@@ -48,15 +48,15 @@ CREATE TABLE forecasts (
 CREATE INDEX idx_forecasts_lookup ON forecasts (station_icao, target_date, fetched_at DESC);
 ```
 
-**Consensus row**: after all models fetch, write one extra row with `model='consensus'`, weighted toward ECMWF (per project requirement: "אנסמבל ECMWF עם חיזוק"). Weight scheme suggestion:
+**Consensus row**: after all models fetch, write one extra row with `model='consensus'`. **Decision probability is derived exclusively from ECMWF IFS04 members** — the consensus row is simply the bias-shifted ECMWF distribution. ICON Global and GFS025 are fetched and stored (for the dashboard histogram and Telegram message context), but carry **zero weight in trade decisions**.
 
-| Model        | Weight |
-| ------------ | ------ |
-| ecmwf_ifs04  | 0.55   |
-| icon_global  | 0.25   |
-| gfs025       | 0.20   |
+| Model        | Decision weight | Display |
+| ------------ | --------------- | ------- |
+| ecmwf_ifs04  | 1.00            | yes     |
+| icon_global  | 0.00            | yes (informational only) |
+| gfs025       | 0.00            | yes (informational only) |
 
-The consensus distribution is built by sampling members proportionally to weights.
+The consensus distribution = ECMWF members shifted by `bias_factor_c`.
 
 ## Table: `metar_obs`
 
@@ -228,9 +228,9 @@ Seeded with:
 | `paper_size_usd`          | `100`   | Paper-trade dollar size                          |
 | `enable_trading`          | `true`  | Master kill switch                               |
 | `bias_window_days`        | `14`    | Rolling window for station bias                  |
-| `ecmwf_weight`            | `0.55`  | Consensus weight                                 |
-| `icon_weight`             | `0.25`  |                                                  |
-| `gfs_weight`              | `0.20`  |                                                  |
+| `ecmwf_weight`            | `1.00`  | ECMWF is the sole decision model (100% weight)   |
+| `icon_weight`             | `0.00`  | Display-only; zero weight in trade decisions     |
+| `gfs_weight`              | `0.00`  | Display-only; zero weight in trade decisions     |
 | `forecast_sigma_c_fallback` | `2.5` | σ in °C when only point forecast is available (matches JS) |
 
 ## Table: `alerts_log`

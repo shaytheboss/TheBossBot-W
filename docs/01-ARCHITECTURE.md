@@ -86,12 +86,15 @@ Gamma /events?q=temperature&active=true ─► filter by US station keyword ─�
 ### Flow B — Forecast pricing (every hour)
 ```
 For each open market with resolution_date today..today+7:
-  fetch ensemble for (lat, lon, date) ─► distribution stats ─►
+  fetch ECMWF IFS04 ensemble (51 members) ─► primary decision distribution
+  fetch ICON Global + GFS025 ─► store for display/context only
   load station_bias.bias_factor_c ─►
-  shift distribution by bias ─►
-  bucket probability via normal CDF (σ from ensemble) ─►
-  write to forecasts table
+  shift ECMWF members by bias ─►
+  bucket probability via normal CDF over ECMWF-only distribution ─►
+  write to forecasts table (one row per model + one consensus=ECMWF row)
 ```
+
+**Decision model is ECMWF-only.** ICON and GFS are fetched and stored so they can be shown in Telegram alerts and the dashboard for human context, but they have zero weight in `P(YES)` and no influence on trade entry.
 
 ### Flow C — Trade evaluation (every 15 min, after pricing)
 ```

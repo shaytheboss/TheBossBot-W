@@ -59,9 +59,9 @@ Phase 12 Polish          → /diag, auto-pause on failure, observability
 | `min_edge_pp`     | 0.05    | `P_model − P_market` must be ≥ this                    |
 | `paper_size_usd`  | 100     | Dollar size per paper trade                            |
 | `bias_window_days`| 14      | Rolling window for station bias                        |
-| `ecmwf_weight`    | 0.55    | ECMWF dominance in the consensus                       |
-| `icon_weight`     | 0.25    |                                                        |
-| `gfs_weight`      | 0.20    |                                                        |
+| `ecmwf_weight`    | 1.00    | ECMWF IFS04 is the sole decision model (100% weight)   |
+| `icon_weight`     | 0.00    | ICON Global — fetched for display in alerts only       |
+| `gfs_weight`      | 0.00    | GFS025 — fetched for display in alerts only            |
 
 ## Stack
 

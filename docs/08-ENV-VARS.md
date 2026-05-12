@@ -37,6 +37,9 @@ All env vars live in Railway → Variables. Local dev uses `.env` (gitignored). 
 | `DEFAULT_PAPER_SIZE_USD`  | `100`   | `paper_size_usd`             |
 | `DEFAULT_BIAS_WINDOW_DAYS`| `14`    | `bias_window_days`           |
 | `DEFAULT_ENABLE_TRADING`  | `true`  | `enable_trading`             |
+| `DEFAULT_ECMWF_WEIGHT`    | `1.00`  | `ecmwf_weight` — sole decision model |
+| `DEFAULT_ICON_WEIGHT`     | `0.00`  | `icon_weight` — display only |
+| `DEFAULT_GFS_WEIGHT`      | `0.00`  | `gfs_weight` — display only  |
 
 These are only used the first time the app boots into an empty `bot_settings` table. Subsequent changes happen via `/setprob` etc. and persist in DB.
 
@@ -87,6 +90,9 @@ DEFAULT_MIN_EDGE_PP=0.05
 DEFAULT_PAPER_SIZE_USD=100
 DEFAULT_BIAS_WINDOW_DAYS=14
 DEFAULT_ENABLE_TRADING=true
+DEFAULT_ECMWF_WEIGHT=1.00
+DEFAULT_ICON_WEIGHT=0.00
+DEFAULT_GFS_WEIGHT=0.00
 
 # === Scheduler ===
 JOB_DISCOVER_MARKETS_SEC=900
