@@ -1,9 +1,9 @@
 from sqlalchemy import (
-    BigInteger, Boolean, Column, Date, Decimal, ForeignKey,
+    BigInteger, Boolean, Column, Date, ForeignKey, Index,
     Integer, Numeric, String, Text, TIMESTAMP, UniqueConstraint
 )
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship, Index
+from sqlalchemy.orm import relationship
 from app.database import Base
 
 
