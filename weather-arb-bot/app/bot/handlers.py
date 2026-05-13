@@ -1,5 +1,5 @@
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -28,6 +28,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Welcome to *Weather Arbitrage Bot*!\n\n"
                 "Commands:\n"
                 "/status — all monitored stations\n"
+                "/scan — fetch Polymarket data + compare forecasts (no threshold)\n"
                 "/watch SF — watch a city\n"
                 "/unwatch SF — stop watching\n"
                 "/settings — configure alerts\n"
@@ -84,6 +85,136 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
 
     await update.message.reply_markdown(fmt_status(city_signals))
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trigger Polymarket fetch + forecast comparison for ALL cities, no threshold filter."""
+    await update.message.reply_text(
+        "\U0001f50d Scanning… triggering market discovery + price fetch. "
+        "This may take 30–60 seconds."
+    )
+
+    from app.workers.jobs import job_discover_markets, job_fetch_polymarket
+    from app.models.market import Market, MarketOutcome
+    from app.analyzers.signal_aggregator import SignalAggregator
+    from app.analyzers.probability_estimator import estimate_true_probability
+    from app.analyzers.confidence_scorer import compute_confidence
+
+    try:
+        await job_discover_markets()
+        await job_fetch_polymarket()
+    except Exception as e:
+        logger.warning(f"cmd_scan data refresh error: {e}")
+
+    aggregator = SignalAggregator()
+    today = date.today()
+    scan_dates = [today + timedelta(days=i) for i in range(3)]
+
+    async with AsyncSessionLocal() as db:
+        cities_result = await db.execute(select(City).where(City.active == True))
+        all_cities = list(cities_result.scalars().all())
+        cities_by_id = {c.id: c for c in all_cities}
+
+        total_with_prices = 0
+        total_no_prices = 0
+        total_not_found = 0
+
+        for target_date in scan_dates:
+            markets_result = await db.execute(
+                select(Market).where(
+                    Market.resolved == False,
+                    Market.event_date == target_date,
+                )
+            )
+            day_markets = markets_result.scalars().all()
+            city_ids_with_market = {m.city_id for m in day_markets}
+
+            lines = [f"\U0001f4c5 *{target_date.strftime('%b %d')}*"]
+
+            for city in all_cities:
+                city_market = next((m for m in day_markets if m.city_id == city.id), None)
+
+                if not city_market:
+                    lines.append(
+                        f"\U0001f4cd {city.name} `{city.primary_icao}`: ❌ not discovered"
+                    )
+                    total_not_found += 1
+                    continue
+
+                outcomes_result = await db.execute(
+                    select(MarketOutcome).where(MarketOutcome.market_id == city_market.id)
+                )
+                outcomes = outcomes_result.scalars().all()
+
+                if not outcomes:
+                    lines.append(
+                        f"\U0001f4cd {city.name} `{city.primary_icao}`: market found, no outcomes"
+                    )
+                    continue
+
+                city_lines = [f"\U0001f4cd *{city.name}* `{city.primary_icao}`"]
+                city_has_price = False
+
+                for outcome in outcomes:
+                    try:
+                        signals = await aggregator.aggregate(
+                            db=db,
+                            city_id=city.id,
+                            primary_icao=city.primary_icao,
+                            reference_icao=city.reference_icao,
+                            outcome=outcome,
+                        )
+                    except Exception as e:
+                        logger.error(f"cmd_scan aggregation error for {city.name}: {e}")
+                        continue
+
+                    price_info = signals.get("market_price")
+                    true_prob = estimate_true_probability(
+                        signals, outcome.bucket_min, outcome.bucket_max
+                    )
+                    confidence = compute_confidence(
+                        signals, outcome.bucket_min, outcome.bucket_max
+                    )
+
+                    label = outcome.bucket_label[:32]
+
+                    if price_info:
+                        city_has_price = True
+                        total_with_prices += 1
+                        yes_price = price_info["yes_price"]
+                        edge = true_prob - yes_price
+                        buy_flag = " ✅ BUY" if edge >= 0.10 and confidence >= 50 else ""
+                        city_lines.append(
+                            f"  • {label}: {round(yes_price*100)}¢ → "
+                            f"est {round(true_prob*100)}% [{edge:+.0%}] conf:{confidence}{buy_flag}"
+                        )
+                    else:
+                        total_no_prices += 1
+                        token_hint = "no token_id" if not outcome.token_id else "no price yet"
+                        city_lines.append(f"  • {label}: ⚠️ {token_hint}")
+
+                lines.extend(city_lines)
+
+            # Send one message per day to stay within Telegram's 4096-char limit
+            text = "\n".join(lines)
+            if len(text) > 3800:
+                text = text[:3800] + "\n…(truncated)"
+            try:
+                await update.message.reply_markdown(text)
+            except Exception as e:
+                logger.error(f"cmd_scan send error: {e}")
+                try:
+                    await update.message.reply_text(text[:3800])
+                except Exception:
+                    pass
+
+        summary = (
+            f"✅ Scan complete — "
+            f"{total_with_prices} outcomes with prices | "
+            f"{total_no_prices} no price | "
+            f"{total_not_found} markets not discovered"
+        )
+        await update.message.reply_text(summary)
 
 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
