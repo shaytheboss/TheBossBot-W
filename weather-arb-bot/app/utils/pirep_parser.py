@@ -1,14 +1,24 @@
 """
-Parse PIREP (Pilot Weather Report) text into a structured dict.
-
-Standard PIREP format:
-  UA /OV KSFO /TM 1430 /FL080 /TP B737 /TA -5 /WV 27040KT /TB LGT /IC LGT RIME /RM SMOOTH
-
-AMDAR format is slightly different but we handle both.
+Parse PIREP JSON/text records from the Aviation Weather API.
+obsTime is returned as a Unix timestamp (int), not ISO string.
 """
 import re
 from datetime import datetime, timezone
 from typing import Optional
+
+
+def _parse_timestamp(value) -> datetime:
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return datetime.now(timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(timezone.utc)
 
 
 def parse_pirep_text(raw: str, json_record: Optional[dict] = None) -> Optional[dict]:
@@ -28,18 +38,12 @@ def parse_pirep_text(raw: str, json_record: Optional[dict] = None) -> Optional[d
         except ValueError:
             observed_at = now
         result["observed_at"] = observed_at
+    elif json_record:
+        result["observed_at"] = _parse_timestamp(
+            json_record.get("obsTime") or json_record.get("reportTime")
+        )
     else:
-        if json_record:
-            ts = json_record.get("obsTime") or json_record.get("reportTime")
-            if ts:
-                try:
-                    result["observed_at"] = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                except ValueError:
-                    result["observed_at"] = datetime.now(timezone.utc)
-            else:
-                result["observed_at"] = datetime.now(timezone.utc)
-        else:
-            result["observed_at"] = datetime.now(timezone.utc)
+        result["observed_at"] = datetime.now(timezone.utc)
 
     ov = re.search(r"/OV\s+([A-Z0-9 ]+?)(?:\s*/|$)", raw)
     if ov:
