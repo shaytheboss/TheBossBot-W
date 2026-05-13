@@ -39,27 +39,38 @@ async def lifespan(app: FastAPI):
             job_discover_markets,
             job_fetch_metars, job_fetch_wunderground, job_fetch_nws,
             job_fetch_models, job_fetch_pireps, job_fetch_polymarket,
-            job_run_analyzer,
+            job_run_analyzer, job_check_resolutions,
         )
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
-        # Discover new markets first (every 30 min, run immediately)
+
+        # Market discovery: every 30 min, run immediately on startup
         _scheduler.add_job(job_discover_markets, IntervalTrigger(seconds=1800),
                            id="discover", next_run_time=now, max_instances=1, misfire_grace_time=300)
+        # METAR: every 5 min
         _scheduler.add_job(job_fetch_metars, IntervalTrigger(seconds=settings.metar_fetch_interval),
                            id="metar", next_run_time=now, max_instances=1, misfire_grace_time=60)
+        # Wunderground: every 30 min (JS-rendered, usually fails — low priority)
         _scheduler.add_job(job_fetch_wunderground, IntervalTrigger(seconds=settings.wunderground_fetch_interval),
                            id="wunderground", next_run_time=now, max_instances=1, misfire_grace_time=300)
+        # NWS + GFS/ECMWF: every hour
         _scheduler.add_job(job_fetch_nws, IntervalTrigger(seconds=3600),
                            id="nws", next_run_time=now, max_instances=1, misfire_grace_time=300)
         _scheduler.add_job(job_fetch_models, IntervalTrigger(seconds=3600),
                            id="models", next_run_time=now, max_instances=1, misfire_grace_time=600)
+        # PIREPs: every 15 min
         _scheduler.add_job(job_fetch_pireps, IntervalTrigger(seconds=900),
                            id="pireps", next_run_time=now, max_instances=1, misfire_grace_time=120)
+        # Polymarket prices: every 5 min
         _scheduler.add_job(job_fetch_polymarket, IntervalTrigger(seconds=settings.polymarket_fetch_interval),
-                           id="polymarket", next_run_time=now, max_instances=1, misfire_grace_time=15)
+                           id="polymarket", next_run_time=now, max_instances=1, misfire_grace_time=60)
+        # Opportunity analysis: every 5 min
         _scheduler.add_job(job_run_analyzer, IntervalTrigger(seconds=settings.analyzer_run_interval),
                            id="analyzer", next_run_time=now, max_instances=1, misfire_grace_time=60)
+        # Resolution tracking: once a day
+        _scheduler.add_job(job_check_resolutions, IntervalTrigger(seconds=86400),
+                           id="resolutions", next_run_time=now, max_instances=1, misfire_grace_time=3600)
+
         _scheduler.start()
         logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
     except Exception as e:
@@ -94,7 +105,7 @@ async def root():
 
 @app.post("/telegram/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
-    if not settings.telegram_webhook_secret or secret != settings.telegram_webhook_secret:
+    if not settings.telegram_bot_token or secret != settings.telegram_webhook_secret:
         raise HTTPException(status_code=403, detail="Forbidden")
     if _bot_app is None:
         raise HTTPException(status_code=503, detail="Bot not initialized")

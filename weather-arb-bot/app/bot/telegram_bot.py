@@ -6,7 +6,10 @@ from telegram import Bot
 from telegram.ext import Application, CommandHandler
 
 from app.config import settings
-from app.bot.handlers import cmd_start, cmd_status, cmd_watch, cmd_unwatch, cmd_settings, cmd_dashboard
+from app.bot.handlers import (
+    cmd_start, cmd_status, cmd_scan,
+    cmd_watch, cmd_unwatch, cmd_settings, cmd_dashboard,
+)
 from app.bot.formatters import fmt_opportunity
 
 logger = logging.getLogger(__name__)
@@ -20,6 +23,7 @@ def get_app() -> Application:
         _app = Application.builder().token(settings.telegram_bot_token).build()
         _app.add_handler(CommandHandler("start", cmd_start))
         _app.add_handler(CommandHandler("status", cmd_status))
+        _app.add_handler(CommandHandler("scan", cmd_scan))
         _app.add_handler(CommandHandler("watch", cmd_watch))
         _app.add_handler(CommandHandler("unwatch", cmd_unwatch))
         _app.add_handler(CommandHandler("settings", cmd_settings))

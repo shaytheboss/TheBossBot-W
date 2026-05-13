@@ -14,10 +14,10 @@ class Settings(BaseSettings):
     app_env: str = "development"
     secret_key: str = "changeme"
     cors_origins: str = "http://localhost:3000"
-    metar_fetch_interval: int = 300
-    polymarket_fetch_interval: int = 30
+    metar_fetch_interval: int = 300       # 5 min
+    polymarket_fetch_interval: int = 300  # 5 min (was 30s — too aggressive)
     wunderground_fetch_interval: int = 1800
-    analyzer_run_interval: int = 120
+    analyzer_run_interval: int = 300      # 5 min (was 120s)
     min_confidence_for_alert: int = 60
     min_edge_for_alert: float = 0.15
     alert_dedup_minutes: int = 30

@@ -1,15 +1,18 @@
 import asyncio
+import json
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, func as sqlfunc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 from app.models.city import City
 from app.models.market import Market, MarketOutcome
+from app.models.metar import MetarObservation
+from app.models.opportunity import Opportunity
 from app.collectors.metar_collector import MetarCollector
 from app.collectors.wunderground_collector import WundergroundCollector
 from app.collectors.nws_collector import NWSCollector
@@ -100,8 +103,6 @@ async def _discover_city_markets(city: City, target_date: date, db: AsyncSession
         if not token_id:
             ids = m.get("clobTokenIds") or []
             if isinstance(ids, str):
-                # Sometimes clobTokenIds is a JSON-encoded string
-                import json
                 try:
                     ids = json.loads(ids)
                 except json.JSONDecodeError:
@@ -234,7 +235,9 @@ async def job_fetch_polymarket():
         )
         outcomes = result.scalars().all()
         if not outcomes:
+            logger.debug("job_fetch_polymarket: no outcomes with token_id found")
             return
+        logger.info(f"job_fetch_polymarket: fetching prices for {len(outcomes)} outcomes")
         for outcome in outcomes:
             try:
                 await poly_col.collect_and_store(outcome.id, outcome.token_id, db)
@@ -255,3 +258,159 @@ async def job_run_analyzer():
                     logger.error(f"Failed to send alert for opportunity {opp.id}: {e}")
         except Exception as e:
             logger.error(f"Analyzer job failed: {e}", exc_info=True)
+
+
+async def _send_resolution_alert(
+    city: City, market: Market, actual_high_f: float, opps: list, winning_outcome_ids: set, db
+) -> None:
+    """Notify all Telegram users about a resolved market's win/loss outcome."""
+    from app.models.alert import TelegramUser
+    from app.config import settings
+    from telegram import Bot
+
+    if not settings.telegram_bot_token:
+        return
+
+    wins = [o for o in opps if o.outcome == "WIN"]
+    losses = [o for o in opps if o.outcome == "LOSS"]
+    total = len(wins) + len(losses)
+    if total == 0:
+        return
+
+    if len(wins) > len(losses):
+        header = "✅ *Resolution WIN*"
+    elif len(losses) > len(wins):
+        header = "❌ *Resolution LOSS*"
+    else:
+        header = "\U0001f91d *Resolution PUSH*"
+
+    lines = [
+        f"{header}",
+        f"\U0001f4cd {city.name} (`{city.primary_icao}`) — {market.event_date.strftime('%b %d, %Y')}",
+        f"\U0001f321️ Actual high: *{actual_high_f}°F*",
+        "",
+    ]
+    for opp in opps:
+        from app.models.market import MarketOutcome as MO
+        oc_res = await db.execute(select(MO).where(MO.id == opp.outcome_id))
+        oc = oc_res.scalar_one_or_none()
+        label = oc.bucket_label if oc else f"outcome #{opp.outcome_id}"
+        result_emoji = "✅" if opp.outcome == "WIN" else "❌"
+        lines.append(
+            f"{result_emoji} {label[:35]} {opp.side} @ {round(float(opp.market_price)*100)}¢ → {opp.outcome}"
+        )
+
+    text = "\n".join(lines)
+
+    users_result = await db.execute(select(TelegramUser))
+    users = users_result.scalars().all()
+    bot = Bot(token=settings.telegram_bot_token)
+    for user in users:
+        if user.cities_watched and city.id not in user.cities_watched:
+            continue
+        try:
+            await bot.send_message(chat_id=user.chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send resolution alert to {user.chat_id}: {e}")
+
+
+async def job_check_resolutions():
+    """Find past unresolved markets, determine actual high from METAR, send win/loss alerts."""
+    today = date.today()
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Market)
+            .where(Market.resolved == False, Market.event_date < today)
+            .order_by(Market.event_date)
+        )
+        markets = result.scalars().all()
+
+        if not markets:
+            return
+
+        logger.info(f"job_check_resolutions: checking {len(markets)} unresolved past markets")
+
+        for market in markets:
+            city_result = await db.execute(select(City).where(City.id == market.city_id))
+            city = city_result.scalar_one_or_none()
+            if not city:
+                continue
+
+            # Find the actual daily high from METAR observations
+            day_start = datetime(
+                market.event_date.year, market.event_date.month, market.event_date.day,
+                tzinfo=timezone.utc,
+            )
+            day_end = day_start + timedelta(days=1)
+
+            temp_result = await db.execute(
+                select(sqlfunc.max(MetarObservation.temperature_f)).where(
+                    MetarObservation.icao == city.primary_icao,
+                    MetarObservation.observed_at >= day_start,
+                    MetarObservation.observed_at < day_end,
+                )
+            )
+            actual_high_raw = temp_result.scalar_one_or_none()
+
+            if actual_high_raw is None:
+                logger.debug(
+                    f"No METAR data for {city.name} on {market.event_date} — skipping resolution"
+                )
+                continue
+
+            actual_high_f = float(actual_high_raw)
+            logger.info(f"Resolving {market.external_id}: actual high = {actual_high_f}°F")
+
+            # Determine which outcome bucket(s) contain the actual high
+            outcomes_result = await db.execute(
+                select(MarketOutcome).where(MarketOutcome.market_id == market.id)
+            )
+            outcomes = outcomes_result.scalars().all()
+
+            winning_outcome_ids: set = set()
+            for outcome in outcomes:
+                b_min = outcome.bucket_min
+                b_max = outcome.bucket_max
+                if b_min is not None and b_max is not None:
+                    if b_min <= actual_high_f < b_max:
+                        winning_outcome_ids.add(outcome.id)
+                elif b_min is not None and b_max is None:
+                    # Open-ended upper bucket (e.g. "100+°F")
+                    if actual_high_f >= b_min:
+                        winning_outcome_ids.add(outcome.id)
+
+            # Mark market resolved
+            market.resolved = True
+            market.resolution_value = f"{actual_high_f}°F"
+
+            # Grade our opportunities
+            opps_result = await db.execute(
+                select(Opportunity)
+                .join(MarketOutcome)
+                .where(
+                    MarketOutcome.market_id == market.id,
+                    Opportunity.alert_sent == True,
+                    Opportunity.outcome == None,  # not yet graded
+                )
+            )
+            opps = opps_result.scalars().all()
+
+            now = datetime.now(timezone.utc)
+            for opp in opps:
+                bucket_won = opp.outcome_id in winning_outcome_ids
+                if opp.side == "YES":
+                    opp.outcome = "WIN" if bucket_won else "LOSS"
+                else:
+                    opp.outcome = "WIN" if not bucket_won else "LOSS"
+                opp.closed_at = now
+
+            await db.commit()
+
+            # Send resolution notification if we had any active recommendations
+            if opps:
+                try:
+                    await _send_resolution_alert(
+                        city, market, actual_high_f, opps, winning_outcome_ids, db
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send resolution alert for {market.external_id}: {e}")
