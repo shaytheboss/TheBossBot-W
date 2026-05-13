@@ -6,8 +6,7 @@ Run once after migrations:
 Idempotent — skips cities that already exist (matched by primary_icao).
 
 Station sources: Polymarket resolves via Wunderground historical data.
-Verify ICAO codes against each market's resolution rules if Polymarket
-updates their stations.
+Verify each URL against the market's resolution rules page on Polymarket.
 """
 import asyncio
 import logging
@@ -21,77 +20,80 @@ logger = logging.getLogger(__name__)
 
 # Each entry: (name, polymarket_slug, primary_icao, reference_icao,
 #              wunderground_base_url, nws_lat, nws_lon, timezone)
+# wunderground_base_url: Wunderground daily history base URL for the station.
+# The collector appends /date/YYYY-M-D when fetching.
 CITIES = [
     (
         "Austin", "austin",
         "KAUS", "KEDC",
-        "https://www.wunderground.com/history/daily/KAUS",
+        "https://www.wunderground.com/history/daily/us/tx/austin/KAUS",
         30.1975, -97.6664, "America/Chicago",
     ),
     (
         "London", "london",
         "EGLL", "EGKK",
-        "https://www.wunderground.com/history/daily/EGLL",
+        "https://www.wunderground.com/history/daily/gb/england/heathrow/EGLL",
         51.4775, -0.4614, "Europe/London",
     ),
     (
         "Dallas", "dallas",
         "KDFW", "KDAL",
-        "https://www.wunderground.com/history/daily/KDFW",
+        "https://www.wunderground.com/history/daily/us/tx/dallas/KDFW",
         32.8998, -97.0403, "America/Chicago",
     ),
     (
         "Chicago", "chicago",
         "KORD", "KMDW",
-        "https://www.wunderground.com/history/daily/KORD",
+        "https://www.wunderground.com/history/daily/us/il/chicago/KORD",
         41.9742, -87.9073, "America/Chicago",
     ),
     (
         "Denver", "denver",
         "KDEN", "KAPA",
-        "https://www.wunderground.com/history/daily/KDEN",
+        "https://www.wunderground.com/history/daily/us/co/denver/KDEN",
         39.8561, -104.6737, "America/Denver",
     ),
     (
+        # Polymarket uses LaGuardia (KLGA) for NYC
         "New York", "nyc",
-        "KNYC", "KJFK",
-        "https://www.wunderground.com/history/daily/KNYC",
-        40.7789, -73.9692, "America/New_York",
+        "KLGA", "KJFK",
+        "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA",
+        40.7769, -73.8740, "America/New_York",
     ),
     (
         "Seattle", "seattle",
         "KSEA", "KBFI",
-        "https://www.wunderground.com/history/daily/KSEA",
+        "https://www.wunderground.com/history/daily/us/wa/seattle/KSEA",
         47.4502, -122.3088, "America/Los_Angeles",
     ),
     (
         "Miami", "miami",
         "KMIA", "KFLL",
-        "https://www.wunderground.com/history/daily/KMIA",
+        "https://www.wunderground.com/history/daily/us/fl/miami/KMIA",
         25.7959, -80.2870, "America/New_York",
     ),
     (
         "San Francisco", "san-francisco",
         "KSFO", "KOAK",
-        "https://www.wunderground.com/history/daily/KSFO",
+        "https://www.wunderground.com/history/daily/us/ca/san-francisco/KSFO",
         37.6188, -122.3750, "America/Los_Angeles",
     ),
     (
         "Los Angeles", "los-angeles",
         "KLAX", "KVNY",
-        "https://www.wunderground.com/history/daily/KLAX",
+        "https://www.wunderground.com/history/daily/us/ca/los-angeles/KLAX",
         33.9425, -118.4081, "America/Los_Angeles",
     ),
     (
         "Atlanta", "atlanta",
         "KATL", "KPDK",
-        "https://www.wunderground.com/history/daily/KATL",
+        "https://www.wunderground.com/history/daily/us/ga/atlanta/KATL",
         33.6407, -84.4277, "America/New_York",
     ),
     (
         "Houston", "houston",
         "KIAH", "KHOU",
-        "https://www.wunderground.com/history/daily/KIAH",
+        "https://www.wunderground.com/history/daily/us/tx/houston/KIAH",
         29.9844, -95.3414, "America/Chicago",
     ),
 ]

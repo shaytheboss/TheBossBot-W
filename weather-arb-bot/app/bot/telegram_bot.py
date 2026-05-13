@@ -66,6 +66,7 @@ async def send_opportunity_alert(opportunity, db) -> None:
         signals=opportunity.signals or {},
         resolution_time=market.resolution_time,
         market_url=market_url,
+        station_icao=city.primary_icao if city else None,
     )
 
     users_result = await db.execute(select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score))
