@@ -1,9 +1,9 @@
 from sqlalchemy import (
-    BigInteger, Boolean, Column, Date, Decimal, ForeignKey,
+    BigInteger, Boolean, Column, Date, ForeignKey, Index,
     Integer, Numeric, String, Text, TIMESTAMP, UniqueConstraint
 )
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship, Index
+from sqlalchemy.orm import relationship
 from app.database import Base
 
 
@@ -37,7 +37,7 @@ class MarketOutcome(Base):
 
     market = relationship("Market", back_populates="outcomes")
     prices = relationship("MarketPrice", back_populates="outcome")
-    opportunities = relationship("Opportunity", back_populates="outcome")
+    opportunities = relationship("Opportunity", back_populates="outcome_ref")
 
     __table_args__ = (
         UniqueConstraint("market_id", "bucket_label", name="uq_outcome_market_bucket"),
