@@ -13,6 +13,9 @@ from app.bot.formatters import fmt_status
 
 logger = logging.getLogger(__name__)
 
+# Forecast sources in priority order — wunderground rarely parses, GFS always works
+_FORECAST_SOURCES = ["gfs", "ecmwf", "nws", "wunderground"]
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -48,8 +51,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         city_signals = []
         for city in cities:
-            # Latest METAR for current temp
             from app.models.metar import MetarObservation
+            from app.models.forecast import Forecast
+
             metar_result = await db.execute(
                 select(MetarObservation)
                 .where(MetarObservation.icao == city.primary_icao)
@@ -58,18 +62,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             metar = metar_result.scalar_one_or_none()
 
-            # Latest Wunderground forecast for today
-            from app.models.forecast import Forecast
-            forecast_result = await db.execute(
-                select(Forecast)
-                .where(
-                    Forecast.city_id == city.id,
-                    Forecast.source == "wunderground",
-                    Forecast.forecast_for_date == date.today(),
+            # Try forecast sources in priority order; GFS/ECMWF always work
+            forecast = None
+            for source in _FORECAST_SOURCES:
+                forecast_result = await db.execute(
+                    select(Forecast)
+                    .where(
+                        Forecast.city_id == city.id,
+                        Forecast.source == source,
+                        Forecast.forecast_for_date == date.today(),
+                    )
+                    .limit(1)
                 )
-                .limit(1)
-            )
-            forecast = forecast_result.scalar_one_or_none()
+                forecast = forecast_result.scalar_one_or_none()
+                if forecast:
+                    break
 
             city_signals.append({
                 "city": city.name,
