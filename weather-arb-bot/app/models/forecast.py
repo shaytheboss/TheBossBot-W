@@ -1,7 +1,6 @@
-from sqlalchemy import BigInteger, Column, Date, ForeignKey, Integer, String, Text, TIMESTAMP
+from sqlalchemy import BigInteger, Column, Date, ForeignKey, Index, Integer, String, Text, TIMESTAMP
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
-from sqlalchemy.orm import Index
 from app.database import Base
 
 
