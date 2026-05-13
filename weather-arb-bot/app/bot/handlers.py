@@ -8,10 +8,11 @@ from sqlalchemy import select, desc
 from app.database import AsyncSessionLocal
 from app.models.alert import TelegramUser
 from app.models.city import City
-from app.models.market import Market
 from app.bot.formatters import fmt_status
 
 logger = logging.getLogger(__name__)
+
+_FORECAST_SOURCES = ["gfs", "ecmwf", "nws", "wunderground"]
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48,8 +49,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         city_signals = []
         for city in cities:
-            # Latest METAR for current temp
             from app.models.metar import MetarObservation
+            from app.models.forecast import Forecast
+
             metar_result = await db.execute(
                 select(MetarObservation)
                 .where(MetarObservation.icao == city.primary_icao)
@@ -58,24 +60,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             metar = metar_result.scalar_one_or_none()
 
-            # Latest Wunderground forecast for today
-            from app.models.forecast import Forecast
-            forecast_result = await db.execute(
-                select(Forecast)
-                .where(
-                    Forecast.city_id == city.id,
-                    Forecast.source == "wunderground",
-                    Forecast.forecast_for_date == date.today(),
+            # Collect ALL available forecasts for today from all sources
+            forecasts_by_source = {}
+            for source in _FORECAST_SOURCES:
+                forecast_result = await db.execute(
+                    select(Forecast)
+                    .where(
+                        Forecast.city_id == city.id,
+                        Forecast.source == source,
+                        Forecast.forecast_for_date == date.today(),
+                    )
+                    .limit(1)
                 )
-                .limit(1)
-            )
-            forecast = forecast_result.scalar_one_or_none()
+                f = forecast_result.scalar_one_or_none()
+                if f and f.predicted_high_f is not None:
+                    forecasts_by_source[source] = f.predicted_high_f
 
             city_signals.append({
                 "city": city.name,
                 "icao": city.primary_icao,
                 "temp_f": float(metar.temperature_f) if metar and metar.temperature_f else None,
-                "forecast_high": forecast.predicted_high_f if forecast else None,
+                "forecasts": forecasts_by_source,
             })
 
     await update.message.reply_markdown(fmt_status(city_signals))
