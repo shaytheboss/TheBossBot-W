@@ -1,6 +1,13 @@
 from datetime import datetime, timezone
 from typing import Optional
 
+_SOURCE_LABELS = {
+    "gfs": "GFS",
+    "ecmwf": "ECMWF",
+    "nws": "NWS",
+    "wunderground": "WU",
+}
+
 
 def fmt_opportunity(
     city_name, market_question, bucket_label, market_price, true_prob, edge,
@@ -29,9 +36,15 @@ def fmt_opportunity(
         avg_c = sum(p["temperature_c"] for p in low_pireps if p.get("temperature_c")) / len(low_pireps)
         avg_f = round(avg_c * 9 / 5 + 32)
         key_signals.append(f"• PIREP: {avg_f}°F avg at low altitude")
-    wg = signals.get("wunderground_forecast") or {}
-    if wg.get("predicted_high_f"):
-        key_signals.append(f"• Wunderground forecast: {wg['predicted_high_f']}°F")
+
+    # Show all available model forecasts
+    for source in ("gfs", "ecmwf", "nws", "wunderground"):
+        key = f"{source}_forecast" if source == "wunderground" else f"{source}_forecast"
+        fc = signals.get(key) or signals.get(source) or {}
+        if fc.get("predicted_high_f"):
+            label = _SOURCE_LABELS.get(source, source.upper())
+            key_signals.append(f"• {label} forecast: {fc['predicted_high_f']}°F")
+
     signals_text = "\n".join(key_signals) if key_signals else "• No key signals available"
 
     hours_left = ""
@@ -44,14 +57,14 @@ def fmt_opportunity(
     link_line = f"\n[Polymarket]({market_url})" if market_url else ""
 
     return (
-        f"🎯 *HIGH CONFIDENCE OPPORTUNITY*\n\n"
-        f"📍 {city_name}{station_line} | {date_str}\n"
-        f"📊 Market: {market_question}\n"
-        f"🏢 Bucket: {bucket_label} (YES)\n\n"
-        f"💰 Market price: {price_cents}¢\n"
-        f"🧠 Model estimate: {prob_pct}%\n"
-        f"📈 Edge: +{edge_pct}pp\n\n"
-        f"🔍 Key signals:\n{signals_text}\n\n"
+        f"\U0001f3af *HIGH CONFIDENCE OPPORTUNITY*\n\n"
+        f"\U0001f4cd {city_name}{station_line} | {date_str}\n"
+        f"\U0001f4ca Market: {market_question}\n"
+        f"\U0001f3e2 Bucket: {bucket_label} (YES)\n\n"
+        f"\U0001f4b0 Market price: {price_cents}¢\n"
+        f"\U0001f9e0 Model estimate: {prob_pct}%\n"
+        f"\U0001f4c8 Edge: +{edge_pct}pp\n\n"
+        f"\U0001f50d Key signals:\n{signals_text}\n\n"
         f"⚠️  Confidence: {confidence}/100{hours_left}{link_line}"
     )
 
@@ -59,7 +72,21 @@ def fmt_opportunity(
 def fmt_status(city_signals: list) -> str:
     if not city_signals:
         return "No cities currently being monitored."
-    lines = ["📡 *Current Status*\n"]
+
+    lines = ["\U0001f4e1 *Current Status*\n"]
     for cs in city_signals:
-        lines.append(f"📍 *{cs['city']}* `{cs.get('icao', '?')}`: {cs.get('temp_f', '?')}°F now, forecast {cs.get('forecast_high', '?')}°F")
+        temp = f"{cs['temp_f']}°F" if cs.get("temp_f") is not None else "--"
+        forecasts: dict = cs.get("forecasts") or {}
+
+        # Build forecast string from all available sources
+        fc_parts = []
+        for source in ("gfs", "ecmwf", "nws", "wunderground"):
+            if source in forecasts:
+                label = _SOURCE_LABELS[source]
+                fc_parts.append(f"{label}:{forecasts[source]}°F")
+        fc_str = " | ".join(fc_parts) if fc_parts else "no forecast"
+
+        lines.append(
+            f"\U0001f4cd *{cs['city']}* `{cs.get('icao', '?')}`: now {temp} — {fc_str}"
+        )
     return "\n".join(lines)

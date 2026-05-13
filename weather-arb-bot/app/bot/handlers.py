@@ -8,12 +8,10 @@ from sqlalchemy import select, desc
 from app.database import AsyncSessionLocal
 from app.models.alert import TelegramUser
 from app.models.city import City
-from app.models.market import Market
 from app.bot.formatters import fmt_status
 
 logger = logging.getLogger(__name__)
 
-# Forecast sources in priority order — wunderground rarely parses, GFS always works
 _FORECAST_SOURCES = ["gfs", "ecmwf", "nws", "wunderground"]
 
 
@@ -62,8 +60,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             metar = metar_result.scalar_one_or_none()
 
-            # Try forecast sources in priority order; GFS/ECMWF always work
-            forecast = None
+            # Collect ALL available forecasts for today from all sources
+            forecasts_by_source = {}
             for source in _FORECAST_SOURCES:
                 forecast_result = await db.execute(
                     select(Forecast)
@@ -74,15 +72,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     .limit(1)
                 )
-                forecast = forecast_result.scalar_one_or_none()
-                if forecast:
-                    break
+                f = forecast_result.scalar_one_or_none()
+                if f and f.predicted_high_f is not None:
+                    forecasts_by_source[source] = f.predicted_high_f
 
             city_signals.append({
                 "city": city.name,
                 "icao": city.primary_icao,
                 "temp_f": float(metar.temperature_f) if metar and metar.temperature_f else None,
-                "forecast_high": forecast.predicted_high_f if forecast else None,
+                "forecasts": forecasts_by_source,
             })
 
     await update.message.reply_markdown(fmt_status(city_signals))
