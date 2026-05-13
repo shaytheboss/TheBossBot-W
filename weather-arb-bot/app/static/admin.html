@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Weather Arb — Admin</title>
+<style>
+  :root { --bg:#0f1116; --panel:#1a1d27; --border:#2a2e3a; --fg:#e6e8ee; --mute:#8a90a2;
+          --accent:#4a9eff; --win:#3fb950; --loss:#f85149; --warn:#d29922; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--fg); }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display:flex; align-items:center; gap:16px; }
+  header h1 { margin:0; font-size:16px; font-weight:600; }
+  nav button { background:transparent; border:none; color:var(--mute); padding:6px 12px; cursor:pointer; font-size:14px; }
+  nav button.active { color: var(--fg); border-bottom: 2px solid var(--accent); }
+  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); }
+  .card { background: var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px; }
+  .card .label { font-size:11px; color: var(--mute); text-transform:uppercase; letter-spacing:0.5px; }
+  .card .value { font-size:24px; font-weight:600; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--mute); font-weight:500; font-size:11px; text-transform:uppercase; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .pill.win { background: rgba(63,185,80,0.15); color: var(--win); }
+  .pill.loss { background: rgba(248,81,73,0.15); color: var(--loss); }
+  .pill.open { background: rgba(74,158,255,0.15); color: var(--accent); }
+  input, button.btn, select { background: var(--panel); border:1px solid var(--border); color: var(--fg);
+         padding:6px 10px; border-radius:6px; font-size:14px; }
+  button.btn { cursor:pointer; }
+  button.btn:hover { background: var(--border); }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color:white; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .toolbar { display:flex; gap:10px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  .log { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:12px; white-space:pre-wrap;
+         background:#080a0e; border:1px solid var(--border); border-radius:6px; padding:10px;
+         max-height:70vh; overflow:auto; }
+  .log .l-INFO { color: var(--fg); }
+  .log .l-WARNING { color: var(--warn); }
+  .log .l-ERROR { color: var(--loss); }
+  .log .l-DEBUG { color: var(--mute); }
+  .login { display:flex; align-items:center; justify-content:center; height:100vh; }
+  .login form { background: var(--panel); padding: 24px; border-radius:8px; border:1px solid var(--border);
+                display:flex; flex-direction:column; gap:12px; width:280px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .small { font-size:12px; color: var(--mute); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="login" class="login hidden">
+  <form onsubmit="event.preventDefault(); doLogin();">
+    <h2 style="margin:0;">Admin Login</h2>
+    <input type="password" id="pw" placeholder="Admin password" autofocus />
+    <button class="btn primary" type="submit">Sign in</button>
+    <div id="loginError" class="small" style="color: var(--loss);"></div>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>🌡️ Weather Arb Admin</h1>
+    <nav>
+      <button class="active" data-tab="stats">Stats</button>
+      <button data-tab="opps">Opportunities</button>
+      <button data-tab="cities">Cities</button>
+      <button data-tab="settings">Settings</button>
+      <button data-tab="logs">Logs</button>
+    </nav>
+    <div style="margin-left:auto;"><button class="btn" onclick="logout()">Sign out</button></div>
+  </header>
+  <main>
+    <section id="tab-stats">
+      <div class="toolbar"><button class="btn" onclick="loadStats()">Refresh</button></div>
+      <h3>Opportunities</h3>
+      <div class="grid" id="statsOpps"></div>
+      <h3 style="margin-top:24px;">Inventory</h3>
+      <div class="grid" id="statsInv"></div>
+    </section>
+
+    <section id="tab-opps" class="hidden">
+      <div class="toolbar">
+        <label class="row"><input type="checkbox" id="onlyAlerted" onchange="loadOpps()" /> only alerted</label>
+        <select id="oppOutcome" onchange="loadOpps()">
+          <option value="">all outcomes</option>
+          <option value="WIN">WIN</option>
+          <option value="LOSS">LOSS</option>
+        </select>
+        <button class="btn" onclick="loadOpps()">Refresh</button>
+      </div>
+      <table>
+        <thead><tr><th>Detected</th><th>City</th><th>Date</th><th>Bucket</th><th>Side</th>
+          <th>Price</th><th>Est %</th><th>Edge</th><th>Conf</th><th>Alert</th><th>Outcome</th><th>Link</th></tr></thead>
+        <tbody id="oppsBody"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-cities" class="hidden">
+      <div class="toolbar"><button class="btn" onclick="loadCities()">Refresh</button></div>
+      <table>
+        <thead><tr><th>Name</th><th>Primary</th><th>Reference</th><th>Poly slug</th>
+          <th>Lat,Lon</th><th>Active</th><th></th></tr></thead>
+        <tbody id="citiesBody"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-settings" class="hidden">
+      <div id="settingsBody"></div>
+      <p class="small">Min edge → needs &ge; this to trigger an alert (0.0–1.0). Min confidence → 0–100. Polling intervals require restart.</p>
+    </section>
+
+    <section id="tab-logs" class="hidden">
+      <div class="toolbar">
+        <select id="logLevel" onchange="loadLogs()">
+          <option value="">all levels</option>
+          <option value="INFO">INFO</option>
+          <option value="WARNING">WARNING</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+        <button class="btn" onclick="loadLogs()">Refresh</button>
+        <label class="row small"><input type="checkbox" id="autoRefreshLogs" /> auto-refresh 5s</label>
+      </div>
+      <div class="log" id="logsBody"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+const api = (path, opts={}) => fetch('/api/admin' + path, { credentials: 'same-origin', ...opts });
+let logsTimer = null;
+
+async function init() {
+  const r = await api('/me');
+  if (r.ok) {
+    document.getElementById('login').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    bindTabs();
+    loadStats();
+  } else {
+    document.getElementById('login').classList.remove('hidden');
+    document.getElementById('app').classList.add('hidden');
+  }
+}
+
+async function doLogin() {
+  const pw = document.getElementById('pw').value;
+  const errBox = document.getElementById('loginError');
+  errBox.textContent = '';
+  const r = await api('/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw}) });
+  if (r.ok) { init(); } else { errBox.textContent = 'Wrong password'; }
+}
+
+async function logout() {
+  await api('/logout', { method:'POST' });
+  location.reload();
+}
+
+function bindTabs() {
+  document.querySelectorAll('nav button').forEach(btn => {
+    btn.onclick = () => {
+      document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const tab = btn.dataset.tab;
+      document.querySelectorAll('main section').forEach(s => s.classList.add('hidden'));
+      document.getElementById('tab-'+tab).classList.remove('hidden');
+      if (tab === 'stats') loadStats();
+      if (tab === 'opps') loadOpps();
+      if (tab === 'cities') loadCities();
+      if (tab === 'settings') loadSettings();
+      if (tab === 'logs') loadLogs();
+    };
+  });
+}
+
+function card(label, value) {
+  return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+}
+
+async function loadStats() {
+  const r = await api('/stats'); if (!r.ok) return;
+  const s = await r.json();
+  const o = s.opportunities;
+  document.getElementById('statsOpps').innerHTML =
+    card('Total detected', o.total) + card('Alerted', o.alerted) + card('Open', o.open) +
+    card('Wins', o.wins) + card('Losses', o.losses) + card('Win rate', o.win_rate_pct + '%');
+  const i = s.inventory;
+  document.getElementById('statsInv').innerHTML =
+    card('Cities', i.cities) + card('Markets', i.markets) + card('Outcomes', i.outcomes) +
+    card('Outcomes w/ token', i.outcomes_with_token) + card('Telegram users', i.telegram_users);
+}
+
+function pill(outcome) {
+  if (outcome === 'WIN') return '<span class="pill win">WIN</span>';
+  if (outcome === 'LOSS') return '<span class="pill loss">LOSS</span>';
+  return '<span class="pill open">open</span>';
+}
+
+async function loadOpps() {
+  const onlyAlerted = document.getElementById('onlyAlerted').checked;
+  const outcome = document.getElementById('oppOutcome').value;
+  const params = new URLSearchParams();
+  if (onlyAlerted) params.set('only_alerted', 'true');
+  if (outcome) params.set('outcome', outcome);
+  const r = await api('/opportunities?' + params); if (!r.ok) return;
+  const rows = await r.json();
+  document.getElementById('oppsBody').innerHTML = rows.map(o => `
+    <tr>
+      <td class="small">${o.detected_at ? o.detected_at.slice(0,16).replace('T',' ') : ''}</td>
+      <td>${o.city || ''}</td>
+      <td>${o.event_date || ''}</td>
+      <td>${o.bucket || ''}</td>
+      <td>${o.side}</td>
+      <td>${Math.round(o.market_price*100)}¢</td>
+      <td>${Math.round(o.true_prob*100)}%</td>
+      <td>${(o.edge*100).toFixed(0)}pp</td>
+      <td>${o.confidence}</td>
+      <td>${o.alert_sent ? '✓' : ''}</td>
+      <td>${pill(o.outcome)}</td>
+      <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadCities() {
+  const r = await api('/cities'); if (!r.ok) return;
+  const rows = await r.json();
+  document.getElementById('citiesBody').innerHTML = rows.map(c => `
+    <tr>
+      <td>${c.name}</td>
+      <td>${c.primary_icao}</td>
+      <td>${c.reference_icao || ''}</td>
+      <td><input style="width:140px;" value="${c.polymarket_slug || ''}" id="city-slug-${c.id}"/></td>
+      <td class="small">${c.nws_lat?.toFixed(3)}, ${c.nws_lon?.toFixed(3)}</td>
+      <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
+      <td><button class="btn primary" onclick="saveCity(${c.id})">Save</button></td>
+    </tr>
+  `).join('');
+}
+
+async function saveCity(id) {
+  const payload = {
+    polymarket_slug: document.getElementById('city-slug-'+id).value || null,
+    active: document.getElementById('city-active-'+id).checked,
+  };
+  const r = await api('/cities/'+id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  if (r.ok) loadCities(); else alert('Save failed');
+}
+
+async function loadSettings() {
+  const r = await api('/settings'); if (!r.ok) return;
+  const s = await r.json();
+  document.getElementById('settingsBody').innerHTML = `
+    <table>
+      <tr><td>Min confidence (0–100)</td><td><input id="set-mc" type="number" value="${s.min_confidence_for_alert}" /></td></tr>
+      <tr><td>Min edge (0.0–1.0)</td><td><input id="set-me" type="number" step="0.01" value="${s.min_edge_for_alert}" /></td></tr>
+      <tr><td>METAR interval (s)</td><td>${s.metar_fetch_interval} <span class="small">(restart)</span></td></tr>
+      <tr><td>Polymarket interval (s)</td><td>${s.polymarket_fetch_interval} <span class="small">(restart)</span></td></tr>
+      <tr><td>Analyzer interval (s)</td><td>${s.analyzer_run_interval} <span class="small">(restart)</span></td></tr>
+      <tr><td>Alert dedup minutes</td><td>${s.alert_dedup_minutes} <span class="small">(restart)</span></td></tr>
+      <tr><td>Environment</td><td>${s.app_env}</td></tr>
+    </table>
+    <p><button class="btn primary" onclick="saveSettings()">Save thresholds</button></p>
+  `;
+}
+
+async function saveSettings() {
+  const payload = {
+    min_confidence_for_alert: parseInt(document.getElementById('set-mc').value),
+    min_edge_for_alert: parseFloat(document.getElementById('set-me').value),
+  };
+  const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  if (r.ok) { alert('Saved'); loadSettings(); }
+  else { const j = await r.json().catch(()=>({})); alert('Save failed: ' + (j.detail || r.status)); }
+}
+
+async function loadLogs() {
+  const level = document.getElementById('logLevel').value;
+  const params = new URLSearchParams();
+  if (level) params.set('level', level);
+  const r = await api('/logs?' + params); if (!r.ok) return;
+  const j = await r.json();
+  document.getElementById('logsBody').innerHTML = j.logs.map(l =>
+    `<div class="l-${l.level}">[${l.ts.slice(11,19)}] ${l.level.padEnd(7)} ${l.name}: ${escapeHtml(l.message)}</div>`
+  ).join('');
+  if (document.getElementById('autoRefreshLogs').checked) {
+    if (!logsTimer) logsTimer = setInterval(loadLogs, 5000);
+  } else if (logsTimer) {
+    clearInterval(logsTimer); logsTimer = null;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+}
+
+init();
+</script>
+</body>
+</html>

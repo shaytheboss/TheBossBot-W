@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -7,10 +8,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from telegram import Update
 
 from app.config import settings
-from app.api import cities, markets, opportunities, users, health
+from app.api import cities, markets, opportunities, users, health, admin
+from app.utils.log_buffer import install_buffer_handler
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,7 @@ _scheduler = None
 async def lifespan(app: FastAPI):
     global _bot_app, _scheduler
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    install_buffer_handler()
     logger.info("Weather Arbitrage Bot starting up...")
 
     if settings.telegram_bot_token:
@@ -44,30 +49,22 @@ async def lifespan(app: FastAPI):
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
 
-        # Market discovery: every 30 min, run immediately on startup
         _scheduler.add_job(job_discover_markets, IntervalTrigger(seconds=1800),
                            id="discover", next_run_time=now, max_instances=1, misfire_grace_time=300)
-        # METAR: every 5 min
         _scheduler.add_job(job_fetch_metars, IntervalTrigger(seconds=settings.metar_fetch_interval),
                            id="metar", next_run_time=now, max_instances=1, misfire_grace_time=60)
-        # Wunderground: every 30 min (JS-rendered, usually fails — low priority)
         _scheduler.add_job(job_fetch_wunderground, IntervalTrigger(seconds=settings.wunderground_fetch_interval),
                            id="wunderground", next_run_time=now, max_instances=1, misfire_grace_time=300)
-        # NWS + GFS/ECMWF: every hour
         _scheduler.add_job(job_fetch_nws, IntervalTrigger(seconds=3600),
                            id="nws", next_run_time=now, max_instances=1, misfire_grace_time=300)
         _scheduler.add_job(job_fetch_models, IntervalTrigger(seconds=3600),
                            id="models", next_run_time=now, max_instances=1, misfire_grace_time=600)
-        # PIREPs: every 15 min
         _scheduler.add_job(job_fetch_pireps, IntervalTrigger(seconds=900),
                            id="pireps", next_run_time=now, max_instances=1, misfire_grace_time=120)
-        # Polymarket prices: every 5 min
         _scheduler.add_job(job_fetch_polymarket, IntervalTrigger(seconds=settings.polymarket_fetch_interval),
                            id="polymarket", next_run_time=now, max_instances=1, misfire_grace_time=60)
-        # Opportunity analysis: every 5 min
         _scheduler.add_job(job_run_analyzer, IntervalTrigger(seconds=settings.analyzer_run_interval),
                            id="analyzer", next_run_time=now, max_instances=1, misfire_grace_time=60)
-        # Resolution tracking: once a day
         _scheduler.add_job(job_check_resolutions, IntervalTrigger(seconds=86400),
                            id="resolutions", next_run_time=now, max_instances=1, misfire_grace_time=3600)
 
@@ -96,11 +93,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 @app.get("/")
 async def root():
     jobs = [j.id for j in _scheduler.get_jobs()] if _scheduler else []
     return {"status": "ok", "service": "Weather Arbitrage Bot", "scheduler_jobs": jobs}
+
+
+@app.get("/admin")
+async def admin_page():
+    path = os.path.join(STATIC_DIR, "admin.html")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Admin page not found")
+    return FileResponse(path)
 
 
 @app.post("/telegram/webhook/{secret}")
@@ -120,3 +129,4 @@ app.include_router(cities.router, prefix="/api/cities", tags=["cities"])
 app.include_router(markets.router, prefix="/api/markets", tags=["markets"])
 app.include_router(opportunities.router, prefix="/api/opportunities", tags=["opportunities"])
 app.include_router(users.router, prefix="/api/users", tags=["users"])
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
