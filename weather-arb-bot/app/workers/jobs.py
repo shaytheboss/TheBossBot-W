@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -30,12 +30,17 @@ poly_col = PolymarketCollector()
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
+# How many days ahead to scan Polymarket for markets
+MARKET_DISCOVERY_DAYS_AHEAD = 7
+# How many days ahead to pull weather forecasts
+FORECAST_DAYS_AHEAD = 7
 
-async def _discover_city_markets(city: City, today: date, db: AsyncSession) -> int:
-    """Fetch today's Polymarket event for a city and seed markets + outcomes."""
+
+async def _discover_city_markets(city: City, target_date: date, db: AsyncSession) -> int:
+    """Fetch Polymarket event for a city/date and seed markets + outcomes."""
     slug = (
         f"highest-temperature-in-{city.polymarket_slug}"
-        f"-on-{today.strftime('%B').lower()}-{today.day}-{today.year}"
+        f"-on-{target_date.strftime('%B').lower()}-{target_date.day}-{target_date.year}"
     )
 
     existing = await db.execute(select(Market).where(Market.external_id == slug))
@@ -50,7 +55,7 @@ async def _discover_city_markets(city: City, today: date, db: AsyncSession) -> i
         return 0
 
     if not events:
-        logger.info(f"No Polymarket event found: {slug}")
+        logger.debug(f"No Polymarket event found: {slug}")
         return 0
 
     event = events[0] if isinstance(events, list) else events
@@ -67,8 +72,8 @@ async def _discover_city_markets(city: City, today: date, db: AsyncSession) -> i
         city_id=city.id,
         external_id=slug,
         platform="polymarket",
-        question=event.get("title") or f"Highest temperature in {city.name} on {today}",
-        event_date=today,
+        question=event.get("title") or f"Highest temperature in {city.name} on {target_date}",
+        event_date=target_date,
         resolution_time=resolution_time,
         resolution_source=event.get("description", "Wunderground"),
     )
@@ -79,13 +84,14 @@ async def _discover_city_markets(city: City, today: date, db: AsyncSession) -> i
     for m in event.get("markets", []):
         question = m.get("question", "")
 
-        # Extract temperature thresholds from question text
         temps = [int(t) for t in re.findall(r"(\d+)\s*°?F", question)]
         bucket_min = temps[0] if len(temps) >= 1 else None
         bucket_max = temps[1] if len(temps) >= 2 else None
-        bucket_label = question[:50] if question else (f"{bucket_min}-{bucket_max}°F" if bucket_max else f"{bucket_min}+°F")
+        bucket_label = (
+            question[:50] if question
+            else (f"{bucket_min}-{bucket_max}°F" if bucket_max else f"{bucket_min}+°F")
+        )
 
-        # Get YES token ID from tokens array
         token_id: Optional[str] = None
         for token in m.get("tokens", []):
             if str(token.get("outcome", "")).lower() == "yes":
@@ -93,6 +99,13 @@ async def _discover_city_markets(city: City, today: date, db: AsyncSession) -> i
                 break
         if not token_id:
             ids = m.get("clobTokenIds") or []
+            if isinstance(ids, str):
+                # Sometimes clobTokenIds is a JSON-encoded string
+                import json
+                try:
+                    ids = json.loads(ids)
+                except json.JSONDecodeError:
+                    ids = []
             token_id = ids[0] if ids else None
 
         outcome = MarketOutcome(
@@ -111,18 +124,30 @@ async def _discover_city_markets(city: City, today: date, db: AsyncSession) -> i
 
 
 async def job_discover_markets():
-    """Discover today's Polymarket weather markets for all active cities."""
+    """Discover Polymarket weather markets for all active cities, today + N future days."""
     today = date.today()
+    dates = [today + timedelta(days=i) for i in range(MARKET_DISCOVERY_DAYS_AHEAD)]
+    total = 0
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(City).where(City.active == True, City.polymarket_slug != None))
+        result = await db.execute(
+            select(City).where(City.active == True, City.polymarket_slug != None)
+        )
         cities = result.scalars().all()
+        if not cities:
+            logger.warning("job_discover_markets: no cities with polymarket_slug found")
+            return
+        logger.info(f"job_discover_markets: scanning {len(cities)} cities x {len(dates)} dates")
         for city in cities:
-            try:
-                found = await _discover_city_markets(city, today, db)
-                if found:
-                    logger.info(f"{city.name}: {found} outcomes discovered")
-            except Exception as e:
-                logger.error(f"Market discovery failed for {city.name}: {e}", exc_info=True)
+            for target_date in dates:
+                try:
+                    found = await _discover_city_markets(city, target_date, db)
+                    total += found
+                except Exception as e:
+                    logger.error(
+                        f"Market discovery failed for {city.name} {target_date}: {e}",
+                        exc_info=True,
+                    )
+    logger.info(f"job_discover_markets: total {total} new outcomes added")
 
 
 async def job_fetch_metars():
@@ -151,33 +176,41 @@ async def job_fetch_wunderground():
 
 
 async def job_fetch_nws():
+    """Fetch NWS forecast for today + N future days."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
         cities = result.scalars().all()
         today = date.today()
+        dates = [today + timedelta(days=i) for i in range(FORECAST_DAYS_AHEAD)]
         for city in cities:
             if city.nws_lat is None or city.nws_lon is None:
                 continue
-            try:
-                await nws_col.collect_and_store(city.id, float(city.nws_lat), float(city.nws_lon), today, db)
-            except Exception as e:
-                logger.error(f"NWS job failed for {city.name}: {e}")
+            for d in dates:
+                try:
+                    await nws_col.collect_and_store(
+                        city.id, float(city.nws_lat), float(city.nws_lon), d, db
+                    )
+                except Exception as e:
+                    logger.error(f"NWS job failed for {city.name} {d}: {e}")
 
 
 async def job_fetch_models():
+    """Fetch GFS/ECMWF model data for today + N future days."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
         cities = result.scalars().all()
         today = date.today()
+        dates = [today + timedelta(days=i) for i in range(FORECAST_DAYS_AHEAD)]
         for city in cities:
             if city.nws_lat is None or city.nws_lon is None:
                 continue
             lat, lon = float(city.nws_lat), float(city.nws_lon)
-            for model in ("gfs", "ecmwf"):
-                try:
-                    await gfs_col.collect_and_store(city.id, lat, lon, today, db, model)
-                except Exception as e:
-                    logger.error(f"{model} job failed for {city.name}: {e}")
+            for d in dates:
+                for model in ("gfs", "ecmwf"):
+                    try:
+                        await gfs_col.collect_and_store(city.id, lat, lon, d, db, model)
+                    except Exception as e:
+                        logger.error(f"{model} job failed for {city.name} {d}: {e}")
 
 
 async def job_fetch_pireps():
@@ -213,6 +246,8 @@ async def job_run_analyzer():
     async with AsyncSessionLocal() as db:
         try:
             opportunities = await detect_opportunities(db)
+            if opportunities:
+                logger.info(f"job_run_analyzer: {len(opportunities)} opportunities found")
             for opp in opportunities:
                 try:
                     await send_opportunity_alert(opp, db)
