@@ -1,9 +1,11 @@
 """
 Parse the Aviation Weather JSON METAR response into a flat dict.
 Aviation Weather API returns obsTime as a Unix timestamp (int), not ISO string.
+Wind direction can be 'VRB' (variable) — stored as None.
 """
 from datetime import datetime, timezone
 from typing import Optional
+import math
 
 
 def _c_to_f(c: Optional[float]) -> Optional[float]:
@@ -15,7 +17,6 @@ def _c_to_f(c: Optional[float]) -> Optional[float]:
 def _dewpoint_to_humidity(temp_f: Optional[float], dew_f: Optional[float]) -> Optional[int]:
     if temp_f is None or dew_f is None:
         return None
-    import math
     temp_c = (temp_f - 32) * 5 / 9
     dew_c = (dew_f - 32) * 5 / 9
     rh = 100 * math.exp(17.625 * dew_c / (243.04 + dew_c)) / math.exp(17.625 * temp_c / (243.04 + temp_c))
@@ -23,7 +24,6 @@ def _dewpoint_to_humidity(temp_f: Optional[float], dew_f: Optional[float]) -> Op
 
 
 def _parse_timestamp(value) -> datetime:
-    """Accept Unix int, float, or ISO string."""
     if value is None:
         return datetime.now(timezone.utc)
     if isinstance(value, (int, float)):
@@ -37,6 +37,16 @@ def _parse_timestamp(value) -> datetime:
         return datetime.now(timezone.utc)
 
 
+def _parse_int(value) -> Optional[int]:
+    """Parse int, returning None for non-numeric values like 'VRB'."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
 def parse_metar_json(record: dict) -> dict:
     temp_c = record.get("temp")
     dew_c = record.get("dewp")
@@ -48,11 +58,7 @@ def parse_metar_json(record: dict) -> dict:
     altim = record.get("altim")
     pressure_hg = round(altim * 0.02953, 2) if altim else None
 
-    wdir = record.get("wdir")
-    wspd = record.get("wspd")
-    wgst = record.get("wgst")
     visib = record.get("visib")
-
     wxstring = record.get("wxString") or record.get("wx_string") or ""
     sky = record.get("sky") or record.get("skyCondition") or ""
     if isinstance(sky, list):
@@ -64,9 +70,9 @@ def parse_metar_json(record: dict) -> dict:
         "temperature_f": temp_f,
         "dew_point_f": dew_f,
         "humidity_pct": _dewpoint_to_humidity(temp_f, dew_f),
-        "wind_direction": int(wdir) if wdir is not None else None,
-        "wind_speed_kt": int(wspd) if wspd is not None else None,
-        "wind_gust_kt": int(wgst) if wgst is not None else None,
+        "wind_direction": _parse_int(record.get("wdir")),
+        "wind_speed_kt": _parse_int(record.get("wspd")),
+        "wind_gust_kt": _parse_int(record.get("wgst")),
         "pressure_hg": pressure_hg,
         "visibility_sm": float(visib) if visib is not None else None,
         "conditions": conditions,

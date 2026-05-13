@@ -34,6 +34,7 @@ class MarketOutcome(Base):
     bucket_label = Column(String(50), nullable=False)
     bucket_min = Column(Integer)
     bucket_max = Column(Integer)
+    token_id = Column(String(100))  # Polymarket CLOB YES-token ID for price fetching
 
     market = relationship("Market", back_populates="outcomes")
     prices = relationship("MarketPrice", back_populates="outcome")
