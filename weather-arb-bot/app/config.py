@@ -13,11 +13,12 @@ class Settings(BaseSettings):
     polymarket_api_key: str = ""
     app_env: str = "development"
     secret_key: str = "changeme"
+    admin_password: str = ""
     cors_origins: str = "http://localhost:3000"
     metar_fetch_interval: int = 300       # 5 min
-    polymarket_fetch_interval: int = 300  # 5 min (was 30s — too aggressive)
+    polymarket_fetch_interval: int = 300  # 5 min
     wunderground_fetch_interval: int = 1800
-    analyzer_run_interval: int = 300      # 5 min (was 120s)
+    analyzer_run_interval: int = 300      # 5 min
     min_confidence_for_alert: int = 60
     min_edge_for_alert: float = 0.15
     alert_dedup_minutes: int = 30
