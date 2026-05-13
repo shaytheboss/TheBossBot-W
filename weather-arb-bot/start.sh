@@ -5,7 +5,7 @@ echo "Running database migrations..."
 alembic upgrade head
 
 echo "Seeding cities..."
-python -m scripts.seed_cities
+python -m scripts.seed_cities || echo "WARNING: seed_cities failed or skipped"
 
 echo "Starting scheduler in background..."
 python -m app.workers.scheduler &
