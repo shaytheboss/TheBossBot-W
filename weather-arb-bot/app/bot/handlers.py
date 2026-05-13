@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 _FORECAST_SOURCES = ["gfs", "ecmwf", "nws", "wunderground"]
 
 
+def _polymarket_url(slug: str) -> str:
+    return f"https://polymarket.com/event/{slug}"
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     async with AsyncSessionLocal() as db:
@@ -27,8 +31,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = (
                 "Welcome to *Weather Arbitrage Bot*!\n\n"
                 "Commands:\n"
-                "/status — all monitored stations\n"
-                "/scan — fetch Polymarket data + compare forecasts (no threshold)\n"
+                "/status — current stations\n"
+                "/scan — fetch Polymarket + compare (no threshold)\n"
                 "/watch SF — watch a city\n"
                 "/unwatch SF — stop watching\n"
                 "/settings — configure alerts\n"
@@ -43,7 +47,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
         cities = result.scalars().all()
-
         if not cities:
             await update.message.reply_text("No cities seeded yet. Contact admin.")
             return
@@ -61,7 +64,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             metar = metar_result.scalar_one_or_none()
 
-            # Collect ALL available forecasts for today from all sources
             forecasts_by_source = {}
             for source in _FORECAST_SOURCES:
                 forecast_result = await db.execute(
@@ -113,7 +115,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as db:
         cities_result = await db.execute(select(City).where(City.active == True))
         all_cities = list(cities_result.scalars().all())
-        cities_by_id = {c.id: c for c in all_cities}
 
         total_with_prices = 0
         total_no_prices = 0
@@ -127,7 +128,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
             day_markets = markets_result.scalars().all()
-            city_ids_with_market = {m.city_id for m in day_markets}
 
             lines = [f"\U0001f4c5 *{target_date.strftime('%b %d')}*"]
 
@@ -146,20 +146,18 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 outcomes = outcomes_result.scalars().all()
 
+                poly_link = _polymarket_url(city_market.external_id)
+                city_header = f"\U0001f4cd *{city.name}* `{city.primary_icao}` — [Polymarket]({poly_link})"
+
                 if not outcomes:
-                    lines.append(
-                        f"\U0001f4cd {city.name} `{city.primary_icao}`: market found, no outcomes"
-                    )
+                    lines.append(city_header + " — no outcomes")
                     continue
 
-                city_lines = [f"\U0001f4cd *{city.name}* `{city.primary_icao}`"]
-                city_has_price = False
-
+                city_lines = [city_header]
                 for outcome in outcomes:
                     try:
                         signals = await aggregator.aggregate(
-                            db=db,
-                            city_id=city.id,
+                            db=db, city_id=city.id,
                             primary_icao=city.primary_icao,
                             reference_icao=city.reference_icao,
                             outcome=outcome,
@@ -169,17 +167,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                     price_info = signals.get("market_price")
-                    true_prob = estimate_true_probability(
-                        signals, outcome.bucket_min, outcome.bucket_max
-                    )
-                    confidence = compute_confidence(
-                        signals, outcome.bucket_min, outcome.bucket_max
-                    )
-
+                    true_prob = estimate_true_probability(signals, outcome.bucket_min, outcome.bucket_max)
+                    confidence = compute_confidence(signals, outcome.bucket_min, outcome.bucket_max)
                     label = outcome.bucket_label[:32]
 
                     if price_info:
-                        city_has_price = True
                         total_with_prices += 1
                         yes_price = price_info["yes_price"]
                         edge = true_prob - yes_price
@@ -195,12 +187,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 lines.extend(city_lines)
 
-            # Send one message per day to stay within Telegram's 4096-char limit
             text = "\n".join(lines)
             if len(text) > 3800:
                 text = text[:3800] + "\n…(truncated)"
             try:
-                await update.message.reply_markdown(text)
+                await update.message.reply_markdown(
+                    text, disable_web_page_preview=True
+                )
             except Exception as e:
                 logger.error(f"cmd_scan send error: {e}")
                 try:
@@ -209,10 +202,11 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
         summary = (
-            f"✅ Scan complete — "
-            f"{total_with_prices} outcomes with prices | "
+            f"✅ Scan done — "
+            f"{total_with_prices} with prices | "
             f"{total_no_prices} no price | "
-            f"{total_not_found} markets not discovered"
+            f"{total_not_found} not discovered. "
+            f"See Railway logs for raw slugs Gamma returned."
         )
         await update.message.reply_text(summary)
 

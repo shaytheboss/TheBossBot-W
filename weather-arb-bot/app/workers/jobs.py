@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import json
 import logging
 import re
@@ -33,35 +34,96 @@ poly_col = PolymarketCollector()
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-# How many days ahead to scan Polymarket for markets
-MARKET_DISCOVERY_DAYS_AHEAD = 7
-# How many days ahead to pull weather forecasts
+# Days ahead to track
 FORECAST_DAYS_AHEAD = 7
 
+# Polymarket sometimes uses different slug names than our canonical city slug.
+CITY_ALIAS_OVERRIDES = {
+    "nyc": ["nyc", "new-york", "new-york-city", "newyork"],
+    "la": ["la", "los-angeles", "losangeles"],
+    "san-francisco": ["san-francisco", "sf", "sanfrancisco"],
+    "washington-dc": ["washington-dc", "dc", "washington"],
+    "philadelphia": ["philadelphia", "philly"],
+    "dallas": ["dallas", "dfw", "dallas-fort-worth"],
+}
 
-async def _discover_city_markets(city: City, target_date: date, db: AsyncSession) -> int:
-    """Fetch Polymarket event for a city/date and seed markets + outcomes."""
-    slug = (
-        f"highest-temperature-in-{city.polymarket_slug}"
-        f"-on-{target_date.strftime('%B').lower()}-{target_date.day}-{target_date.year}"
-    )
+# Match slugs like:
+#   highest-temperature-in-nyc-on-may-13-2026
+#   highest-temperature-in-nyc-on-may-13
+#   nyc-highest-temperature-on-may-13-2026
+TEMP_SLUG_RX_A = re.compile(
+    r"^highest[-_]temperature[-_]in[-_]([a-z][a-z0-9-]*?)[-_]on[-_]"
+    r"([a-z]+)[-_](\d{1,2})(?:[-_](\d{4}))?$"
+)
+TEMP_SLUG_RX_B = re.compile(
+    r"^([a-z][a-z0-9-]*?)[-_]highest[-_]temperature[-_]on[-_]"
+    r"([a-z]+)[-_](\d{1,2})(?:[-_](\d{4}))?$"
+)
+
+_MONTH_BY_NAME = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+
+
+def _city_aliases(city: City) -> list[str]:
+    slug = city.polymarket_slug
+    if not slug:
+        return []
+    return CITY_ALIAS_OVERRIDES.get(slug, [slug])
+
+
+def _parse_temp_slug(slug: str):
+    """Return (city_alias, date) if slug looks like a daily-high temp market, else None."""
+    s = slug.lower()
+    for rx in (TEMP_SLUG_RX_A, TEMP_SLUG_RX_B):
+        m = rx.match(s)
+        if not m:
+            continue
+        city_alias, month_name, day_str, year_str = m.groups()
+        month = _MONTH_BY_NAME.get(month_name)
+        if not month:
+            continue
+        try:
+            year = int(year_str) if year_str else date.today().year
+            day = int(day_str)
+            return city_alias, date(year, month, day)
+        except ValueError:
+            continue
+    return None
+
+
+async def _fetch_all_active_events() -> list[dict]:
+    """Paginate through Polymarket Gamma API for all open events."""
+    events: list[dict] = []
+    offset = 0
+    page_size = 100
+    safety_limit = 50  # 50 pages * 100 = up to 5000 events
+    for _ in range(safety_limit):
+        try:
+            resp = await poly_col._get(
+                f"{GAMMA_API}/events",
+                params={"closed": "false", "limit": page_size, "offset": offset},
+            )
+            batch = resp.json()
+        except Exception as e:
+            logger.error(f"Gamma events fetch failed at offset={offset}: {e}")
+            break
+        if not batch:
+            break
+        events.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return events
+
+
+async def _create_market_from_event(
+    event: dict, city: City, target_date: date, db: AsyncSession
+) -> int:
+    """Insert Market + MarketOutcome rows from a Polymarket event payload."""
+    slug = event.get("slug") or f"{city.polymarket_slug}-{target_date.isoformat()}"
 
     existing = await db.execute(select(Market).where(Market.external_id == slug))
     if existing.scalar_one_or_none():
         return 0
-
-    try:
-        resp = await poly_col._get(f"{GAMMA_API}/events", params={"slug": slug})
-        events = resp.json()
-    except Exception as e:
-        logger.warning(f"Gamma API failed for {slug}: {e}")
-        return 0
-
-    if not events:
-        logger.debug(f"No Polymarket event found: {slug}")
-        return 0
-
-    event = events[0] if isinstance(events, list) else events
 
     end_str = event.get("endDate") or event.get("end_date_iso")
     resolution_time: Optional[datetime] = None
@@ -75,28 +137,28 @@ async def _discover_city_markets(city: City, target_date: date, db: AsyncSession
         city_id=city.id,
         external_id=slug,
         platform="polymarket",
-        question=event.get("title") or f"Highest temperature in {city.name} on {target_date}",
+        question=event.get("title") or f"Highest temp in {city.name} on {target_date}",
         event_date=target_date,
         resolution_time=resolution_time,
-        resolution_source=event.get("description", "Wunderground"),
+        resolution_source=event.get("description", "")[:500] if event.get("description") else None,
     )
     db.add(market)
     await db.flush()
 
     count = 0
     for m in event.get("markets", []):
-        question = m.get("question", "")
-
+        question = m.get("question", "") or m.get("groupItemTitle", "")
         temps = [int(t) for t in re.findall(r"(\d+)\s*°?F", question)]
         bucket_min = temps[0] if len(temps) >= 1 else None
         bucket_max = temps[1] if len(temps) >= 2 else None
         bucket_label = (
-            question[:50] if question
+            question[:50]
+            if question
             else (f"{bucket_min}-{bucket_max}°F" if bucket_max else f"{bucket_min}+°F")
         )
 
         token_id: Optional[str] = None
-        for token in m.get("tokens", []):
+        for token in m.get("tokens", []) or []:
             if str(token.get("outcome", "")).lower() == "yes":
                 token_id = token.get("tokenId")
                 break
@@ -111,7 +173,7 @@ async def _discover_city_markets(city: City, target_date: date, db: AsyncSession
 
         outcome = MarketOutcome(
             market_id=market.id,
-            bucket_label=bucket_label,
+            bucket_label=bucket_label or "unknown",
             bucket_min=bucket_min,
             bucket_max=bucket_max,
             token_id=token_id,
@@ -120,35 +182,65 @@ async def _discover_city_markets(city: City, target_date: date, db: AsyncSession
         count += 1
 
     await db.commit()
-    logger.info(f"Discovered {count} outcomes for {slug}")
+    logger.info(f"Discovered {count} outcomes for {slug} ({city.name} {target_date})")
     return count
 
 
 async def job_discover_markets():
-    """Discover Polymarket weather markets for all active cities, today + N future days."""
-    today = date.today()
-    dates = [today + timedelta(days=i) for i in range(MARKET_DISCOVERY_DAYS_AHEAD)]
-    total = 0
+    """Pull all open Polymarket events, find daily-high temperature markets, match to our cities."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(City).where(City.active == True, City.polymarket_slug != None)
         )
         cities = result.scalars().all()
         if not cities:
-            logger.warning("job_discover_markets: no cities with polymarket_slug found")
+            logger.warning("job_discover_markets: no cities with polymarket_slug")
             return
-        logger.info(f"job_discover_markets: scanning {len(cities)} cities x {len(dates)} dates")
+
+        # Build alias -> city map
+        alias_to_city: dict[str, City] = {}
         for city in cities:
-            for target_date in dates:
-                try:
-                    found = await _discover_city_markets(city, target_date, db)
-                    total += found
-                except Exception as e:
-                    logger.error(
-                        f"Market discovery failed for {city.name} {target_date}: {e}",
-                        exc_info=True,
-                    )
-    logger.info(f"job_discover_markets: total {total} new outcomes added")
+            for alias in _city_aliases(city):
+                alias_to_city[alias.lower()] = city
+
+        events = await _fetch_all_active_events()
+        logger.info(f"job_discover_markets: fetched {len(events)} open events from Gamma")
+
+        # Optional: log temperature-looking events for debugging
+        temp_events = []
+        unmatched_aliases: set[str] = set()
+        today = date.today()
+        horizon = today + timedelta(days=FORECAST_DAYS_AHEAD)
+        total_new = 0
+
+        for event in events:
+            slug = (event.get("slug") or "").lower()
+            if "temperature" not in slug:
+                continue
+            temp_events.append(slug)
+            parsed = _parse_temp_slug(slug)
+            if not parsed:
+                continue
+            city_alias, target_date = parsed
+            if target_date < today or target_date > horizon:
+                continue
+            city = alias_to_city.get(city_alias)
+            if not city:
+                unmatched_aliases.add(city_alias)
+                continue
+            try:
+                total_new += await _create_market_from_event(event, city, target_date, db)
+            except Exception as e:
+                logger.error(f"_create_market_from_event failed for {slug}: {e}", exc_info=True)
+
+        logger.info(
+            f"job_discover_markets: temp_events_seen={len(temp_events)} "
+            f"unmatched_city_aliases={sorted(unmatched_aliases)} new_outcomes={total_new}"
+        )
+        if temp_events and total_new == 0:
+            # Help debugging: show first few slugs that we saw but didn't import
+            sample = temp_events[:8]
+            logger.info(f"job_discover_markets: sample temperature slugs seen: {sample}")
 
 
 async def job_fetch_metars():
@@ -177,7 +269,6 @@ async def job_fetch_wunderground():
 
 
 async def job_fetch_nws():
-    """Fetch NWS forecast for today + N future days."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
         cities = result.scalars().all()
@@ -196,7 +287,6 @@ async def job_fetch_nws():
 
 
 async def job_fetch_models():
-    """Fetch GFS/ECMWF model data for today + N future days."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
         cities = result.scalars().all()
@@ -226,7 +316,6 @@ async def job_fetch_pireps():
 
 
 async def job_fetch_polymarket():
-    """Fetch current prices for all tracked outcomes that have a token_id."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(MarketOutcome)
@@ -235,7 +324,7 @@ async def job_fetch_polymarket():
         )
         outcomes = result.scalars().all()
         if not outcomes:
-            logger.debug("job_fetch_polymarket: no outcomes with token_id found")
+            logger.debug("job_fetch_polymarket: no outcomes with token_id")
             return
         logger.info(f"job_fetch_polymarket: fetching prices for {len(outcomes)} outcomes")
         for outcome in outcomes:
@@ -263,7 +352,6 @@ async def job_run_analyzer():
 async def _send_resolution_alert(
     city: City, market: Market, actual_high_f: float, opps: list, winning_outcome_ids: set, db
 ) -> None:
-    """Notify all Telegram users about a resolved market's win/loss outcome."""
     from app.models.alert import TelegramUser
     from app.config import settings
     from telegram import Bot
@@ -284,24 +372,24 @@ async def _send_resolution_alert(
     else:
         header = "\U0001f91d *Resolution PUSH*"
 
+    poly_url = f"https://polymarket.com/event/{market.external_id}"
     lines = [
-        f"{header}",
+        header,
         f"\U0001f4cd {city.name} (`{city.primary_icao}`) — {market.event_date.strftime('%b %d, %Y')}",
         f"\U0001f321️ Actual high: *{actual_high_f}°F*",
+        f"[Polymarket]({poly_url})",
         "",
     ]
     for opp in opps:
-        from app.models.market import MarketOutcome as MO
-        oc_res = await db.execute(select(MO).where(MO.id == opp.outcome_id))
+        oc_res = await db.execute(select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id))
         oc = oc_res.scalar_one_or_none()
         label = oc.bucket_label if oc else f"outcome #{opp.outcome_id}"
-        result_emoji = "✅" if opp.outcome == "WIN" else "❌"
+        emoji = "✅" if opp.outcome == "WIN" else "❌"
         lines.append(
-            f"{result_emoji} {label[:35]} {opp.side} @ {round(float(opp.market_price)*100)}¢ → {opp.outcome}"
+            f"{emoji} {label[:35]} {opp.side} @ {round(float(opp.market_price)*100)}¢ → {opp.outcome}"
         )
 
     text = "\n".join(lines)
-
     users_result = await db.execute(select(TelegramUser))
     users = users_result.scalars().all()
     bot = Bot(token=settings.telegram_bot_token)
@@ -315,7 +403,6 @@ async def _send_resolution_alert(
 
 
 async def job_check_resolutions():
-    """Find past unresolved markets, determine actual high from METAR, send win/loss alerts."""
     today = date.today()
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -324,25 +411,20 @@ async def job_check_resolutions():
             .order_by(Market.event_date)
         )
         markets = result.scalars().all()
-
         if not markets:
             return
-
         logger.info(f"job_check_resolutions: checking {len(markets)} unresolved past markets")
-
         for market in markets:
             city_result = await db.execute(select(City).where(City.id == market.city_id))
             city = city_result.scalar_one_or_none()
             if not city:
                 continue
 
-            # Find the actual daily high from METAR observations
             day_start = datetime(
                 market.event_date.year, market.event_date.month, market.event_date.day,
                 tzinfo=timezone.utc,
             )
             day_end = day_start + timedelta(days=1)
-
             temp_result = await db.execute(
                 select(sqlfunc.max(MetarObservation.temperature_f)).where(
                     MetarObservation.icao == city.primary_icao,
@@ -351,50 +433,39 @@ async def job_check_resolutions():
                 )
             )
             actual_high_raw = temp_result.scalar_one_or_none()
-
             if actual_high_raw is None:
-                logger.debug(
-                    f"No METAR data for {city.name} on {market.event_date} — skipping resolution"
-                )
+                logger.debug(f"No METAR for {city.name} {market.event_date} — skip resolution")
                 continue
-
             actual_high_f = float(actual_high_raw)
             logger.info(f"Resolving {market.external_id}: actual high = {actual_high_f}°F")
 
-            # Determine which outcome bucket(s) contain the actual high
             outcomes_result = await db.execute(
                 select(MarketOutcome).where(MarketOutcome.market_id == market.id)
             )
             outcomes = outcomes_result.scalars().all()
-
             winning_outcome_ids: set = set()
             for outcome in outcomes:
-                b_min = outcome.bucket_min
-                b_max = outcome.bucket_max
-                if b_min is not None and b_max is not None:
-                    if b_min <= actual_high_f < b_max:
+                bn, bx = outcome.bucket_min, outcome.bucket_max
+                if bn is not None and bx is not None:
+                    if bn <= actual_high_f < bx:
                         winning_outcome_ids.add(outcome.id)
-                elif b_min is not None and b_max is None:
-                    # Open-ended upper bucket (e.g. "100+°F")
-                    if actual_high_f >= b_min:
+                elif bn is not None and bx is None:
+                    if actual_high_f >= bn:
                         winning_outcome_ids.add(outcome.id)
 
-            # Mark market resolved
             market.resolved = True
             market.resolution_value = f"{actual_high_f}°F"
 
-            # Grade our opportunities
             opps_result = await db.execute(
                 select(Opportunity)
                 .join(MarketOutcome)
                 .where(
                     MarketOutcome.market_id == market.id,
                     Opportunity.alert_sent == True,
-                    Opportunity.outcome == None,  # not yet graded
+                    Opportunity.outcome == None,
                 )
             )
             opps = opps_result.scalars().all()
-
             now = datetime.now(timezone.utc)
             for opp in opps:
                 bucket_won = opp.outcome_id in winning_outcome_ids
@@ -403,14 +474,10 @@ async def job_check_resolutions():
                 else:
                     opp.outcome = "WIN" if not bucket_won else "LOSS"
                 opp.closed_at = now
-
             await db.commit()
 
-            # Send resolution notification if we had any active recommendations
             if opps:
                 try:
-                    await _send_resolution_alert(
-                        city, market, actual_high_f, opps, winning_outcome_ids, db
-                    )
+                    await _send_resolution_alert(city, market, actual_high_f, opps, winning_outcome_ids, db)
                 except Exception as e:
                     logger.error(f"Failed to send resolution alert for {market.external_id}: {e}")
