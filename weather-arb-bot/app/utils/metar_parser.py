@@ -2,6 +2,7 @@
 Parse the Aviation Weather JSON METAR response into a flat dict.
 Aviation Weather API returns obsTime as a Unix timestamp (int), not ISO string.
 Wind direction can be 'VRB' (variable) — stored as None.
+Visibility can be '10+' (greater than 10 SM) — stored as 10.0.
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -47,6 +48,16 @@ def _parse_int(value) -> Optional[int]:
         return None
 
 
+def _parse_float(value) -> Optional[float]:
+    """Parse float, stripping trailing '+' for values like '10+' (>10 SM)."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).rstrip('+').strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def parse_metar_json(record: dict) -> dict:
     temp_c = record.get("temp")
     dew_c = record.get("dewp")
@@ -74,7 +85,7 @@ def parse_metar_json(record: dict) -> dict:
         "wind_speed_kt": _parse_int(record.get("wspd")),
         "wind_gust_kt": _parse_int(record.get("wgst")),
         "pressure_hg": pressure_hg,
-        "visibility_sm": float(visib) if visib is not None else None,
+        "visibility_sm": _parse_float(visib),
         "conditions": conditions,
         "raw_metar": record.get("rawOb") or record.get("raw_text"),
     }

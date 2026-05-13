@@ -3,7 +3,8 @@
 Run once after migrations:
   python -m scripts.seed_cities
 
-Idempotent — skips cities that already exist (matched by primary_icao).
+Idempotent — upserts based on primary_icao. Updates polymarket_slug and
+other fields for existing rows so re-deploys pick up any changes.
 
 Station sources: Polymarket resolves via Wunderground historical data.
 Verify each URL against the market's resolution rules page on Polymarket.
@@ -102,25 +103,36 @@ CITIES = [
 async def seed():
     async with AsyncSessionLocal() as db:
         for (name, slug, primary, reference, wu_url, lat, lon, tz) in CITIES:
-            existing = await db.execute(
+            result = await db.execute(
                 select(City).where(City.primary_icao == primary)
             )
-            if existing.scalar_one_or_none():
-                logger.info(f"Skipping {name} ({primary}) — already exists")
-                continue
-            city = City(
-                name=name,
-                polymarket_slug=slug,
-                primary_icao=primary,
-                reference_icao=reference,
-                wunderground_url=wu_url,
-                nws_lat=lat,
-                nws_lon=lon,
-                timezone=tz,
-                active=True,
-            )
-            db.add(city)
-            logger.info(f"Added {name} ({primary})")
+            city = result.scalar_one_or_none()
+            if city:
+                updated = False
+                if not city.polymarket_slug:
+                    city.polymarket_slug = slug
+                    updated = True
+                if not city.wunderground_url:
+                    city.wunderground_url = wu_url
+                    updated = True
+                if updated:
+                    logger.info(f"Updated {name} ({primary}) — set missing fields")
+                else:
+                    logger.info(f"Skipping {name} ({primary}) — already up to date")
+            else:
+                city = City(
+                    name=name,
+                    polymarket_slug=slug,
+                    primary_icao=primary,
+                    reference_icao=reference,
+                    wunderground_url=wu_url,
+                    nws_lat=lat,
+                    nws_lon=lon,
+                    timezone=tz,
+                    active=True,
+                )
+                db.add(city)
+                logger.info(f"Added {name} ({primary})")
         await db.commit()
     logger.info("Seed complete.")
 
