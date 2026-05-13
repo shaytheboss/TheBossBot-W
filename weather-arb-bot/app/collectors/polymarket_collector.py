@@ -17,8 +17,11 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 class PolymarketCollector(BaseCollector):
     name = "polymarket"
 
+    async def collect(self, token_id: str, *args, **kwargs) -> Optional[dict]:
+        """Fetch current price for a single token."""
+        return await self.get_prices([token_id])
+
     async def get_market(self, market_id: str) -> Optional[dict]:
-        """Fetch market metadata from Gamma API."""
         try:
             resp = await self._get(f"{GAMMA_API_BASE}/markets/{market_id}")
             return resp.json()
@@ -27,7 +30,6 @@ class PolymarketCollector(BaseCollector):
             return None
 
     async def get_prices(self, token_ids: List[str]) -> Optional[dict]:
-        """Fetch current mid-market prices for a list of token IDs."""
         if not token_ids:
             return {}
         try:
@@ -41,7 +43,6 @@ class PolymarketCollector(BaseCollector):
             return None
 
     async def get_orderbook(self, token_id: str) -> Optional[dict]:
-        """Fetch order book for a token to compute best bid/ask."""
         try:
             resp = await self._get(f"{CLOB_API_BASE}/book", params={"token_id": token_id})
             return resp.json()
@@ -52,7 +53,6 @@ class PolymarketCollector(BaseCollector):
     async def collect_and_store(
         self, outcome_id: int, token_id: str, db: AsyncSession
     ) -> Optional[dict]:
-        """Fetch current price for a token and store it."""
         prices = await self.get_prices([token_id])
         if not prices or token_id not in prices:
             return None
