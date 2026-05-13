@@ -4,6 +4,9 @@ set -e
 echo "Running database migrations..."
 alembic upgrade head
 
+echo "Seeding cities..."
+python -m scripts.seed_cities
+
 echo "Starting scheduler in background..."
 python -m app.workers.scheduler &
 SCHEDULER_PID=$!

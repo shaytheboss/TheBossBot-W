@@ -17,6 +17,7 @@ class City(Base):
     timezone = Column(String(50), nullable=False)
     buoy_id = Column(String(10))
     active = Column(Boolean, default=True)
+    polymarket_slug = Column(String(60))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     markets = relationship("Market", back_populates="city")
