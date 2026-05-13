@@ -1,6 +1,6 @@
 """
 Parse the Aviation Weather JSON METAR response into a flat dict.
-Aviation Weather API returns camelCase fields.
+Aviation Weather API returns obsTime as a Unix timestamp (int), not ISO string.
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -13,48 +13,50 @@ def _c_to_f(c: Optional[float]) -> Optional[float]:
 
 
 def _dewpoint_to_humidity(temp_f: Optional[float], dew_f: Optional[float]) -> Optional[int]:
-    """Approximate relative humidity from temp and dew point (Magnus formula)."""
     if temp_f is None or dew_f is None:
         return None
+    import math
     temp_c = (temp_f - 32) * 5 / 9
     dew_c = (dew_f - 32) * 5 / 9
-    rh = 100 * (
-        (17.625 * dew_c / (243.04 + dew_c)).real.__class__(1) *
-        __import__("math").exp(17.625 * dew_c / (243.04 + dew_c)) /
-        __import__("math").exp(17.625 * temp_c / (243.04 + temp_c))
-    )
+    rh = 100 * math.exp(17.625 * dew_c / (243.04 + dew_c)) / math.exp(17.625 * temp_c / (243.04 + temp_c))
     return min(100, max(0, round(rh)))
 
 
-def parse_metar_json(record: dict) -> dict:
-    """Convert Aviation Weather API JSON record to our internal dict."""
-    import math
+def _parse_timestamp(value) -> datetime:
+    """Accept Unix int, float, or ISO string."""
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return datetime.now(timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(timezone.utc)
 
+
+def parse_metar_json(record: dict) -> dict:
     temp_c = record.get("temp")
     dew_c = record.get("dewp")
     temp_f = _c_to_f(temp_c)
     dew_f = _c_to_f(dew_c)
 
-    obs_time_str = record.get("obsTime") or record.get("reportTime")
-    if obs_time_str:
-        try:
-            observed_at = datetime.fromisoformat(obs_time_str.replace("Z", "+00:00"))
-        except ValueError:
-            observed_at = datetime.now(timezone.utc)
-    else:
-        observed_at = datetime.now(timezone.utc)
+    observed_at = _parse_timestamp(record.get("obsTime") or record.get("reportTime"))
 
     altim = record.get("altim")
     pressure_hg = round(altim * 0.02953, 2) if altim else None
 
-    visib = record.get("visib")
-
     wdir = record.get("wdir")
     wspd = record.get("wspd")
     wgst = record.get("wgst")
+    visib = record.get("visib")
 
     wxstring = record.get("wxString") or record.get("wx_string") or ""
     sky = record.get("sky") or record.get("skyCondition") or ""
+    if isinstance(sky, list):
+        sky = " ".join(str(s) for s in sky)
     conditions = " ".join(filter(None, [wxstring, sky])).strip() or None
 
     return {
