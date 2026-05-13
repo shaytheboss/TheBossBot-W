@@ -27,7 +27,6 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger.info("Weather Arbitrage Bot starting up...")
 
-    # Telegram bot
     if settings.telegram_bot_token:
         from app.bot.telegram_bot import get_app
         _bot_app = get_app()
@@ -35,15 +34,18 @@ async def lifespan(app: FastAPI):
         await _bot_app.start()
         logger.info("Telegram bot initialized (webhook mode)")
 
-    # Background scheduler (same process so crashes are visible in logs)
     try:
         from app.workers.jobs import (
+            job_discover_markets,
             job_fetch_metars, job_fetch_wunderground, job_fetch_nws,
             job_fetch_models, job_fetch_pireps, job_fetch_polymarket,
             job_run_analyzer,
         )
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
+        # Discover new markets first (every 30 min, run immediately)
+        _scheduler.add_job(job_discover_markets, IntervalTrigger(seconds=1800),
+                           id="discover", next_run_time=now, max_instances=1, misfire_grace_time=300)
         _scheduler.add_job(job_fetch_metars, IntervalTrigger(seconds=settings.metar_fetch_interval),
                            id="metar", next_run_time=now, max_instances=1, misfire_grace_time=60)
         _scheduler.add_job(job_fetch_wunderground, IntervalTrigger(seconds=settings.wunderground_fetch_interval),
