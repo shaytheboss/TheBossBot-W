@@ -91,22 +91,31 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Trigger Polymarket fetch + forecast comparison for ALL cities, no threshold filter."""
-    await update.message.reply_text(
-        "\U0001f50d Scanning… triggering market discovery + price fetch. "
-        "This may take 30–60 seconds."
-    )
-
-    from app.workers.jobs import job_discover_markets, job_fetch_polymarket
+    from app.workers.jobs import job_discover_markets, job_fetch_polymarket, LAST_DISCOVERY
     from app.models.market import Market, MarketOutcome
     from app.analyzers.signal_aggregator import SignalAggregator
     from app.analyzers.probability_estimator import estimate_true_probability
     from app.analyzers.confidence_scorer import compute_confidence
 
+    await update.message.reply_text(
+        "\U0001f50d Scanning Polymarket… building candidate slugs and querying Gamma."
+    )
+
     try:
-        await job_discover_markets()
+        stats = await job_discover_markets(notify=False)
+        await update.message.reply_markdown(
+            f"\U0001f4e1 Discovery: tried *{stats['candidates_tried']}* slugs, "
+            f"found *{stats['events_found']}* events, "
+            f"ingested *{stats['markets_ingested']}* new outcomes."
+        )
+    except Exception as e:
+        logger.warning(f"cmd_scan discovery error: {e}", exc_info=True)
+        await update.message.reply_text(f"⚠️ Discovery error: {e}")
+
+    try:
         await job_fetch_polymarket()
     except Exception as e:
-        logger.warning(f"cmd_scan data refresh error: {e}")
+        logger.warning(f"cmd_scan price fetch error: {e}")
 
     aggregator = SignalAggregator()
     today = date.today()
@@ -201,12 +210,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+        sample_hits = ", ".join(h["city"] for h in (LAST_DISCOVERY.get("hits") or [])[:5])
         summary = (
             f"✅ Scan done — "
-            f"{total_with_prices} with prices | "
+            f"{total_with_prices} priced | "
             f"{total_no_prices} no price | "
-            f"{total_not_found} not discovered. "
-            f"See Railway logs for raw slugs Gamma returned."
+            f"{total_not_found} missing. "
+            f"Discovery hits: {sample_hits or 'none'}."
         )
         await update.message.reply_text(summary)
 

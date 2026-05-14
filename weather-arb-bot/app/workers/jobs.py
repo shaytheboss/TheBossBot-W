@@ -6,9 +6,11 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 from sqlalchemy import select, func as sqlfunc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.city import City
 from app.models.market import Market, MarketOutcome
@@ -22,6 +24,9 @@ from app.collectors.pirep_collector import PirepCollector
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.analyzers.opportunity_detector import detect_opportunities
 from app.bot.telegram_bot import send_opportunity_alert
+from app.utils.polymarket_discovery import (
+    GAMMA_API, build_all_candidates, fetch_event_by_slug, fetch_events_by_tag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,60 +37,26 @@ gfs_col = GFSCollector()
 pirep_col = PirepCollector()
 poly_col = PolymarketCollector()
 
-GAMMA_API = "https://gamma-api.polymarket.com"
 FORECAST_DAYS_AHEAD = 7
-
-# Search terms for Polymarket Gamma /events?q=<term> — matches the working
-# logic from polymarketweatherassistwebpage.
-POLYMARKET_QUERIES = [
-    "temperature",
-    "highest temperature",
-    "degrees fahrenheit",
-    "hottest",
-    "warmest",
-    "high temp",
-]
-
-# City slug aliases — Polymarket sometimes uses different names than ours.
-CITY_ALIAS_OVERRIDES = {
-    "nyc": ["nyc", "new-york", "new-york-city", "newyork"],
-    "los-angeles": ["los-angeles", "la", "losangeles"],
-    "san-francisco": ["san-francisco", "sf", "sanfrancisco"],
-    "washington-dc": ["washington-dc", "dc", "washington"],
-    "philadelphia": ["philadelphia", "philly"],
-    "dallas": ["dallas", "dfw", "dallas-fort-worth"],
-}
+DISCOVERY_CONCURRENCY = 10
 
 # ICAO codes Polymarket weather markets resolve via, mapped to our city slugs.
-# Source: polymarketweatherassistwebpage working code.
 POLYMARKET_ICAO_TO_CITY_SLUG = {
-    "KNYC": "nyc",          # NYC — Central Park
-    "KLGA": "nyc",          # alt NYC
-    "KJFK": "nyc",          # alt NYC
-    "KLAX": "los-angeles",
-    "KMIA": "miami",
-    "KDEN": "denver",
-    "KORD": "chicago",
-    "KAUS": "austin",
-    "KIAH": "houston",
-    "KHOU": "houston",
-    "KDFW": "dallas",
-    "KPHL": "philadelphia",
-    "KATL": "atlanta",
-    "KSEA": "seattle",
-    "KSFO": "san-francisco",
-    "KDCA": "washington-dc",
-    "KPHX": "phoenix",
-    "KBOS": "boston",
-    "KLAS": "las-vegas",
-    "KPDX": "portland",
-    "KMSP": "minneapolis",
-    "KDTW": "detroit",
-    "KSAN": "san-diego",
-    "KTPA": "tampa",
-    "KMCO": "orlando",
+    "KNYC": "nyc", "KLGA": "nyc", "KJFK": "nyc",
+    "KLAX": "los-angeles", "KMIA": "miami", "KDEN": "denver",
+    "KORD": "chicago", "KAUS": "austin",
+    "KIAH": "houston", "KHOU": "houston",
+    "KDFW": "dallas", "KPHL": "philadelphia",
+    "KATL": "atlanta", "KSEA": "seattle",
+    "KSFO": "san-francisco", "KDCA": "washington-dc",
+    "KPHX": "phoenix", "KBOS": "boston",
+    "KLAS": "las-vegas", "KPDX": "portland",
     "EGLL": "london",
 }
+
+WUNDERGROUND_ICAO_RX = re.compile(
+    r"wunderground\.com/[\w/\-]+/([A-Z]{4})(?=[/\s\)\.,]|$)", re.IGNORECASE
+)
 
 _MONTH_BY_NAME = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 _MONTH_BY_NAME.update({
@@ -94,27 +65,24 @@ _MONTH_BY_NAME.update({
 })
 _MONTHS_RX = "|".join(sorted(_MONTH_BY_NAME, key=len, reverse=True))
 
-# Wunderground URL in description: last path segment is the station ICAO
-WUNDERGROUND_ICAO_RX = re.compile(
-    r"wunderground\.com/[\w/\-]+/([A-Z]{4})(?=[/\s\)\.,]|$)", re.IGNORECASE
-)
-
-# Date in question prose: "on May 13", "for May 13, 2026"
 _DATE_PROSE_RX = re.compile(
     rf"(?:on|for)\s+({_MONTHS_RX})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:[,\s]+(\d{{4}}))?",
     re.IGNORECASE,
 )
-# Date in slug: "may-13-2026" or "may-13"
 _DATE_SLUG_RX = re.compile(
     rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?", re.IGNORECASE,
 )
 
-
-def _city_aliases(city: City) -> list[str]:
-    slug = city.polymarket_slug
-    if not slug:
-        return []
-    return CITY_ALIAS_OVERRIDES.get(slug, [slug])
+# Last discovery run stats (exposed via admin/diag).
+LAST_DISCOVERY: dict = {
+    "started_at": None,
+    "finished_at": None,
+    "candidates_tried": 0,
+    "events_found": 0,
+    "markets_ingested": 0,
+    "hits": [],
+    "errors": [],
+}
 
 
 def _parse_date(text: str) -> Optional[date]:
@@ -144,73 +112,8 @@ def _extract_icao_from_description(desc: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
-async def _search_event_slugs(query: str, limit: int = 100) -> set[str]:
-    """Polymarket Gamma /events?q=<term> returns matching events (slugs only;
-    the markets[] array comes back empty)."""
-    try:
-        resp = await poly_col._get(
-            f"{GAMMA_API}/events",
-            params={"q": query, "active": "true", "closed": "false", "limit": limit},
-        )
-        events = resp.json()
-    except Exception as e:
-        logger.warning(f"Gamma /events?q={query!r} failed: {e}")
-        return set()
-    slugs: set[str] = set()
-    if isinstance(events, list):
-        for e in events:
-            s = e.get("slug")
-            if s:
-                slugs.add(s)
-    return slugs
-
-
-async def _fetch_event_by_slug(slug: str) -> Optional[dict]:
-    """Fetch single event by slug — returns full event with populated markets[]."""
-    try:
-        resp = await poly_col._get(
-            f"{GAMMA_API}/events", params={"slug": slug, "limit": 1}
-        )
-        data = resp.json()
-        if isinstance(data, list) and data:
-            return data[0]
-        if isinstance(data, dict) and data.get("slug"):
-            return data
-    except Exception as e:
-        logger.warning(f"Gamma /events?slug={slug} failed: {e}")
-    return None
-
-
-def _match_event_to_city(event: dict, alias_to_city: dict[str, City]) -> Optional[City]:
-    """Try several ways to match an event to one of our cities."""
-    slug = (event.get("slug") or "").lower()
-    title = (event.get("title") or "").lower()
-    description = event.get("description") or ""
-
-    # 1. ICAO from Wunderground link in description (most reliable)
-    icao = _extract_icao_from_description(description)
-    if not icao:
-        for m in event.get("markets", []) or []:
-            icao = _extract_icao_from_description(m.get("description") or "")
-            if icao:
-                break
-    if icao:
-        city_slug = POLYMARKET_ICAO_TO_CITY_SLUG.get(icao)
-        if city_slug and city_slug in alias_to_city:
-            return alias_to_city[city_slug]
-
-    # 2. Match by alias appearing in slug/title
-    for alias, city in alias_to_city.items():
-        # avoid spurious substring hits like "san" matching "san-jose"
-        token = f"-{alias}-"
-        padded_slug = f"-{slug}-"
-        if token in padded_slug or alias in title.split():
-            return city
-    return None
-
-
 async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
-    """Insert market + outcomes for an event matched to a city."""
+    """Insert market + outcomes for an event matched to a city. Returns # of outcomes added."""
     slug = event.get("slug")
     if not slug:
         return 0
@@ -219,7 +122,6 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
     if existing.scalar_one_or_none():
         return 0
 
-    # Resolve date — prefer slug, fall back to title
     target_date = _parse_date(slug) or _parse_date(event.get("title") or "")
     if not target_date:
         logger.debug(f"No date parsed from event slug={slug}")
@@ -285,75 +187,196 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
 
     await db.commit()
     logger.info(
-        f"Discovered market: city={city.name} date={target_date} "
-        f"slug={slug} outcomes={count}"
+        f"DISCOVERY HIT ✓ city={city.name} date={target_date} slug={slug} outcomes={count}"
     )
     return count
 
 
-async def job_discover_markets():
-    """Discover Polymarket weather markets via q-based search.
+def _city_for_event(
+    event: dict, slug_to_city: dict[str, City]
+) -> Optional[City]:
+    """Best-effort match an event to a city.
 
-    Strategy from polymarketweatherassistwebpage (proven working):
-      1. Search Gamma /events?q=<term> with multiple weather terms
-      2. Collect unique slugs (search returns events with EMPTY markets[])
-      3. Fetch each event individually by slug (returns full event)
-      4. Extract resolution ICAO from description → match to our cities
-      5. Fall back to slug/title alias matching
+    1. If the candidate slug we used is already mapped, return its city.
+    2. Else inspect description for Wunderground ICAO.
     """
+    slug = (event.get("slug") or "").lower()
+    if slug in slug_to_city:
+        return slug_to_city[slug]
+    description = event.get("description") or ""
+    icao = _extract_icao_from_description(description)
+    if not icao:
+        for m in event.get("markets", []) or []:
+            icao = _extract_icao_from_description(m.get("description") or "")
+            if icao:
+                break
+    if icao:
+        city_slug = POLYMARKET_ICAO_TO_CITY_SLUG.get(icao)
+        if city_slug:
+            for c in slug_to_city.values():
+                if c.polymarket_slug == city_slug:
+                    return c
+    return None
+
+
+async def _notify_telegram(text: str) -> None:
+    if not settings.telegram_bot_token:
+        return
+    try:
+        from telegram import Bot
+        from app.models.alert import TelegramUser
+        async with AsyncSessionLocal() as db:
+            users = (await db.execute(select(TelegramUser))).scalars().all()
+        bot = Bot(token=settings.telegram_bot_token)
+        for user in users:
+            try:
+                await bot.send_message(chat_id=user.chat_id, text=text, parse_mode="Markdown")
+            except Exception as e:
+                logger.debug(f"_notify_telegram send to {user.chat_id} failed: {e}")
+    except Exception as e:
+        logger.warning(f"_notify_telegram error: {e}")
+
+
+async def job_discover_markets(notify: bool = True) -> dict:
+    """Polymarket weather-market discovery via direct slug construction.
+
+    Strategy:
+      1. For each active city + each date in next 7 days, build candidate slugs
+         using the known Polymarket pattern
+         (highest-temperature-in-<city>-on-<month>-<day>[-<year>]).
+      2. Fetch each candidate concurrently via Gamma /events?slug=<exact>.
+      3. Ingest any hits.
+      4. As a fallback, query Gamma by weather tag and try to match by ICAO.
+
+    Returns a stats dict; also stored in LAST_DISCOVERY.
+    """
+    started = datetime.now(timezone.utc)
+    LAST_DISCOVERY.update({
+        "started_at": started.isoformat(),
+        "finished_at": None,
+        "candidates_tried": 0,
+        "events_found": 0,
+        "markets_ingested": 0,
+        "hits": [],
+        "errors": [],
+    })
+
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(City).where(City.active == True, City.polymarket_slug != None)
         )
         cities = list(result.scalars().all())
-        if not cities:
-            logger.warning("job_discover_markets: no cities with polymarket_slug")
-            return
 
-        alias_to_city: dict[str, City] = {}
-        for city in cities:
-            for alias in _city_aliases(city):
-                alias_to_city[alias.lower()] = city
+    if not cities:
+        msg = "job_discover_markets: no active cities with polymarket_slug"
+        logger.warning(msg)
+        LAST_DISCOVERY["errors"].append(msg)
+        LAST_DISCOVERY["finished_at"] = datetime.now(timezone.utc).isoformat()
+        return dict(LAST_DISCOVERY)
 
-        # 1. Collect slugs across all search terms
-        all_slugs: set[str] = set()
-        for q in POLYMARKET_QUERIES:
-            found = await _search_event_slugs(q, limit=100)
-            all_slugs |= found
-        logger.info(
-            f"job_discover_markets: found {len(all_slugs)} unique slugs across "
-            f"{len(POLYMARKET_QUERIES)} search queries"
+    city_slugs = [c.polymarket_slug for c in cities]
+    candidates = build_all_candidates(city_slugs, FORECAST_DAYS_AHEAD)
+    LAST_DISCOVERY["candidates_tried"] = len(candidates)
+    logger.info(
+        f"DISCOVERY: built {len(candidates)} candidate slugs for {len(cities)} cities x {FORECAST_DAYS_AHEAD+1} days"
+    )
+
+    # Build slug -> City map for fast post-fetch attribution.
+    slug_to_city: dict[str, City] = {}
+    for city_slug, slug, _target in candidates:
+        slug_to_city[slug.lower()] = next(
+            c for c in cities if c.polymarket_slug == city_slug
         )
-        if not all_slugs:
-            return
 
-        # 2. Fetch full event for each slug (cap at 200 for safety)
-        new_outcomes = 0
-        matched_cities: dict[str, int] = {}
-        unmatched: list[str] = []
-        for slug in list(all_slugs)[:200]:
-            event = await _fetch_event_by_slug(slug)
-            if not event:
-                continue
-            city = _match_event_to_city(event, alias_to_city)
-            if not city:
-                unmatched.append(slug)
-                continue
+    sem = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+    found_events: list[dict] = []
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "weather-arb-bot/1.0"}
+    ) as client:
+
+        async def try_one(slug: str) -> None:
+            async with sem:
+                event = await fetch_event_by_slug(client, slug)
+                if event:
+                    found_events.append(event)
+
+        await asyncio.gather(*(try_one(s) for _c, s, _d in candidates))
+
+        LAST_DISCOVERY["events_found"] = len(found_events)
+        logger.info(
+            f"DISCOVERY: direct-slug pass found {len(found_events)} real events "
+            f"out of {len(candidates)} candidates tried"
+        )
+
+        # Fallback: weather tag query for any cities still uncovered.
+        if len(found_events) < len(cities):
+            tag_events = await fetch_events_by_tag(client, "weather", limit=200)
+            logger.info(
+                f"DISCOVERY: tag fallback returned {len(tag_events)} events from /events?tag=weather"
+            )
+            for ev in tag_events:
+                ev_slug = (ev.get("slug") or "").lower()
+                if not ev_slug or any(e.get("slug") == ev_slug for e in found_events):
+                    continue
+                # Tag-query results may have empty markets[]; refetch if needed.
+                if not ev.get("markets"):
+                    full = await fetch_event_by_slug(client, ev_slug)
+                    if full:
+                        ev = full
+                found_events.append(ev)
+
+    # Ingest matches.
+    async with AsyncSessionLocal() as db:
+        for event in found_events:
             try:
+                city = _city_for_event(event, slug_to_city)
+                if not city:
+                    continue
                 added = await _ingest_event(event, city, db)
                 if added > 0:
-                    new_outcomes += added
-                    matched_cities[city.name] = matched_cities.get(city.name, 0) + 1
+                    LAST_DISCOVERY["markets_ingested"] += added
+                    LAST_DISCOVERY["hits"].append({
+                        "slug": event.get("slug"),
+                        "city": city.name,
+                        "outcomes": added,
+                    })
             except Exception as e:
-                logger.error(f"_ingest_event failed for slug={slug}: {e}", exc_info=True)
+                msg = f"ingest failed for slug={event.get('slug')}: {e}"
+                logger.error(msg, exc_info=True)
+                LAST_DISCOVERY["errors"].append(msg)
 
-        logger.info(
-            f"job_discover_markets: ingested={new_outcomes} outcomes "
-            f"matched_cities={matched_cities}"
-        )
-        if unmatched:
-            sample = unmatched[:10]
-            logger.info(f"job_discover_markets: unmatched slugs (sample): {sample}")
+    LAST_DISCOVERY["finished_at"] = datetime.now(timezone.utc).isoformat()
+    summary = (
+        f"DISCOVERY DONE: tried={LAST_DISCOVERY['candidates_tried']} "
+        f"events_found={LAST_DISCOVERY['events_found']} "
+        f"ingested={LAST_DISCOVERY['markets_ingested']} "
+        f"hits={[h['city'] for h in LAST_DISCOVERY['hits']]}"
+    )
+    logger.info(summary)
+
+    if notify:
+        if LAST_DISCOVERY["markets_ingested"] > 0:
+            msg = (
+                f"\U0001f50d *Discovery*: tried {LAST_DISCOVERY['candidates_tried']} slugs, "
+                f"found {LAST_DISCOVERY['events_found']} events, "
+                f"ingested *{LAST_DISCOVERY['markets_ingested']}* new outcomes "
+                f"({', '.join(h['city'] for h in LAST_DISCOVERY['hits']) or 'none'})."
+            )
+        elif LAST_DISCOVERY["events_found"] > 0:
+            msg = (
+                f"\U0001f50d *Discovery*: tried {LAST_DISCOVERY['candidates_tried']} slugs, "
+                f"found {LAST_DISCOVERY['events_found']} events but none matched/were new."
+            )
+        else:
+            msg = (
+                f"\U0001f50d *Discovery*: tried {LAST_DISCOVERY['candidates_tried']} slugs, "
+                f"none matched real Polymarket events. "
+                f"Check `/api/admin/diag/polymarket?slug=...` to test specific slugs."
+            )
+        await _notify_telegram(msg)
+
+    return dict(LAST_DISCOVERY)
 
 
 async def job_fetch_metars():
@@ -466,7 +489,6 @@ async def _send_resolution_alert(
     city: City, market: Market, actual_high_f: float, opps: list, winning_outcome_ids: set, db
 ) -> None:
     from app.models.alert import TelegramUser
-    from app.config import settings
     from telegram import Bot
 
     if not settings.telegram_bot_token:
