@@ -78,15 +78,27 @@ _DATE_SLUG_RX = re.compile(
     rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?", re.IGNORECASE,
 )
 
+# Skip markets whose question text contains any of these tokens (case-insensitive).
+# For now we only trade "highest temperature" markets — daily-low markets are disabled.
+SKIP_MARKET_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
+
 LAST_DISCOVERY: dict = {
     "started_at": None,
     "finished_at": None,
     "candidates_tried": 0,
     "events_found": 0,
     "markets_ingested": 0,
+    "markets_refreshed": 0,
     "hits": [],
     "errors": [],
 }
+
+
+def _is_skippable_market(text: str) -> bool:
+    if not text:
+        return False
+    lo = text.lower()
+    return any(kw in lo for kw in SKIP_MARKET_KEYWORDS)
 
 
 def _parse_date(text: str) -> Optional[date]:
@@ -131,38 +143,30 @@ def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
         return None, None
     t = text.lower().replace("°", "").strip()
 
-    # ── Range: "65-70f" or "65 to 70" ──────────────────────────────────────
     m = re.search(r"(\d+)\s*(?:-|to)\s*(\d+)\s*[fc]?", t)
     if m:
         return int(m.group(1)), int(m.group(2))
 
-    # ── "X+" e.g. "85+f" ────────────────────────────────────────────────────
     m = re.search(r"(\d+)\s*\+", t)
     if m:
         return int(m.group(1)), None
 
-    # ── "X or above/higher/over/more" e.g. "53f or above", "12c or higher" ─
     m = re.search(r"(\d+)\s*[fc]?\s*(?:or\s+)?(?:above|higher|over|more|greater)", t)
     if m:
         return int(m.group(1)), None
 
-    # ── "above/over/greater than X" ─────────────────────────────────────────
     m = re.search(r"(?:above|over|greater\s+than)\s+(\d+)", t)
     if m:
         return int(m.group(1)), None
 
-    # ── "X or below/lower/under/less" e.g. "53f or below", "9c or lower" ───
     m = re.search(r"(\d+)\s*[fc]?\s*(?:or\s+)?(?:below|lower|under|less)", t)
     if m:
         return None, int(m.group(1))
 
-    # ── "below/under/less than X" ───────────────────────────────────────────
     m = re.search(r"(?:below|under|less\s+than)\s+(\d+)", t)
     if m:
         return None, int(m.group(1))
 
-    # ── Single value: "11c", "53f", "75" ────────────────────────────────────
-    # Treat as [X, X+1) — exact bucket (1-degree window).
     nums = re.findall(r"\d+", t)
     if nums:
         v = int(nums[0])
@@ -176,7 +180,6 @@ def _is_celsius_bucket(label: str) -> bool:
     lo = label.lower()
     if "°c" in lo:
         return True
-    # e.g. "11c", "12c or higher" — digit followed by 'c' at word boundary
     if re.search(r"\d\s*c(?:\s|$|or\b|/)", lo):
         return True
     return False
@@ -188,22 +191,83 @@ def _c_to_f(celsius: Optional[int]) -> Optional[int]:
     return round(celsius * 9 / 5 + 32)
 
 
-async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
+def _parse_bucket(label: str) -> tuple[Optional[int], Optional[int]]:
+    """Parse a bucket label into (min, max) in °F (converting from Celsius if needed)."""
+    bmin, bmax = _parse_temp_range(label)
+    if _is_celsius_bucket(label):
+        bmin = _c_to_f(bmin)
+        bmax = _c_to_f(bmax)
+    return bmin, bmax
+
+
+async def _refresh_outcome_bounds(db: AsyncSession, market: Market, raw_markets: list) -> int:
+    """Re-parse every outcome of an existing market and update bucket_min/max if changed.
+
+    Needed because rows ingested before the parser/Celsius fixes have wrong bounds.
+    Returns the count of outcomes updated.
+    """
+    existing_outcomes_q = await db.execute(
+        select(MarketOutcome).where(MarketOutcome.market_id == market.id)
+    )
+    by_label = {o.bucket_label: o for o in existing_outcomes_q.scalars().all()}
+
+    updated = 0
+    for m in raw_markets or []:
+        gtitle = (m.get("groupItemTitle") or "").strip()
+        question = (m.get("question") or "").strip()
+        bucket_label = (gtitle or question[:50] or "unknown")[:100]
+
+        target = by_label.get(bucket_label)
+        if target is None:
+            continue
+
+        bmin, bmax = _parse_bucket(gtitle)
+        if bmin is None and bmax is None:
+            bmin, bmax = _parse_bucket(question)
+
+        if target.bucket_min != bmin or target.bucket_max != bmax:
+            logger.info(
+                f"REFRESH outcome id={target.id} label={bucket_label!r} "
+                f"({target.bucket_min},{target.bucket_max}) → ({bmin},{bmax})"
+            )
+            target.bucket_min = bmin
+            target.bucket_max = bmax
+            updated += 1
+
+    if updated:
+        await db.commit()
+    return updated
+
+
+async def _ingest_event(event: dict, city: City, db: AsyncSession) -> tuple[int, int]:
+    """Ingest a Polymarket event. Returns (new_outcomes, refreshed_outcomes).
+
+    If the market already exists, re-parse and refresh existing outcome bounds
+    (so old rows with wrong bucket_min/max get corrected on next discovery).
+    Skips markets whose title says "lowest" — we only trade highest-temp for now.
+    """
     slug = event.get("slug")
     if not slug:
-        return 0
+        return 0, 0
+
+    title = (event.get("title") or "")
+    if _is_skippable_market(title) or _is_skippable_market(slug):
+        logger.debug(f"Skipping non-highest market: {slug}")
+        return 0, 0
 
     existing = await db.execute(select(Market).where(Market.external_id == slug))
-    if existing.scalar_one_or_none():
-        return 0
+    existing_market = existing.scalar_one_or_none()
+    if existing_market is not None:
+        refreshed = await _refresh_outcome_bounds(db, existing_market, event.get("markets") or [])
+        return 0, refreshed
 
-    target_date = _parse_date(slug) or _parse_date(event.get("title") or "")
+    target_date = _parse_date(slug) or _parse_date(title)
     if not target_date:
         logger.debug(f"No date parsed from event slug={slug}")
-        return 0
+        return 0, 0
     today = date.today()
     if target_date < today or target_date > today + timedelta(days=FORECAST_DAYS_AHEAD):
-        return 0
+        return 0, 0
 
     end_str = event.get("endDate") or event.get("end_date_iso")
     resolution_time: Optional[datetime] = None
@@ -217,7 +281,7 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
         city_id=city.id,
         external_id=slug,
         platform="polymarket",
-        question=event.get("title") or f"Highest temp in {city.name} on {target_date}",
+        question=title or f"Highest temp in {city.name} on {target_date}",
         event_date=target_date,
         resolution_time=resolution_time,
         resolution_source=(event.get("description") or "")[:500] or None,
@@ -231,18 +295,9 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
         question = (m.get("question") or "").strip()
         bucket_label = gtitle or question[:50] or "unknown"
 
-        bucket_min, bucket_max = _parse_temp_range(gtitle)
+        bucket_min, bucket_max = _parse_bucket(gtitle)
         if bucket_min is None and bucket_max is None:
-            bucket_min, bucket_max = _parse_temp_range(question)
-
-        # Convert Celsius buckets to Fahrenheit so all comparisons are in °F.
-        if _is_celsius_bucket(bucket_label):
-            bucket_min = _c_to_f(bucket_min)
-            bucket_max = _c_to_f(bucket_max)
-            logger.debug(
-                f"Celsius bucket converted: label={bucket_label!r} → "
-                f"bucket_min={bucket_min}°F bucket_max={bucket_max}°F"
-            )
+            bucket_min, bucket_max = _parse_bucket(question)
 
         token_id: Optional[str] = None
         for token in m.get("tokens", []) or []:
@@ -270,7 +325,7 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
 
     await db.commit()
     logger.info(f"DISCOVERY HIT ✓ city={city.name} date={target_date} slug={slug} outcomes={count}")
-    return count
+    return count, 0
 
 
 def _city_for_event(
@@ -328,6 +383,7 @@ async def job_discover_markets(notify: bool = True) -> dict:
         "candidates_tried": 0,
         "events_found": 0,
         "markets_ingested": 0,
+        "markets_refreshed": 0,
         "hits": [],
         "errors": [],
     })
@@ -444,12 +500,14 @@ async def job_discover_markets(notify: bool = True) -> dict:
                     if len(unmatched_samples) < 5:
                         unmatched_samples.append(f"{event.get('slug', '?')} ({event.get('title', '?')[:40]})")
                     continue
-                added = await _ingest_event(event, city, db)
+                added, refreshed = await _ingest_event(event, city, db)
                 if added > 0:
                     LAST_DISCOVERY["markets_ingested"] += added
                     LAST_DISCOVERY["hits"].append({"slug": event.get("slug"), "city": city.name, "outcomes": added})
                 else:
                     already_tracked += 1
+                if refreshed > 0:
+                    LAST_DISCOVERY["markets_refreshed"] += refreshed
             except Exception as e:
                 msg = f"ingest failed for slug={event.get('slug')}: {e}"
                 logger.error(msg, exc_info=True)
@@ -470,10 +528,16 @@ async def job_discover_markets(notify: bool = True) -> dict:
                 f"\U0001f50d *Discovery*: ingested *{LAST_DISCOVERY['markets_ingested']}* new outcomes "
                 f"({city_names})."
             )
+            if LAST_DISCOVERY["markets_refreshed"]:
+                msg += f" Refreshed {LAST_DISCOVERY['markets_refreshed']} existing outcome bounds."
         else:
+            refreshed_note = (
+                f" (refreshed {LAST_DISCOVERY['markets_refreshed']} bounds)"
+                if LAST_DISCOVERY["markets_refreshed"] else ""
+            )
             msg = (
                 f"\U0001f50d *Discovery*: {len(found_events)} events, 0 new "
-                f"(already tracked: {already_tracked}). "
+                f"(already tracked: {already_tracked}){refreshed_note}. "
                 f"Gamma temp markets: {len(gamma_temp_markets)}, CLOB: {len(clob_temp_markets)}."
             )
         await _notify_telegram(msg)
@@ -689,6 +753,9 @@ async def job_check_resolutions():
                         winning_outcome_ids.add(outcome.id)
                 elif bn is not None and bx is None:
                     if actual_high_f >= bn:
+                        winning_outcome_ids.add(outcome.id)
+                elif bn is None and bx is not None:
+                    if actual_high_f <= bx:
                         winning_outcome_ids.add(outcome.id)
 
             market.resolved = True
