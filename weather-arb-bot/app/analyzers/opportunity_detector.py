@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 aggregator = SignalAggregator()
 
+MIN_PREDICTION_CERTAINTY = 80  # default — overridden by settings.min_confidence_for_alert
+
 
 async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     found: List[Opportunity] = []
@@ -36,9 +38,11 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         )
         outcomes: List[MarketOutcome] = outcomes_result.scalars().all()
 
+        is_low_market = "lowest" in (market.question or "").lower()
+
         for outcome in outcomes:
             try:
-                opp = await _analyze_outcome(db, city, outcome)
+                opp = await _analyze_outcome(db, city, outcome, market, is_low_market)
                 if opp:
                     found.append(opp)
             except Exception as e:
@@ -47,28 +51,30 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     return found
 
 
-async def _analyze_outcome(db: AsyncSession, city: City, outcome: MarketOutcome) -> Optional[Opportunity]:
-    """Detect an opportunity on this bucket.
+async def _analyze_outcome(
+    db: AsyncSession,
+    city: City,
+    outcome: MarketOutcome,
+    market: Market,
+    is_low_market: bool,
+) -> Optional[Opportunity]:
+    """Detect an opportunity for a single bucket.
 
-    For each bucket we have:
-      - true_prob: model's probability that this bucket wins (YES)
-      - yes_price: market's YES price (= market's implied probability of YES)
-      - no_price = 1 - yes_price
-      - true_prob_no = 1 - true_prob
+    Gate: our directional certainty = max(true_prob, 1 - true_prob) must be
+    >= settings.min_confidence_for_alert percent, AND the edge for that side
+    must be >= settings.min_edge_for_alert.
 
-    We pick the directional side we're more confident in:
-      - side=YES if true_prob >= 0.5
-      - side=NO  if true_prob <  0.5
-
-    Then require:
-      1. Our certainty for that side >= settings.min_confidence_for_alert / 100
-         (e.g. 80% certain it WILL or WON'T be this bucket)
-      2. Edge for that side >= settings.min_edge_for_alert
-         (market underprices the side we believe in by at least min_edge)
+    side=YES when true_prob >= 0.5 (market underprices YES).
+    side=NO  when true_prob <  0.5 (market underprices NO).
     """
     signals = await aggregator.aggregate(
-        db=db, city_id=city.id, primary_icao=city.primary_icao,
-        reference_icao=city.reference_icao, outcome=outcome,
+        db=db,
+        city_id=city.id,
+        primary_icao=city.primary_icao,
+        reference_icao=city.reference_icao,
+        outcome=outcome,
+        forecast_date=market.event_date,
+        is_low_market=is_low_market,
     )
 
     price_info = signals.get("market_price")
@@ -78,7 +84,6 @@ async def _analyze_outcome(db: AsyncSession, city: City, outcome: MarketOutcome)
     yes_price = price_info["yes_price"]
     true_prob = estimate_true_probability(signals, outcome.bucket_min, outcome.bucket_max)
 
-    # Pick the side we believe in.
     if true_prob >= 0.5:
         side = "YES"
         certainty = true_prob
@@ -86,7 +91,7 @@ async def _analyze_outcome(db: AsyncSession, city: City, outcome: MarketOutcome)
     else:
         side = "NO"
         certainty = 1.0 - true_prob
-        market_implied = 1.0 - yes_price  # market's NO price
+        market_implied = 1.0 - yes_price
 
     edge = certainty - market_implied
 
