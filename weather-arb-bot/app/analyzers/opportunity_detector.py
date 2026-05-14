@@ -7,7 +7,6 @@ from sqlalchemy import select
 
 from app.analyzers.signal_aggregator import SignalAggregator
 from app.analyzers.probability_estimator import estimate_true_probability
-from app.analyzers.confidence_scorer import compute_confidence
 from app.config import settings
 from app.models.city import City
 from app.models.market import Market, MarketOutcome
@@ -16,8 +15,6 @@ from app.models.opportunity import Opportunity
 logger = logging.getLogger(__name__)
 
 aggregator = SignalAggregator()
-
-MIN_CONFIDENCE = 80  # hard floor — overrides settings so it cannot be lowered accidentally
 
 
 async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
@@ -51,6 +48,24 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
 
 
 async def _analyze_outcome(db: AsyncSession, city: City, outcome: MarketOutcome) -> Optional[Opportunity]:
+    """Detect an opportunity on this bucket.
+
+    For each bucket we have:
+      - true_prob: model's probability that this bucket wins (YES)
+      - yes_price: market's YES price (= market's implied probability of YES)
+      - no_price = 1 - yes_price
+      - true_prob_no = 1 - true_prob
+
+    We pick the directional side we're more confident in:
+      - side=YES if true_prob >= 0.5
+      - side=NO  if true_prob <  0.5
+
+    Then require:
+      1. Our certainty for that side >= settings.min_confidence_for_alert / 100
+         (e.g. 80% certain it WILL or WON'T be this bucket)
+      2. Edge for that side >= settings.min_edge_for_alert
+         (market underprices the side we believe in by at least min_edge)
+    """
     signals = await aggregator.aggregate(
         db=db, city_id=city.id, primary_icao=city.primary_icao,
         reference_icao=city.reference_icao, outcome=outcome,
@@ -62,25 +77,33 @@ async def _analyze_outcome(db: AsyncSession, city: City, outcome: MarketOutcome)
 
     yes_price = price_info["yes_price"]
     true_prob = estimate_true_probability(signals, outcome.bucket_min, outcome.bucket_max)
-    confidence = compute_confidence(signals, outcome.bucket_min, outcome.bucket_max)
 
-    # Only flag when the market is UNDERPRICING the outcome relative to our model.
-    # i.e. we think YES is more likely than what the market charges.
-    # Never fire on the NO side — shorting a weather bucket is not our use-case.
-    yes_edge = true_prob - yes_price
+    # Pick the side we believe in.
+    if true_prob >= 0.5:
+        side = "YES"
+        certainty = true_prob
+        market_implied = yes_price
+    else:
+        side = "NO"
+        certainty = 1.0 - true_prob
+        market_implied = 1.0 - yes_price  # market's NO price
 
-    min_conf = max(MIN_CONFIDENCE, settings.min_confidence_for_alert)
-    if yes_edge < settings.min_edge_for_alert or confidence < min_conf:
+    edge = certainty - market_implied
+
+    min_certainty = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
+    if certainty < min_certainty:
+        return None
+    if edge < settings.min_edge_for_alert:
         return None
 
     opp = Opportunity(
         outcome_id=outcome.id,
         detected_at=datetime.now(timezone.utc),
-        side="YES",
+        side=side,
         market_price=yes_price,
         estimated_true_prob=true_prob,
-        edge=yes_edge,
-        confidence_score=confidence,
+        edge=edge,
+        confidence_score=int(round(certainty * 100)),
         signals=signals,
         alert_sent=False,
     )
