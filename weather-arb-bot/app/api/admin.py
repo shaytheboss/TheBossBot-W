@@ -3,6 +3,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -16,6 +17,9 @@ from app.models.market import Market, MarketOutcome
 from app.models.opportunity import Opportunity
 from app.models.alert import Alert, TelegramUser
 from app.utils.log_buffer import recent_logs
+from app.utils.polymarket_discovery import (
+    GAMMA_API, build_all_candidates, fetch_event_by_slug, fetch_events_by_tag,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +91,6 @@ async def admin_me(_: str = Depends(require_admin)):
 
 @router.post("/seed")
 async def admin_seed(_: str = Depends(require_admin)):
-    """Re-run the city seed (idempotent). Updates ICAO codes, slugs, etc."""
     try:
         from app.utils.seed import seed_cities
         summary = await seed_cities()
@@ -96,6 +99,68 @@ async def admin_seed(_: str = Depends(require_admin)):
     except Exception as e:
         logger.error(f"Admin seed failed: {e}", exc_info=True)
         raise HTTPException(500, f"Seed failed: {e}")
+
+
+@router.post("/discover")
+async def admin_discover(_: str = Depends(require_admin)):
+    """Trigger Polymarket market discovery immediately. Returns the run stats."""
+    from app.workers.jobs import job_discover_markets
+    stats = await job_discover_markets(notify=False)
+    return {"ok": True, **stats}
+
+
+@router.get("/diag/polymarket")
+async def admin_diag_polymarket(
+    slug: str = Query(..., description="Exact Polymarket event slug to fetch"),
+    _: str = Depends(require_admin),
+):
+    """Hit Gamma /events?slug=<slug> from the server and return the raw response.
+
+    Useful for testing what Polymarket returns for a slug we expect to exist,
+    e.g. `highest-temperature-in-nyc-on-may-16-2026`.
+    """
+    async with httpx.AsyncClient(headers={"User-Agent": "weather-arb-bot/1.0"}) as client:
+        try:
+            r = await client.get(
+                f"{GAMMA_API}/events",
+                params={"slug": slug, "limit": 1},
+                timeout=20.0,
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Upstream error: {e}")
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:1000]}
+        return {
+            "status": r.status_code,
+            "url": str(r.url),
+            "body": body,
+        }
+
+
+@router.get("/diag/last-discovery")
+async def admin_diag_last_discovery(_: str = Depends(require_admin)):
+    from app.workers.jobs import LAST_DISCOVERY
+    return LAST_DISCOVERY
+
+
+@router.get("/diag/candidates")
+async def admin_diag_candidates(
+    _: str = Depends(require_admin), db: AsyncSession = Depends(get_db),
+    days: int = Query(default=7, ge=1, le=14),
+):
+    """Preview the candidate slugs we'd try for every active city x next N days."""
+    cities = (await db.execute(
+        select(City).where(City.active == True, City.polymarket_slug != None)
+    )).scalars().all()
+    candidates = build_all_candidates([c.polymarket_slug for c in cities], days)
+    return {
+        "city_count": len(cities),
+        "days": days + 1,
+        "total": len(candidates),
+        "sample": [s for _c, s, _d in candidates[:30]],
+    }
 
 
 @router.get("/stats")
@@ -255,7 +320,6 @@ async def admin_get_settings(_: str = Depends(require_admin)):
 
 @router.patch("/settings")
 async def admin_set_settings(payload: SettingsIn, _: str = Depends(require_admin)):
-    """Hot-update analyzer thresholds. Polling intervals require restart."""
     if payload.min_confidence_for_alert is not None:
         if not (0 <= payload.min_confidence_for_alert <= 100):
             raise HTTPException(400, "min_confidence_for_alert must be 0-100")
