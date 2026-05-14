@@ -16,8 +16,6 @@ logger = logging.getLogger(__name__)
 
 aggregator = SignalAggregator()
 
-MIN_PREDICTION_CERTAINTY = 80  # default — overridden by settings.min_confidence_for_alert
-
 
 async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     found: List[Opportunity] = []
@@ -40,13 +38,20 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
 
         is_low_market = "lowest" in (market.question or "").lower()
 
+        # Evaluate every bucket but only keep the single best-edge opportunity
+        # per market — prevents contradictory or duplicate alerts for the same city/date.
+        best_opp: Optional[Opportunity] = None
         for outcome in outcomes:
             try:
                 opp = await _analyze_outcome(db, city, outcome, market, is_low_market)
-                if opp:
-                    found.append(opp)
+                if opp is not None:
+                    if best_opp is None or opp.edge > best_opp.edge:
+                        best_opp = opp
             except Exception as e:
                 logger.error(f"Error analyzing outcome {outcome.id}: {e}", exc_info=True)
+
+        if best_opp is not None:
+            found.append(best_opp)
 
     return found
 
