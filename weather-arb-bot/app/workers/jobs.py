@@ -117,27 +117,75 @@ def _extract_icao_from_description(desc: str) -> Optional[str]:
 
 
 def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
+    """Parse temperature bucket bounds from a label string.
+
+    Handles (in priority order):
+      "65-70°F" / "65 to 70"     → (65, 70)
+      "85+°F" / "X or above/higher/over/more" → (X, None)
+      "X or below/lower/under/less"            → (None, X)
+      "below/under/less than X"                → (None, X)
+      "above/over/greater than X"              → (X, None)
+      "11°C" (single exact value)              → (11, 12)  ← treated as [X, X+1)
+    """
     if not text:
         return None, None
-    t = text.lower().replace("°", "")
+    t = text.lower().replace("°", "").strip()
+
+    # ── Range: "65-70f" or "65 to 70" ──────────────────────────────────────
     m = re.search(r"(\d+)\s*(?:-|to)\s*(\d+)\s*[fc]?", t)
     if m:
         return int(m.group(1)), int(m.group(2))
-    m = re.search(r"(\d+)\s*\+\s*[fc]?", t)
+
+    # ── "X+" e.g. "85+f" ────────────────────────────────────────────────────
+    m = re.search(r"(\d+)\s*\+", t)
     if m:
         return int(m.group(1)), None
-    m = re.search(r"(?:above|over|greater than)\s+(\d+)\s*[fc]?", t)
+
+    # ── "X or above/higher/over/more" e.g. "53f or above", "12c or higher" ─
+    m = re.search(r"(\d+)\s*[fc]?\s*(?:or\s+)?(?:above|higher|over|more|greater)", t)
     if m:
         return int(m.group(1)), None
-    m = re.search(r"(?:below|under|less than)\s+(\d+)\s*[fc]?", t)
+
+    # ── "above/over/greater than X" ─────────────────────────────────────────
+    m = re.search(r"(?:above|over|greater\s+than)\s+(\d+)", t)
+    if m:
+        return int(m.group(1)), None
+
+    # ── "X or below/lower/under/less" e.g. "53f or below", "9c or lower" ───
+    m = re.search(r"(\d+)\s*[fc]?\s*(?:or\s+)?(?:below|lower|under|less)", t)
     if m:
         return None, int(m.group(1))
-    nums = re.findall(r"(\d{2,3})", t)
-    if len(nums) >= 2:
-        return int(nums[0]), int(nums[1])
-    if len(nums) == 1:
-        return int(nums[0]), None
+
+    # ── "below/under/less than X" ───────────────────────────────────────────
+    m = re.search(r"(?:below|under|less\s+than)\s+(\d+)", t)
+    if m:
+        return None, int(m.group(1))
+
+    # ── Single value: "11c", "53f", "75" ────────────────────────────────────
+    # Treat as [X, X+1) — exact bucket (1-degree window).
+    nums = re.findall(r"\d+", t)
+    if nums:
+        v = int(nums[0])
+        return v, v + 1
+
     return None, None
+
+
+def _is_celsius_bucket(label: str) -> bool:
+    """Return True if the bucket label uses Celsius units."""
+    lo = label.lower()
+    if "°c" in lo:
+        return True
+    # e.g. "11c", "12c or higher" — digit followed by 'c' at word boundary
+    if re.search(r"\d\s*c(?:\s|$|or\b|/)", lo):
+        return True
+    return False
+
+
+def _c_to_f(celsius: Optional[int]) -> Optional[int]:
+    if celsius is None:
+        return None
+    return round(celsius * 9 / 5 + 32)
 
 
 async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
@@ -186,6 +234,15 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
         bucket_min, bucket_max = _parse_temp_range(gtitle)
         if bucket_min is None and bucket_max is None:
             bucket_min, bucket_max = _parse_temp_range(question)
+
+        # Convert Celsius buckets to Fahrenheit so all comparisons are in °F.
+        if _is_celsius_bucket(bucket_label):
+            bucket_min = _c_to_f(bucket_min)
+            bucket_max = _c_to_f(bucket_max)
+            logger.debug(
+                f"Celsius bucket converted: label={bucket_label!r} → "
+                f"bucket_min={bucket_min}°F bucket_max={bucket_max}°F"
+            )
 
         token_id: Optional[str] = None
         for token in m.get("tokens", []) or []:
@@ -483,7 +540,6 @@ async def job_fetch_models():
                         await gfs_col.collect_and_store(city.id, lat, lon, d, db, model)
                     except Exception as e:
                         logger.error(f"{model} job failed for {city.name} {d}: {e}")
-                # GFS ensemble probabilities — fetched once per city/date
                 try:
                     await gfs_col.collect_ensemble_and_store(city.id, lat, lon, d, db)
                 except Exception as e:
