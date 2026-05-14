@@ -75,9 +75,10 @@ def fmt_opportunity(
 
     # Open-Meteo ensemble probability (most reliable source)
     ensemble = signals.get("gfs_ensemble") or {}
-    ensemble_highs = ensemble.get("ensemble_highs") or []
-    if ensemble_highs:
-        n = len(ensemble_highs)
+    ensemble_key = "ensemble_lows" if is_low_market else "ensemble_highs"
+    ensemble_vals = ensemble.get(ensemble_key) or []
+    if ensemble_vals:
+        n = len(ensemble_vals)
         bucket_min = signals.get("_bucket_min")
         bucket_max = signals.get("_bucket_max")
         if bucket_min is not None or bucket_max is not None:
@@ -87,8 +88,9 @@ def fmt_opportunity(
                 if bucket_max is not None and v > bucket_max:
                     return False
                 return True
-            pct_in = round(100 * sum(1 for h in ensemble_highs if in_bucket(h)) / n)
-            p50 = ensemble.get("p50_high_f") or ensemble.get("p50_low_f")
+            pct_in = round(100 * sum(1 for h in ensemble_vals if in_bucket(h)) / n)
+            p50_key = "p50_low_f" if is_low_market else "p50_high_f"
+            p50 = ensemble.get(p50_key)
             p50_str = f", median {p50}°F" if p50 else ""
             key_signals.append(f"• Open-Meteo ensemble ({n} members): {pct_in}% in bucket{p50_str}")
 
