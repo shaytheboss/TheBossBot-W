@@ -26,6 +26,7 @@ from app.analyzers.opportunity_detector import detect_opportunities
 from app.bot.telegram_bot import send_opportunity_alert
 from app.utils.polymarket_discovery import (
     build_all_candidates,
+    extract_event_slug,
     fetch_event_by_slug,
     fetch_events_by_tag,
     fetch_gamma_temperature_markets,
@@ -43,7 +44,7 @@ pirep_col = PirepCollector()
 poly_col = PolymarketCollector()
 
 FORECAST_DAYS_AHEAD = 7
-DISCOVERY_CONCURRENCY = 3  # low to avoid 429 rate limiting
+DISCOVERY_CONCURRENCY = 3
 
 POLYMARKET_ICAO_TO_CITY_SLUG = {
     "KNYC": "nyc", "KLGA": "nyc", "KJFK": "nyc",
@@ -115,6 +116,34 @@ def _extract_icao_from_description(desc: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
+def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
+    """Extract temperature bucket bounds from any text.
+
+    Handles: '65-70°F', '70 to 75 F', '85+°F', 'above 80F', 'below 50F'.
+    """
+    if not text:
+        return None, None
+    t = text.lower().replace("°", "")
+    m = re.search(r"(\d+)\s*(?:-|to)\s*(\d+)\s*[fc]?", t)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"(\d+)\s*\+\s*[fc]?", t)
+    if m:
+        return int(m.group(1)), None
+    m = re.search(r"(?:above|over|greater than)\s+(\d+)\s*[fc]?", t)
+    if m:
+        return int(m.group(1)), None
+    m = re.search(r"(?:below|under|less than)\s+(\d+)\s*[fc]?", t)
+    if m:
+        return None, int(m.group(1))
+    nums = re.findall(r"(\d{2,3})", t)
+    if len(nums) >= 2:
+        return int(nums[0]), int(nums[1])
+    if len(nums) == 1:
+        return int(nums[0]), None
+    return None, None
+
+
 async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
     """Insert market + outcomes for an event matched to a city. Returns # of outcomes added."""
     slug = event.get("slug")
@@ -155,19 +184,21 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
 
     count = 0
     for m in event.get("markets", []) or []:
-        question = m.get("question", "") or m.get("groupItemTitle", "")
-        temps = [int(t) for t in re.findall(r"(\d+)\s*°?F", question)]
-        bucket_min = temps[0] if len(temps) >= 1 else None
-        bucket_max = temps[1] if len(temps) >= 2 else None
-        bucket_label = (
-            question[:50] if question
-            else (f"{bucket_min}-{bucket_max}°F" if bucket_max else f"{bucket_min}+°F")
-        )
+        # Prefer the short bucket label (groupItemTitle) over full question
+        # e.g. groupItemTitle="65-70°F" vs question="Will the highest temperature in..."
+        gtitle = (m.get("groupItemTitle") or "").strip()
+        question = (m.get("question") or "").strip()
+        bucket_label = gtitle or question[:50] or "unknown"
+
+        # Try to parse temperature bounds from groupItemTitle first, then question
+        bucket_min, bucket_max = _parse_temp_range(gtitle)
+        if bucket_min is None and bucket_max is None:
+            bucket_min, bucket_max = _parse_temp_range(question)
 
         token_id: Optional[str] = None
         for token in m.get("tokens", []) or []:
             if str(token.get("outcome", "")).lower() == "yes":
-                token_id = token.get("tokenId")
+                token_id = token.get("tokenId") or token.get("token_id")
                 break
         if not token_id:
             ids = m.get("clobTokenIds") or []
@@ -180,7 +211,7 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
 
         outcome = MarketOutcome(
             market_id=market.id,
-            bucket_label=bucket_label or "unknown",
+            bucket_label=bucket_label[:100],
             bucket_min=bucket_min,
             bucket_max=bucket_max,
             token_id=token_id,
@@ -200,20 +231,16 @@ def _city_for_event(
     slug_to_city: dict[str, City],
     cities_by_pm_slug: dict[str, City],
 ) -> Optional[City]:
-    """Match an event to a city using 3 strategies."""
     slug = (event.get("slug") or "").lower()
 
-    # 1. Exact candidate-slug match
     if slug in slug_to_city:
         return slug_to_city[slug]
 
-    # 2. City name substring in event title / slug
     title = event.get("title") or ""
     pm_slug = city_slug_from_text(title + " " + slug)
     if pm_slug and pm_slug in cities_by_pm_slug:
         return cities_by_pm_slug[pm_slug]
 
-    # 3. Wunderground ICAO code in description
     description = event.get("description") or ""
     icao = _extract_icao_from_description(description)
     if not icao:
@@ -248,18 +275,6 @@ async def _notify_telegram(text: str) -> None:
 
 
 async def job_discover_markets(notify: bool = True) -> dict:
-    """Polymarket weather-market discovery.
-
-    4 passes in order:
-      1. Gamma /markets scan  — paginate /markets?closed=false, filter by
-         temperature keywords. Each market record contains the event slug;
-         we fetch the full event and ingest. No slug guessing needed.
-      2. CLOB /markets scan   — same approach via the trading API endpoint.
-         Finds markets with different slug patterns or missing from Gamma scan.
-      3. Slug-probe fallback  — try constructed candidate slugs (concurrency=3
-         to avoid 429). Keeps working for known patterns like London.
-      4. Weather-tag fallback — Gamma /events?tag_slug=weather.
-    """
     started = datetime.now(timezone.utc)
     LAST_DISCOVERY.update({
         "started_at": started.isoformat(),
@@ -308,12 +323,10 @@ async def job_discover_markets(notify: bool = True) -> dict:
         headers={"User-Agent": "weather-arb-bot/1.0"}, timeout=30.0
     ) as client:
 
-        # ── Pass 1: Gamma /markets scan ───────────────────────────────────────
         gamma_temp_markets = await fetch_gamma_temperature_markets(client, max_pages=15)
         gamma_event_slugs: set[str] = set()
         for gm in gamma_temp_markets:
-            # 'slug' in Gamma /markets is the event slug
-            ev_slug = (gm.get("slug") or gm.get("eventSlug") or "").lower()
+            ev_slug = extract_event_slug(gm)
             if ev_slug:
                 gamma_event_slugs.add(ev_slug)
         logger.info(
@@ -328,21 +341,13 @@ async def job_discover_markets(notify: bool = True) -> dict:
                 _add_event(event)
             await asyncio.sleep(0.2)
         pass1_count = len(found_events)
-        logger.info(f"DISCOVERY pass1 done: {pass1_count} events fetched")
 
-        # ── Pass 2: CLOB /markets scan ────────────────────────────────────────
         clob_temp_markets = await fetch_clob_temperature_markets(client, max_pages=20)
         clob_event_slugs: set[str] = set()
         for cm in clob_temp_markets:
-            ev_slug = (cm.get("market_slug") or cm.get("slug") or "").lower()
+            ev_slug = extract_event_slug(cm)
             if ev_slug:
-                # CLOB market_slug may include outcome suffix; try to strip it
-                # e.g. "...on-may-15-70-to-75-f" -> "...on-may-15"
-                base = re.sub(r'-\d+-to-\d+[fc]?$', '', ev_slug)
-                base = re.sub(r'-(above|below)-\d+[fc]?$', '', base)
-                for candidate in (base, ev_slug):
-                    if candidate not in seen_slugs:
-                        clob_event_slugs.add(candidate)
+                clob_event_slugs.add(ev_slug)
         logger.info(
             f"DISCOVERY pass2 (CLOB /markets): {len(clob_temp_markets)} temp markets, "
             f"{len(clob_event_slugs)} candidate event slugs"
@@ -355,9 +360,7 @@ async def job_discover_markets(notify: bool = True) -> dict:
                 _add_event(event)
             await asyncio.sleep(0.2)
         pass2_count = len(found_events) - pass1_count
-        logger.info(f"DISCOVERY pass2 done: +{pass2_count} new events")
 
-        # ── Pass 3: slug-probe fallback (low concurrency) ───────────────────────
         sem = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
 
         async def try_slug(slug: str) -> None:
@@ -368,9 +371,7 @@ async def job_discover_markets(notify: bool = True) -> dict:
 
         await asyncio.gather(*(try_slug(s) for _c, s, _d in candidates))
         pass3_count = len(found_events) - pass1_count - pass2_count
-        logger.info(f"DISCOVERY pass3 (slug probe): +{pass3_count} new events")
 
-        # ── Pass 4: weather-tag fallback ───────────────────────────────────────
         tag_events = await fetch_events_by_tag(client, "weather", limit=200)
         for ev in tag_events:
             ev_slug = (ev.get("slug") or "").lower()
@@ -381,25 +382,25 @@ async def job_discover_markets(notify: bool = True) -> dict:
                         ev = full
                 _add_event(ev)
         pass4_count = len(found_events) - pass1_count - pass2_count - pass3_count
-        logger.info(f"DISCOVERY pass4 (weather tag): +{pass4_count} new events")
+
+        logger.info(
+            f"DISCOVERY: pass1={pass1_count} pass2={pass2_count} pass3={pass3_count} pass4={pass4_count} "
+            f"| Gamma temp={len(gamma_temp_markets)} CLOB temp={len(clob_temp_markets)}"
+        )
 
     LAST_DISCOVERY["events_found"] = len(found_events)
-    logger.info(
-        f"DISCOVERY: total unique events={len(found_events)} across all passes. "
-        f"Gamma temp markets={len(gamma_temp_markets)}, CLOB temp markets={len(clob_temp_markets)}"
-    )
 
-    # ── Ingest ───────────────────────────────────────────────────────────────────
     already_tracked = 0
+    unmatched_samples: list[str] = []
     async with AsyncSessionLocal() as db:
         for event in found_events:
             try:
                 city = _city_for_event(event, slug_to_city, cities_by_pm_slug)
                 if not city:
-                    logger.debug(
-                        f"DISCOVERY: no city match for slug={event.get('slug')} "
-                        f"title={event.get('title')}"
-                    )
+                    if len(unmatched_samples) < 5:
+                        unmatched_samples.append(
+                            f"{event.get('slug', '?')} ({event.get('title', '?')[:40]})"
+                        )
                     continue
                 added = await _ingest_event(event, city, db)
                 if added > 0:
@@ -416,38 +417,26 @@ async def job_discover_markets(notify: bool = True) -> dict:
                 logger.error(msg, exc_info=True)
                 LAST_DISCOVERY["errors"].append(msg)
 
+    if unmatched_samples:
+        logger.warning(
+            f"DISCOVERY: {len(found_events) - len(LAST_DISCOVERY['hits']) - already_tracked} unmatched events. "
+            f"Samples: {unmatched_samples}"
+        )
+
     LAST_DISCOVERY["finished_at"] = datetime.now(timezone.utc).isoformat()
-    logger.info(
-        f"DISCOVERY DONE: ingested={LAST_DISCOVERY['markets_ingested']} "
-        f"already_tracked={already_tracked} "
-        f"hits={[h['city'] for h in LAST_DISCOVERY['hits']]}"
-    )
 
     if notify:
         if LAST_DISCOVERY["markets_ingested"] > 0:
             city_names = ", ".join(h["city"] for h in LAST_DISCOVERY["hits"])
             msg = (
-                f"\U0001f50d *Discovery*: found *{LAST_DISCOVERY['markets_ingested']}* new outcomes "
-                f"({city_names}). "
-                f"Gamma: {len(gamma_temp_markets)} temp markets | CLOB: {len(clob_temp_markets)} temp markets."
-            )
-        elif already_tracked > 0:
-            city_names = ", ".join(
-                h['city'] for h in [
-                    {"city": _city_for_event(ev, slug_to_city, cities_by_pm_slug)}
-                    for ev in found_events[:3]
-                    if _city_for_event(ev, slug_to_city, cities_by_pm_slug)
-                ]
-            ) or "unknown"
-            msg = (
-                f"\U0001f50d *Discovery*: {len(found_events)} events found, all already tracked. "
-                f"Gamma: {len(gamma_temp_markets)} temp markets | CLOB: {len(clob_temp_markets)} temp markets."
+                f"\U0001f50d *Discovery*: ingested *{LAST_DISCOVERY['markets_ingested']}* new outcomes "
+                f"({city_names})."
             )
         else:
             msg = (
-                f"\U0001f50d *Discovery*: Gamma returned {len(gamma_temp_markets)} temperature markets, "
-                f"CLOB returned {len(clob_temp_markets)} temperature markets. "
-                f"None matched our cities. Check Railway logs for `Gamma /markets temp hit` lines."
+                f"\U0001f50d *Discovery*: {len(found_events)} events, 0 new "
+                f"(already tracked: {already_tracked}). "
+                f"Gamma temp markets: {len(gamma_temp_markets)}, CLOB: {len(clob_temp_markets)}."
             )
         await _notify_telegram(msg)
 
