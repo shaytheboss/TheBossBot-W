@@ -25,7 +25,13 @@ from app.collectors.polymarket_collector import PolymarketCollector
 from app.analyzers.opportunity_detector import detect_opportunities
 from app.bot.telegram_bot import send_opportunity_alert
 from app.utils.polymarket_discovery import (
-    GAMMA_API, build_all_candidates, fetch_event_by_slug, fetch_events_by_tag,
+    GAMMA_API,
+    build_all_candidates,
+    fetch_event_by_slug,
+    fetch_events_by_tag,
+    fetch_all_open_events,
+    city_slug_from_event,
+    is_temperature_event,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,11 +72,11 @@ _MONTH_BY_NAME.update({
 _MONTHS_RX = "|".join(sorted(_MONTH_BY_NAME, key=len, reverse=True))
 
 _DATE_PROSE_RX = re.compile(
-    rf"(?:on|for)\s+({_MONTHS_RX})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:[,\s]+(\d{{4}}))?",
+    rf"(?:on|for)\s+({_MONTHS_RX})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:[,\s]+(\d{{4}}))?" ,
     re.IGNORECASE,
 )
 _DATE_SLUG_RX = re.compile(
-    rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?", re.IGNORECASE,
+    rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?" , re.IGNORECASE,
 )
 
 # Last discovery run stats (exposed via admin/diag).
@@ -193,16 +199,23 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
 
 
 def _city_for_event(
-    event: dict, slug_to_city: dict[str, City]
+    event: dict,
+    slug_to_city: dict[str, City],
+    cities_by_pm_slug: dict[str, City],
 ) -> Optional[City]:
-    """Best-effort match an event to a city.
-
-    1. If the candidate slug we used is already mapped, return its city.
-    2. Else inspect description for Wunderground ICAO.
-    """
+    """Best-effort match an event to a city (3 strategies)."""
     slug = (event.get("slug") or "").lower()
+
+    # 1. Exact candidate-slug match
     if slug in slug_to_city:
         return slug_to_city[slug]
+
+    # 2. City name substring in event title / slug
+    pm_slug = city_slug_from_event(event)
+    if pm_slug and pm_slug in cities_by_pm_slug:
+        return cities_by_pm_slug[pm_slug]
+
+    # 3. Wunderground ICAO code in description
     description = event.get("description") or ""
     icao = _extract_icao_from_description(description)
     if not icao:
@@ -211,11 +224,10 @@ def _city_for_event(
             if icao:
                 break
     if icao:
-        city_slug = POLYMARKET_ICAO_TO_CITY_SLUG.get(icao)
-        if city_slug:
-            for c in slug_to_city.values():
-                if c.polymarket_slug == city_slug:
-                    return c
+        city_pm_slug = POLYMARKET_ICAO_TO_CITY_SLUG.get(icao)
+        if city_pm_slug and city_pm_slug in cities_by_pm_slug:
+            return cities_by_pm_slug[city_pm_slug]
+
     return None
 
 
@@ -238,17 +250,16 @@ async def _notify_telegram(text: str) -> None:
 
 
 async def job_discover_markets(notify: bool = True) -> dict:
-    """Polymarket weather-market discovery via direct slug construction.
+    """Polymarket weather-market discovery — 3-pass approach.
 
-    Strategy:
-      1. For each active city + each date in next 7 days, build candidate slugs
-         using the known Polymarket pattern
-         (highest-temperature-in-<city>-on-<month>-<day>[-<year>]).
-      2. Fetch each candidate concurrently via Gamma /events?slug=<exact>.
-      3. Ingest any hits.
-      4. As a fallback, query Gamma by weather tag and try to match by ICAO.
+    Pass 1: Direct slug probing (~512 candidates, fast).
+    Pass 2: Weather-tag query via /events?tag_slug=weather.
+    Pass 3: Full open-events scan (paginated, catches any slug format).
 
-    Returns a stats dict; also stored in LAST_DISCOVERY.
+    Events are matched to cities by:
+      a) Exact candidate slug -> city map.
+      b) City name substring in event title/slug.
+      c) Wunderground ICAO in event description.
     """
     started = datetime.now(timezone.utc)
     LAST_DISCOVERY.update({
@@ -281,57 +292,86 @@ async def job_discover_markets(notify: bool = True) -> dict:
         f"DISCOVERY: built {len(candidates)} candidate slugs for {len(cities)} cities x {FORECAST_DAYS_AHEAD+1} days"
     )
 
-    # Build slug -> City map for fast post-fetch attribution.
+    # Lookup maps built from cities.
     slug_to_city: dict[str, City] = {}
     for city_slug, slug, _target in candidates:
         slug_to_city[slug.lower()] = next(
             c for c in cities if c.polymarket_slug == city_slug
         )
+    cities_by_pm_slug: dict[str, City] = {c.polymarket_slug: c for c in cities}
 
     sem = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
     found_events: list[dict] = []
+    seen_slugs: set[str] = set()
+
+    def _add_event(ev: dict) -> None:
+        ev_slug = (ev.get("slug") or "").lower()
+        if ev_slug and ev_slug not in seen_slugs:
+            seen_slugs.add(ev_slug)
+            found_events.append(ev)
 
     async with httpx.AsyncClient(
         headers={"User-Agent": "weather-arb-bot/1.0"}
     ) as client:
 
+        # ── Pass 1: direct slug probing ─────────────────────────────────────
         async def try_one(slug: str) -> None:
             async with sem:
                 event = await fetch_event_by_slug(client, slug)
                 if event:
-                    found_events.append(event)
+                    _add_event(event)
 
         await asyncio.gather(*(try_one(s) for _c, s, _d in candidates))
+        pass1_count = len(found_events)
+        logger.info(f"DISCOVERY pass1 (slug probe): {pass1_count} unique events found")
 
-        LAST_DISCOVERY["events_found"] = len(found_events)
-        logger.info(
-            f"DISCOVERY: direct-slug pass found {len(found_events)} real events "
-            f"out of {len(candidates)} candidates tried"
-        )
-
-        # Fallback: weather tag query for any cities still uncovered.
-        if len(found_events) < len(cities):
-            tag_events = await fetch_events_by_tag(client, "weather", limit=200)
-            logger.info(
-                f"DISCOVERY: tag fallback returned {len(tag_events)} events from /events?tag=weather"
-            )
-            for ev in tag_events:
+        # ── Pass 2: weather-tag query ───────────────────────────────────────
+        tag_events = await fetch_events_by_tag(client, "weather", limit=200)
+        for ev in tag_events:
+            if not ev.get("markets"):
                 ev_slug = (ev.get("slug") or "").lower()
-                if not ev_slug or any(e.get("slug") == ev_slug for e in found_events):
-                    continue
-                # Tag-query results may have empty markets[]; refetch if needed.
-                if not ev.get("markets"):
+                if ev_slug:
                     full = await fetch_event_by_slug(client, ev_slug)
                     if full:
                         ev = full
-                found_events.append(ev)
+            _add_event(ev)
+        pass2_count = len(found_events) - pass1_count
+        logger.info(f"DISCOVERY pass2 (weather tag): +{pass2_count} new events")
 
-    # Ingest matches.
+        # ── Pass 3: full open-events scan ──────────────────────────────────
+        all_open = await fetch_all_open_events(client, max_pages=15)
+        pass3_temp_hits = 0
+        for ev in all_open:
+            if not is_temperature_event(ev):
+                continue
+            ev_slug = (ev.get("slug") or "").lower()
+            logger.info(
+                f"DISCOVERY pass3 temperature event: slug={ev_slug} title={ev.get('title')}"
+            )
+            if not ev.get("markets"):
+                full = await fetch_event_by_slug(client, ev_slug)
+                if full:
+                    ev = full
+            _add_event(ev)
+            pass3_temp_hits += 1
+        pass3_new = len(found_events) - pass1_count - pass2_count
+        logger.info(
+            f"DISCOVERY pass3 (full scan): scanned {len(all_open)} open events, "
+            f"found {pass3_temp_hits} temperature events, +{pass3_new} new unique"
+        )
+
+    LAST_DISCOVERY["events_found"] = len(found_events)
+
+    # ── Ingest matched events ───────────────────────────────────────────────
     async with AsyncSessionLocal() as db:
         for event in found_events:
             try:
-                city = _city_for_event(event, slug_to_city)
+                city = _city_for_event(event, slug_to_city, cities_by_pm_slug)
                 if not city:
+                    logger.debug(
+                        f"DISCOVERY: no city match for slug={event.get('slug')} "
+                        f"title={event.get('title')}"
+                    )
                     continue
                 added = await _ingest_event(event, city, db)
                 if added > 0:
@@ -348,8 +388,8 @@ async def job_discover_markets(notify: bool = True) -> dict:
 
     LAST_DISCOVERY["finished_at"] = datetime.now(timezone.utc).isoformat()
     summary = (
-        f"DISCOVERY DONE: tried={LAST_DISCOVERY['candidates_tried']} "
-        f"events_found={LAST_DISCOVERY['events_found']} "
+        f"DISCOVERY DONE: candidates={LAST_DISCOVERY['candidates_tried']} "
+        f"unique_events={LAST_DISCOVERY['events_found']} "
         f"ingested={LAST_DISCOVERY['markets_ingested']} "
         f"hits={[h['city'] for h in LAST_DISCOVERY['hits']]}"
     )
@@ -357,22 +397,19 @@ async def job_discover_markets(notify: bool = True) -> dict:
 
     if notify:
         if LAST_DISCOVERY["markets_ingested"] > 0:
+            city_names = ", ".join(h["city"] for h in LAST_DISCOVERY["hits"])
             msg = (
                 f"\U0001f50d *Discovery*: tried {LAST_DISCOVERY['candidates_tried']} slugs, "
-                f"found {LAST_DISCOVERY['events_found']} events, "
+                f"scanned {len(all_open)} open events, "
                 f"ingested *{LAST_DISCOVERY['markets_ingested']}* new outcomes "
-                f"({', '.join(h['city'] for h in LAST_DISCOVERY['hits']) or 'none'})."
-            )
-        elif LAST_DISCOVERY["events_found"] > 0:
-            msg = (
-                f"\U0001f50d *Discovery*: tried {LAST_DISCOVERY['candidates_tried']} slugs, "
-                f"found {LAST_DISCOVERY['events_found']} events but none matched/were new."
+                f"({city_names})."
             )
         else:
             msg = (
-                f"\U0001f50d *Discovery*: tried {LAST_DISCOVERY['candidates_tried']} slugs, "
-                f"none matched real Polymarket events. "
-                f"Check `/api/admin/diag/polymarket?slug=...` to test specific slugs."
+                f"\U0001f50d *Discovery*: tried {LAST_DISCOVERY['candidates_tried']} slugs + "
+                f"scanned {len(all_open)} open events. "
+                f"Found {LAST_DISCOVERY['events_found']} temperature events but none matched our cities. "
+                f"Check `/api/admin/diag/last-discovery` for details."
             )
         await _notify_telegram(msg)
 
