@@ -117,10 +117,6 @@ def _extract_icao_from_description(desc: str) -> Optional[str]:
 
 
 def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
-    """Extract temperature bucket bounds from any text.
-
-    Handles: '65-70°F', '70 to 75 F', '85+°F', 'above 80F', 'below 50F'.
-    """
     if not text:
         return None, None
     t = text.lower().replace("°", "")
@@ -145,7 +141,6 @@ def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
 
 
 async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
-    """Insert market + outcomes for an event matched to a city. Returns # of outcomes added."""
     slug = event.get("slug")
     if not slug:
         return 0
@@ -184,13 +179,10 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
 
     count = 0
     for m in event.get("markets", []) or []:
-        # Prefer the short bucket label (groupItemTitle) over full question
-        # e.g. groupItemTitle="65-70°F" vs question="Will the highest temperature in..."
         gtitle = (m.get("groupItemTitle") or "").strip()
         question = (m.get("question") or "").strip()
         bucket_label = gtitle or question[:50] or "unknown"
 
-        # Try to parse temperature bounds from groupItemTitle first, then question
         bucket_min, bucket_max = _parse_temp_range(gtitle)
         if bucket_min is None and bucket_max is None:
             bucket_min, bucket_max = _parse_temp_range(question)
@@ -220,9 +212,7 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
         count += 1
 
     await db.commit()
-    logger.info(
-        f"DISCOVERY HIT ✓ city={city.name} date={target_date} slug={slug} outcomes={count}"
-    )
+    logger.info(f"DISCOVERY HIT ✓ city={city.name} date={target_date} slug={slug} outcomes={count}")
     return count
 
 
@@ -232,7 +222,6 @@ def _city_for_event(
     cities_by_pm_slug: dict[str, City],
 ) -> Optional[City]:
     slug = (event.get("slug") or "").lower()
-
     if slug in slug_to_city:
         return slug_to_city[slug]
 
@@ -305,9 +294,7 @@ async def job_discover_markets(notify: bool = True) -> dict:
 
     slug_to_city: dict[str, City] = {}
     for city_slug, slug, _target in candidates:
-        slug_to_city[slug.lower()] = next(
-            c for c in cities if c.polymarket_slug == city_slug
-        )
+        slug_to_city[slug.lower()] = next(c for c in cities if c.polymarket_slug == city_slug)
     cities_by_pm_slug: dict[str, City] = {c.polymarket_slug: c for c in cities}
 
     found_events: list[dict] = []
@@ -398,18 +385,12 @@ async def job_discover_markets(notify: bool = True) -> dict:
                 city = _city_for_event(event, slug_to_city, cities_by_pm_slug)
                 if not city:
                     if len(unmatched_samples) < 5:
-                        unmatched_samples.append(
-                            f"{event.get('slug', '?')} ({event.get('title', '?')[:40]})"
-                        )
+                        unmatched_samples.append(f"{event.get('slug', '?')} ({event.get('title', '?')[:40]})")
                     continue
                 added = await _ingest_event(event, city, db)
                 if added > 0:
                     LAST_DISCOVERY["markets_ingested"] += added
-                    LAST_DISCOVERY["hits"].append({
-                        "slug": event.get("slug"),
-                        "city": city.name,
-                        "outcomes": added,
-                    })
+                    LAST_DISCOVERY["hits"].append({"slug": event.get("slug"), "city": city.name, "outcomes": added})
                 else:
                     already_tracked += 1
             except Exception as e:
@@ -502,6 +483,11 @@ async def job_fetch_models():
                         await gfs_col.collect_and_store(city.id, lat, lon, d, db, model)
                     except Exception as e:
                         logger.error(f"{model} job failed for {city.name} {d}: {e}")
+                # GFS ensemble probabilities — fetched once per city/date
+                try:
+                    await gfs_col.collect_ensemble_and_store(city.id, lat, lon, d, db)
+                except Exception as e:
+                    logger.error(f"GFS ensemble job failed for {city.name} {d}: {e}")
 
 
 async def job_fetch_pireps():
