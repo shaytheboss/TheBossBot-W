@@ -18,8 +18,7 @@ class PolymarketCollector(BaseCollector):
     name = "polymarket"
 
     async def collect(self, token_id: str, *args, **kwargs) -> Optional[dict]:
-        """Fetch current price for a single token."""
-        return await self.get_prices([token_id])
+        return await self.get_midpoint(token_id)
 
     async def get_market(self, market_id: str) -> Optional[dict]:
         try:
@@ -29,22 +28,45 @@ class PolymarketCollector(BaseCollector):
             logger.error(f"Failed to fetch market {market_id}: {e}")
             return None
 
-    async def get_prices(self, token_ids: List[str]) -> Optional[dict]:
-        if not token_ids:
-            return {}
+    async def get_midpoint(self, token_id: str) -> Optional[float]:
+        """Get the midpoint price for a token via CLOB /midpoint endpoint.
+
+        Correct Polymarket CLOB API: GET /midpoint?token_id=X returns {"mid": "0.42"}.
+        The /prices endpoint does NOT exist on CLOB — it always returns 400.
+        """
         try:
             resp = await self._get(
-                f"{CLOB_API_BASE}/prices",
-                params={"token_id": ",".join(token_ids)},
+                f"{CLOB_API_BASE}/midpoint",
+                params={"token_id": token_id},
             )
-            return resp.json()
+            data = resp.json()
+            if isinstance(data, dict) and "mid" in data:
+                return float(data["mid"])
+            return None
         except Exception as e:
-            logger.error(f"Failed to fetch CLOB prices: {e}")
+            logger.error(f"Failed to fetch /midpoint for {token_id}: {e}")
+            return None
+
+    async def get_price(self, token_id: str, side: str = "buy") -> Optional[float]:
+        """Get best bid (side=buy) or best ask (side=sell) for a token."""
+        try:
+            resp = await self._get(
+                f"{CLOB_API_BASE}/price",
+                params={"token_id": token_id, "side": side},
+            )
+            data = resp.json()
+            if isinstance(data, dict) and "price" in data:
+                return float(data["price"])
+            return None
+        except Exception as e:
+            logger.error(f"Failed to fetch /price for {token_id}: {e}")
             return None
 
     async def get_orderbook(self, token_id: str) -> Optional[dict]:
         try:
-            resp = await self._get(f"{CLOB_API_BASE}/book", params={"token_id": token_id})
+            resp = await self._get(
+                f"{CLOB_API_BASE}/book", params={"token_id": token_id}
+            )
             return resp.json()
         except Exception as e:
             logger.error(f"Failed to fetch orderbook for {token_id}: {e}")
@@ -53,13 +75,11 @@ class PolymarketCollector(BaseCollector):
     async def collect_and_store(
         self, outcome_id: int, token_id: str, db: AsyncSession
     ) -> Optional[dict]:
-        prices = await self.get_prices([token_id])
-        if not prices or token_id not in prices:
+        yes_price = await self.get_midpoint(token_id)
+        if yes_price is None:
             return None
 
-        yes_price = float(prices[token_id])
         no_price = round(1.0 - yes_price, 4)
-
         now = datetime.now(timezone.utc)
         stmt = (
             insert(MarketPrice)
