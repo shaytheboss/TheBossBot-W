@@ -51,9 +51,7 @@ async def send_opportunity_alert(opportunity, db) -> None:
     city = city_result.scalar_one_or_none()
 
     # Use the actual event slug stored in external_id — guaranteed to match Polymarket's URL
-    market_url = None
-    if market.external_id:
-        market_url = f"https://polymarket.com/event/{market.external_id}"
+    market_url = f"https://polymarket.com/event/{market.external_id}" if market.external_id else None
 
     text = fmt_opportunity(
         city_name=city.name if city else "Unknown",
@@ -64,12 +62,16 @@ async def send_opportunity_alert(opportunity, db) -> None:
         edge=float(opportunity.edge),
         confidence=opportunity.confidence_score,
         signals=opportunity.signals or {},
+        side=opportunity.side or "YES",
+        event_date=market.event_date,
         resolution_time=market.resolution_time,
         market_url=market_url,
         station_icao=city.primary_icao if city else None,
     )
 
-    users_result = await db.execute(select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score))
+    users_result = await db.execute(
+        select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score)
+    )
     users = users_result.scalars().all()
     bot = Bot(token=settings.telegram_bot_token)
     for user in users:
