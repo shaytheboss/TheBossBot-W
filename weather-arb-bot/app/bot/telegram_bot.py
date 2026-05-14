@@ -31,11 +31,6 @@ def get_app() -> Application:
     return _app
 
 
-def _make_polymarket_url(slug: str, event_date) -> str:
-    month = event_date.strftime("%B").lower()
-    return f"https://polymarket.com/event/highest-temperature-in-{slug}-on-{month}-{event_date.day}-{event_date.year}"
-
-
 async def send_opportunity_alert(opportunity, db) -> None:
     if not settings.telegram_bot_token:
         return
@@ -55,9 +50,10 @@ async def send_opportunity_alert(opportunity, db) -> None:
     city_result = await db.execute(select(City).where(City.id == market.city_id))
     city = city_result.scalar_one_or_none()
 
+    # Use the actual event slug stored in external_id — guaranteed to match Polymarket's URL
     market_url = None
-    if city and city.polymarket_slug and market.event_date:
-        market_url = _make_polymarket_url(city.polymarket_slug, market.event_date)
+    if market.external_id:
+        market_url = f"https://polymarket.com/event/{market.external_id}"
 
     text = fmt_opportunity(
         city_name=city.name if city else "Unknown",
