@@ -119,6 +119,49 @@ def is_temperature_event(text: str) -> bool:
     return any(kw in t for kw in TEMP_KEYWORDS)
 
 
+def extract_event_slug(market_record: dict) -> Optional[str]:
+    """Extract event slug from a Gamma /markets or CLOB /markets record.
+
+    The market record's own `slug` is the bucket-level market slug
+    (e.g. `will-highest-temp-in-nyc-be-65-70-on-may-14`). The event slug
+    (which we ingest as `external_id`) lives in nested `events[]` or in
+    `eventSlug`. Try several known shapes.
+    """
+    # Direct fields
+    for key in ("eventSlug", "event_slug"):
+        v = market_record.get(key)
+        if isinstance(v, str) and v:
+            return v.lower()
+
+    # Nested events list (Gamma)
+    events = market_record.get("events")
+    if isinstance(events, list) and events:
+        ev = events[0]
+        if isinstance(ev, dict):
+            s = ev.get("slug")
+            if isinstance(s, str) and s:
+                return s.lower()
+
+    # Nested event object (some CLOB shapes)
+    ev = market_record.get("event")
+    if isinstance(ev, dict):
+        s = ev.get("slug")
+        if isinstance(s, str) and s:
+            return s.lower()
+
+    # Fall back: strip bucket suffix from the market slug.
+    # Patterns: -65-70f, -above-90f, -below-50f, -65-to-70f
+    import re as _re
+    raw = market_record.get("slug") or market_record.get("market_slug") or ""
+    if not raw:
+        return None
+    raw = raw.lower()
+    stripped = _re.sub(r"-\d{1,3}(?:-to)?-\d{1,3}-?[fc]?$", "", raw)
+    stripped = _re.sub(r"-(above|below|over|under)-\d{1,3}-?[fc]?$", "", stripped)
+    stripped = _re.sub(r"-\d{1,3}-?[fc]?\+?$", "", stripped)
+    return stripped or raw
+
+
 def candidate_slugs_for_city(city_slug: str, target_date: date) -> list[str]:
     month = calendar.month_name[target_date.month].lower()
     out: list[str] = []
@@ -185,8 +228,8 @@ async def fetch_gamma_temperature_markets(
 ) -> list[dict]:
     """Paginate Gamma /markets?closed=false and return temperature markets.
 
-    Each record contains: question, slug (event slug), conditionId,
-    outcomePrices, tokens, clobTokenIds, etc.
+    Each record contains: question, slug (market slug, not event slug),
+    conditionId, outcomePrices, tokens, clobTokenIds, events[{slug,...}].
     """
     markets: list[dict] = []
     limit = 200
@@ -218,9 +261,10 @@ async def fetch_gamma_temperature_markets(
             s = (m.get("slug") or "").lower()
             if is_temperature_event(q) or is_temperature_event(g) or is_temperature_event(s):
                 markets.append(m)
+                ev_slug = extract_event_slug(m)
                 logger.info(
                     f"Gamma /markets temp hit: city={city_slug_from_text(q or s)} "
-                    f"slug={m.get('slug')} q={m.get('question', '')[:60]}"
+                    f"event_slug={ev_slug} market_slug={m.get('slug')} q={m.get('question', '')[:60]}"
                 )
 
         logger.debug(
@@ -279,9 +323,10 @@ async def fetch_clob_temperature_markets(
             s = (m.get("market_slug") or "").lower()
             if is_temperature_event(q) or is_temperature_event(s):
                 markets.append(m)
+                ev_slug = extract_event_slug(m)
                 logger.info(
                     f"CLOB /markets temp hit: city={city_slug_from_text(q or s)} "
-                    f"slug={m.get('market_slug')} q={m.get('question', '')[:60]}"
+                    f"event_slug={ev_slug} market_slug={m.get('market_slug')} q={m.get('question', '')[:60]}"
                 )
 
         next_cursor = data.get("next_cursor") if isinstance(data, dict) else None
