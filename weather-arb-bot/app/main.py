@@ -32,6 +32,14 @@ async def lifespan(app: FastAPI):
     install_buffer_handler()
     logger.info("Weather Arbitrage Bot starting up...")
 
+    # Auto-seed cities on every startup (idempotent, no-op if already up to date)
+    try:
+        from app.utils.seed import seed_cities
+        summary = await seed_cities()
+        logger.info(f"Startup seed: {summary}")
+    except Exception as e:
+        logger.error(f"Startup seed failed: {e}", exc_info=True)
+
     if settings.telegram_bot_token:
         from app.bot.telegram_bot import get_app
         _bot_app = get_app()

@@ -85,9 +85,21 @@ async def admin_me(_: str = Depends(require_admin)):
     return {"ok": True}
 
 
+@router.post("/seed")
+async def admin_seed(_: str = Depends(require_admin)):
+    """Re-run the city seed (idempotent). Updates ICAO codes, slugs, etc."""
+    try:
+        from app.utils.seed import seed_cities
+        summary = await seed_cities()
+        logger.info(f"Admin triggered seed: {summary}")
+        return {"ok": True, **summary}
+    except Exception as e:
+        logger.error(f"Admin seed failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Seed failed: {e}")
+
+
 @router.get("/stats")
 async def admin_stats(_: str = Depends(require_admin), db: AsyncSession = Depends(get_db)):
-    # Opportunity counts
     total_opps = (await db.execute(select(func.count(Opportunity.id)))).scalar() or 0
     alerted = (
         await db.execute(select(func.count(Opportunity.id)).where(Opportunity.alert_sent == True))
@@ -152,7 +164,6 @@ async def admin_opportunities(
         q = q.where(Opportunity.outcome == outcome.upper())
     rows = (await db.execute(q)).scalars().all()
 
-    # Hydrate related rows
     out = []
     for opp in rows:
         oc_res = await db.execute(
@@ -247,11 +258,11 @@ async def admin_set_settings(payload: SettingsIn, _: str = Depends(require_admin
     """Hot-update analyzer thresholds. Polling intervals require restart."""
     if payload.min_confidence_for_alert is not None:
         if not (0 <= payload.min_confidence_for_alert <= 100):
-            raise HTTPException(400, "min_confidence_for_alert must be 0–100")
+            raise HTTPException(400, "min_confidence_for_alert must be 0-100")
         settings.min_confidence_for_alert = payload.min_confidence_for_alert
     if payload.min_edge_for_alert is not None:
         if not (0.0 <= payload.min_edge_for_alert <= 1.0):
-            raise HTTPException(400, "min_edge_for_alert must be 0.0–1.0")
+            raise HTTPException(400, "min_edge_for_alert must be 0.0-1.0")
         settings.min_edge_for_alert = payload.min_edge_for_alert
     logger.info(
         f"Admin updated thresholds: min_conf={settings.min_confidence_for_alert} "
