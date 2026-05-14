@@ -9,6 +9,22 @@ _SOURCE_LABELS = {
 }
 
 
+def _ensemble_bucket_pct(ensemble_vals, bucket_min, bucket_max):
+    """Return (pct_in_bucket, n_members) or (None, 0) when not computable."""
+    if not ensemble_vals:
+        return None, 0
+    n = len(ensemble_vals)
+    if bucket_min is None and bucket_max is None:
+        return None, n
+    def in_bucket(v):
+        if bucket_min is not None and v < bucket_min:
+            return False
+        if bucket_max is not None and v > bucket_max:
+            return False
+        return True
+    return round(100 * sum(1 for v in ensemble_vals if in_bucket(v)) / n), n
+
+
 def fmt_opportunity(
     city_name, market_question, bucket_label, market_price, true_prob, edge,
     confidence, signals, side="YES", event_date=None,
@@ -24,12 +40,10 @@ def fmt_opportunity(
     """
     is_no = (side == "NO")
 
-    # Prices and estimates for the chosen side
     side_price_cents = round((1 - market_price if is_no else market_price) * 100)
     side_prob_pct = round((1 - true_prob if is_no else true_prob) * 100)
     edge_pct = round(edge * 100)
 
-    # Market event date (not today)
     if event_date:
         if isinstance(event_date, date):
             date_str = event_date.strftime("%b %d, %Y")
@@ -39,6 +53,22 @@ def fmt_opportunity(
         date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
 
     station_line = f" `{station_icao}`" if station_icao else ""
+
+    # Open-Meteo ensemble probability for the chosen side
+    is_low_market = signals.get("is_low_market", False)
+    ensemble = signals.get("gfs_ensemble") or {}
+    ensemble_key = "ensemble_lows" if is_low_market else "ensemble_highs"
+    p50_key = "p50_low_f" if is_low_market else "p50_high_f"
+    ensemble_vals = ensemble.get(ensemble_key) or []
+    bucket_min = signals.get("_bucket_min")
+    bucket_max = signals.get("_bucket_max")
+    pct_in_bucket, n_members = _ensemble_bucket_pct(ensemble_vals, bucket_min, bucket_max)
+    p50 = ensemble.get(p50_key)
+
+    # For the side we're alerting on, the bucket probability for NO is (1 - pct_in_bucket)
+    side_ensemble_pct: Optional[int] = None
+    if pct_in_bucket is not None:
+        side_ensemble_pct = (100 - pct_in_bucket) if is_no else pct_in_bucket
 
     # Signals section
     key_signals = []
@@ -61,11 +91,8 @@ def fmt_opportunity(
         avg_f = round(avg_c * 9 / 5 + 32)
         key_signals.append(f"• PIREP: {avg_f}°F avg at low altitude")
 
-    # Forecast sources — distinguish high vs low market
-    is_low_market = signals.get("is_low_market", False)
     fc_key = "predicted_low_f" if is_low_market else "predicted_high_f"
     fc_label_suffix = " low" if is_low_market else " high"
-
     for source in ("gfs", "ecmwf", "nws", "wunderground"):
         fc = signals.get(f"{source}_forecast") or {}
         val = fc.get(fc_key)
@@ -73,26 +100,11 @@ def fmt_opportunity(
             label = _SOURCE_LABELS.get(source, source.upper())
             key_signals.append(f"• {label} forecast{fc_label_suffix}: {val}°F")
 
-    # Open-Meteo ensemble probability (most reliable source)
-    ensemble = signals.get("gfs_ensemble") or {}
-    ensemble_key = "ensemble_lows" if is_low_market else "ensemble_highs"
-    ensemble_vals = ensemble.get(ensemble_key) or []
-    if ensemble_vals:
-        n = len(ensemble_vals)
-        bucket_min = signals.get("_bucket_min")
-        bucket_max = signals.get("_bucket_max")
-        if bucket_min is not None or bucket_max is not None:
-            def in_bucket(v):
-                if bucket_min is not None and v < bucket_min:
-                    return False
-                if bucket_max is not None and v > bucket_max:
-                    return False
-                return True
-            pct_in = round(100 * sum(1 for h in ensemble_vals if in_bucket(h)) / n)
-            p50_key = "p50_low_f" if is_low_market else "p50_high_f"
-            p50 = ensemble.get(p50_key)
-            p50_str = f", median {p50}°F" if p50 else ""
-            key_signals.append(f"• Open-Meteo ensemble ({n} members): {pct_in}% in bucket{p50_str}")
+    if pct_in_bucket is not None and n_members:
+        p50_str = f", median {p50}°F" if p50 else ""
+        key_signals.append(
+            f"• Open-Meteo ensemble ({n_members} members): {pct_in_bucket}% in bucket{p50_str}"
+        )
 
     signals_text = "\n".join(key_signals) if key_signals else "• No key signals available"
 
@@ -105,13 +117,19 @@ def fmt_opportunity(
 
     link_line = f"\n[Polymarket]({market_url})" if market_url else ""
 
+    # Prominent Open-Meteo probability line for the chosen side
+    om_line = ""
+    if side_ensemble_pct is not None:
+        om_line = f"\n\U0001f310 Open-Meteo p({side}): {side_ensemble_pct}% ({n_members} members)"
+
     return (
         f"🎯 *HIGH CONFIDENCE OPPORTUNITY*\n\n"
         f"📍 {city_name}{station_line} | {date_str}\n"
         f"📊 Market: {market_question}\n"
         f"🏢 Bucket: {bucket_label} (*{side}*)\n\n"
         f"💰 Market {side} price: {side_price_cents}¢\n"
-        f"🧠 Our {side} estimate: {side_prob_pct}%\n"
+        f"🧠 Our {side} estimate: {side_prob_pct}%"
+        f"{om_line}\n"
         f"📈 Edge: +{edge_pct}pp\n\n"
         f"🔍 Key signals:\n{signals_text}\n\n"
         f"⚠️ Certainty: {confidence}%{hours_left}{link_line}"

@@ -16,6 +16,36 @@ logger = logging.getLogger(__name__)
 
 aggregator = SignalAggregator()
 
+# Skip markets whose question contains any of these tokens — only "highest"
+# temperature markets are analyzed for now.
+SKIP_QUESTION_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
+
+
+def _should_skip_market(question: Optional[str]) -> bool:
+    if not question:
+        return False
+    lo = question.lower()
+    return any(kw in lo for kw in SKIP_QUESTION_KEYWORDS)
+
+
+async def _has_prior_alert(db: AsyncSession, outcome_id: int, side: str) -> bool:
+    """Has an alert already been sent for this exact (outcome, side) pair?
+
+    Dedup key = outcome_id + side. outcome_id uniquely identifies
+    (city, event_date, bucket), so we never re-alert on the same
+    (station, date, bucket, YES/NO) tuple even if values shift.
+    Only un-resolved prior alerts block; once resolved we can re-evaluate.
+    """
+    q = await db.execute(
+        select(Opportunity.id).where(
+            Opportunity.outcome_id == outcome_id,
+            Opportunity.side == side,
+            Opportunity.alert_sent == True,
+            Opportunity.outcome == None,
+        ).limit(1)
+    )
+    return q.scalar_one_or_none() is not None
+
 
 async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     found: List[Opportunity] = []
@@ -26,6 +56,9 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     markets: List[Market] = result.scalars().all()
 
     for market in markets:
+        if _should_skip_market(market.question):
+            continue
+
         city_result = await db.execute(select(City).where(City.id == market.city_id))
         city: Optional[City] = city_result.scalar_one_or_none()
         if not city:
@@ -36,7 +69,7 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         )
         outcomes: List[MarketOutcome] = outcomes_result.scalars().all()
 
-        is_low_market = "lowest" in (market.question or "").lower()
+        is_low_market = False  # only "highest" markets pass the skip filter
 
         # Evaluate every bucket but only keep the single best-edge opportunity
         # per market — prevents contradictory or duplicate alerts for the same city/date.
@@ -71,6 +104,9 @@ async def _analyze_outcome(
 
     side=YES when true_prob >= 0.5 (market underprices YES).
     side=NO  when true_prob <  0.5 (market underprices NO).
+
+    Dedup: if we already sent an alert for this (outcome, side) and it isn't
+    resolved yet, skip — even if signals have shifted significantly.
     """
     signals = await aggregator.aggregate(
         db=db,
@@ -104,6 +140,12 @@ async def _analyze_outcome(
     if certainty < min_certainty:
         return None
     if edge < settings.min_edge_for_alert:
+        return None
+
+    if await _has_prior_alert(db, outcome.id, side):
+        logger.debug(
+            f"Dedup: already alerted on outcome={outcome.id} side={side}; skipping"
+        )
         return None
 
     opp = Opportunity(
