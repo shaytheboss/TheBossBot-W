@@ -19,7 +19,10 @@ class Settings(BaseSettings):
     polymarket_fetch_interval: int = 300  # 5 min
     wunderground_fetch_interval: int = 1800
     analyzer_run_interval: int = 300      # 5 min
-    min_confidence_for_alert: int = 60
+    # Minimum directional certainty (in %) required to alert.
+    # certainty = max(true_prob, 1 - true_prob). 80 means we need to be
+    # at least 80% sure the bucket will (YES) or will not (NO) be the answer.
+    min_confidence_for_alert: int = 80
     min_edge_for_alert: float = 0.15
     alert_dedup_minutes: int = 30
     sentry_dsn: str = ""
