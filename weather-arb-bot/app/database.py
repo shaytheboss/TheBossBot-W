@@ -11,9 +11,15 @@ def _async_url(url: str) -> str:
     return url
 
 
+# SQL echo is OFF by default — it was previously enabled in non-production
+# environments which flooded Railway logs (500+ events/sec rate limit hit).
+# Re-enable per session via SQLALCHEMY_ECHO=1 if you genuinely need it.
+import os
+_ECHO = os.getenv("SQLALCHEMY_ECHO", "").lower() in ("1", "true", "yes")
+
 engine = create_async_engine(
     _async_url(settings.database_url),
-    echo=not settings.is_production,
+    echo=_ECHO,
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
