@@ -26,6 +26,7 @@ from app.analyzers.opportunity_detector import detect_opportunities
 from app.bot.telegram_bot import send_opportunity_alert
 from app.utils.polymarket_discovery import (
     build_all_candidates,
+    extract_event_slug,
     fetch_event_by_slug,
     fetch_events_by_tag,
     fetch_gamma_temperature_markets,
@@ -325,7 +326,7 @@ async def job_discover_markets(notify: bool = True) -> dict:
         gamma_temp_markets = await fetch_gamma_temperature_markets(client, max_pages=15)
         gamma_event_slugs: set[str] = set()
         for gm in gamma_temp_markets:
-            ev_slug = (gm.get("slug") or gm.get("eventSlug") or "").lower()
+            ev_slug = extract_event_slug(gm)
             if ev_slug:
                 gamma_event_slugs.add(ev_slug)
         logger.info(
@@ -344,13 +345,9 @@ async def job_discover_markets(notify: bool = True) -> dict:
         clob_temp_markets = await fetch_clob_temperature_markets(client, max_pages=20)
         clob_event_slugs: set[str] = set()
         for cm in clob_temp_markets:
-            ev_slug = (cm.get("market_slug") or cm.get("slug") or "").lower()
+            ev_slug = extract_event_slug(cm)
             if ev_slug:
-                base = re.sub(r'-\d+-to-\d+[fc]?$', '', ev_slug)
-                base = re.sub(r'-(above|below)-\d+[fc]?$', '', base)
-                for candidate in (base, ev_slug):
-                    if candidate not in seen_slugs:
-                        clob_event_slugs.add(candidate)
+                clob_event_slugs.add(ev_slug)
         logger.info(
             f"DISCOVERY pass2 (CLOB /markets): {len(clob_temp_markets)} temp markets, "
             f"{len(clob_event_slugs)} candidate event slugs"
