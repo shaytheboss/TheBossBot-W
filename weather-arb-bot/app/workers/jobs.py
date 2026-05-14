@@ -33,34 +33,81 @@ pirep_col = PirepCollector()
 poly_col = PolymarketCollector()
 
 GAMMA_API = "https://gamma-api.polymarket.com"
-
-# Days ahead to track
 FORECAST_DAYS_AHEAD = 7
 
-# Polymarket sometimes uses different slug names than our canonical city slug.
+# Search terms for Polymarket Gamma /events?q=<term> — matches the working
+# logic from polymarketweatherassistwebpage.
+POLYMARKET_QUERIES = [
+    "temperature",
+    "highest temperature",
+    "degrees fahrenheit",
+    "hottest",
+    "warmest",
+    "high temp",
+]
+
+# City slug aliases — Polymarket sometimes uses different names than ours.
 CITY_ALIAS_OVERRIDES = {
     "nyc": ["nyc", "new-york", "new-york-city", "newyork"],
-    "la": ["la", "los-angeles", "losangeles"],
+    "los-angeles": ["los-angeles", "la", "losangeles"],
     "san-francisco": ["san-francisco", "sf", "sanfrancisco"],
     "washington-dc": ["washington-dc", "dc", "washington"],
     "philadelphia": ["philadelphia", "philly"],
     "dallas": ["dallas", "dfw", "dallas-fort-worth"],
 }
 
-# Match slugs like:
-#   highest-temperature-in-nyc-on-may-13-2026
-#   highest-temperature-in-nyc-on-may-13
-#   nyc-highest-temperature-on-may-13-2026
-TEMP_SLUG_RX_A = re.compile(
-    r"^highest[-_]temperature[-_]in[-_]([a-z][a-z0-9-]*?)[-_]on[-_]"
-    r"([a-z]+)[-_](\d{1,2})(?:[-_](\d{4}))?$"
-)
-TEMP_SLUG_RX_B = re.compile(
-    r"^([a-z][a-z0-9-]*?)[-_]highest[-_]temperature[-_]on[-_]"
-    r"([a-z]+)[-_](\d{1,2})(?:[-_](\d{4}))?$"
-)
+# ICAO codes Polymarket weather markets resolve via, mapped to our city slugs.
+# Source: polymarketweatherassistwebpage working code.
+POLYMARKET_ICAO_TO_CITY_SLUG = {
+    "KNYC": "nyc",          # NYC — Central Park
+    "KLGA": "nyc",          # alt NYC
+    "KJFK": "nyc",          # alt NYC
+    "KLAX": "los-angeles",
+    "KMIA": "miami",
+    "KDEN": "denver",
+    "KORD": "chicago",
+    "KAUS": "austin",
+    "KIAH": "houston",
+    "KHOU": "houston",
+    "KDFW": "dallas",
+    "KPHL": "philadelphia",
+    "KATL": "atlanta",
+    "KSEA": "seattle",
+    "KSFO": "san-francisco",
+    "KDCA": "washington-dc",
+    "KPHX": "phoenix",
+    "KBOS": "boston",
+    "KLAS": "las-vegas",
+    "KPDX": "portland",
+    "KMSP": "minneapolis",
+    "KDTW": "detroit",
+    "KSAN": "san-diego",
+    "KTPA": "tampa",
+    "KMCO": "orlando",
+    "EGLL": "london",
+}
 
 _MONTH_BY_NAME = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+_MONTH_BY_NAME.update({
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+})
+_MONTHS_RX = "|".join(sorted(_MONTH_BY_NAME, key=len, reverse=True))
+
+# Wunderground URL in description: last path segment is the station ICAO
+WUNDERGROUND_ICAO_RX = re.compile(
+    r"wunderground\.com/[\w/\-]+/([A-Z]{4})(?=[/\s\)\.,]|$)", re.IGNORECASE
+)
+
+# Date in question prose: "on May 13", "for May 13, 2026"
+_DATE_PROSE_RX = re.compile(
+    rf"(?:on|for)\s+({_MONTHS_RX})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:[,\s]+(\d{{4}}))?",
+    re.IGNORECASE,
+)
+# Date in slug: "may-13-2026" or "may-13"
+_DATE_SLUG_RX = re.compile(
+    rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?", re.IGNORECASE,
+)
 
 
 def _city_aliases(city: City) -> list[str]:
@@ -70,59 +117,115 @@ def _city_aliases(city: City) -> list[str]:
     return CITY_ALIAS_OVERRIDES.get(slug, [slug])
 
 
-def _parse_temp_slug(slug: str):
-    """Return (city_alias, date) if slug looks like a daily-high temp market, else None."""
-    s = slug.lower()
-    for rx in (TEMP_SLUG_RX_A, TEMP_SLUG_RX_B):
-        m = rx.match(s)
+def _parse_date(text: str) -> Optional[date]:
+    if not text:
+        return None
+    for rx in (_DATE_PROSE_RX, _DATE_SLUG_RX):
+        m = rx.search(text)
         if not m:
             continue
-        city_alias, month_name, day_str, year_str = m.groups()
-        month = _MONTH_BY_NAME.get(month_name)
+        month_name, day_str, year_str = m.group(1), m.group(2), m.group(3)
+        month = _MONTH_BY_NAME.get(month_name.lower())
         if not month:
             continue
         try:
-            year = int(year_str) if year_str else date.today().year
             day = int(day_str)
-            return city_alias, date(year, month, day)
+            year = int(year_str) if year_str else date.today().year
+            return date(year, month, day)
         except ValueError:
             continue
     return None
 
 
-async def _fetch_all_active_events() -> list[dict]:
-    """Paginate through Polymarket Gamma API for all open events."""
-    events: list[dict] = []
-    offset = 0
-    page_size = 100
-    safety_limit = 50  # 50 pages * 100 = up to 5000 events
-    for _ in range(safety_limit):
-        try:
-            resp = await poly_col._get(
-                f"{GAMMA_API}/events",
-                params={"closed": "false", "limit": page_size, "offset": offset},
-            )
-            batch = resp.json()
-        except Exception as e:
-            logger.error(f"Gamma events fetch failed at offset={offset}: {e}")
-            break
-        if not batch:
-            break
-        events.extend(batch)
-        if len(batch) < page_size:
-            break
-        offset += page_size
-    return events
+def _extract_icao_from_description(desc: str) -> Optional[str]:
+    if not desc:
+        return None
+    m = WUNDERGROUND_ICAO_RX.search(desc)
+    return m.group(1).upper() if m else None
 
 
-async def _create_market_from_event(
-    event: dict, city: City, target_date: date, db: AsyncSession
-) -> int:
-    """Insert Market + MarketOutcome rows from a Polymarket event payload."""
-    slug = event.get("slug") or f"{city.polymarket_slug}-{target_date.isoformat()}"
+async def _search_event_slugs(query: str, limit: int = 100) -> set[str]:
+    """Polymarket Gamma /events?q=<term> returns matching events (slugs only;
+    the markets[] array comes back empty)."""
+    try:
+        resp = await poly_col._get(
+            f"{GAMMA_API}/events",
+            params={"q": query, "active": "true", "closed": "false", "limit": limit},
+        )
+        events = resp.json()
+    except Exception as e:
+        logger.warning(f"Gamma /events?q={query!r} failed: {e}")
+        return set()
+    slugs: set[str] = set()
+    if isinstance(events, list):
+        for e in events:
+            s = e.get("slug")
+            if s:
+                slugs.add(s)
+    return slugs
+
+
+async def _fetch_event_by_slug(slug: str) -> Optional[dict]:
+    """Fetch single event by slug — returns full event with populated markets[]."""
+    try:
+        resp = await poly_col._get(
+            f"{GAMMA_API}/events", params={"slug": slug, "limit": 1}
+        )
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0]
+        if isinstance(data, dict) and data.get("slug"):
+            return data
+    except Exception as e:
+        logger.warning(f"Gamma /events?slug={slug} failed: {e}")
+    return None
+
+
+def _match_event_to_city(event: dict, alias_to_city: dict[str, City]) -> Optional[City]:
+    """Try several ways to match an event to one of our cities."""
+    slug = (event.get("slug") or "").lower()
+    title = (event.get("title") or "").lower()
+    description = event.get("description") or ""
+
+    # 1. ICAO from Wunderground link in description (most reliable)
+    icao = _extract_icao_from_description(description)
+    if not icao:
+        for m in event.get("markets", []) or []:
+            icao = _extract_icao_from_description(m.get("description") or "")
+            if icao:
+                break
+    if icao:
+        city_slug = POLYMARKET_ICAO_TO_CITY_SLUG.get(icao)
+        if city_slug and city_slug in alias_to_city:
+            return alias_to_city[city_slug]
+
+    # 2. Match by alias appearing in slug/title
+    for alias, city in alias_to_city.items():
+        # avoid spurious substring hits like "san" matching "san-jose"
+        token = f"-{alias}-"
+        padded_slug = f"-{slug}-"
+        if token in padded_slug or alias in title.split():
+            return city
+    return None
+
+
+async def _ingest_event(event: dict, city: City, db: AsyncSession) -> int:
+    """Insert market + outcomes for an event matched to a city."""
+    slug = event.get("slug")
+    if not slug:
+        return 0
 
     existing = await db.execute(select(Market).where(Market.external_id == slug))
     if existing.scalar_one_or_none():
+        return 0
+
+    # Resolve date — prefer slug, fall back to title
+    target_date = _parse_date(slug) or _parse_date(event.get("title") or "")
+    if not target_date:
+        logger.debug(f"No date parsed from event slug={slug}")
+        return 0
+    today = date.today()
+    if target_date < today or target_date > today + timedelta(days=FORECAST_DAYS_AHEAD):
         return 0
 
     end_str = event.get("endDate") or event.get("end_date_iso")
@@ -140,20 +243,19 @@ async def _create_market_from_event(
         question=event.get("title") or f"Highest temp in {city.name} on {target_date}",
         event_date=target_date,
         resolution_time=resolution_time,
-        resolution_source=event.get("description", "")[:500] if event.get("description") else None,
+        resolution_source=(event.get("description") or "")[:500] or None,
     )
     db.add(market)
     await db.flush()
 
     count = 0
-    for m in event.get("markets", []):
+    for m in event.get("markets", []) or []:
         question = m.get("question", "") or m.get("groupItemTitle", "")
         temps = [int(t) for t in re.findall(r"(\d+)\s*°?F", question)]
         bucket_min = temps[0] if len(temps) >= 1 else None
         bucket_max = temps[1] if len(temps) >= 2 else None
         bucket_label = (
-            question[:50]
-            if question
+            question[:50] if question
             else (f"{bucket_min}-{bucket_max}°F" if bucket_max else f"{bucket_min}+°F")
         )
 
@@ -182,65 +284,76 @@ async def _create_market_from_event(
         count += 1
 
     await db.commit()
-    logger.info(f"Discovered {count} outcomes for {slug} ({city.name} {target_date})")
+    logger.info(
+        f"Discovered market: city={city.name} date={target_date} "
+        f"slug={slug} outcomes={count}"
+    )
     return count
 
 
 async def job_discover_markets():
-    """Pull all open Polymarket events, find daily-high temperature markets, match to our cities."""
+    """Discover Polymarket weather markets via q-based search.
+
+    Strategy from polymarketweatherassistwebpage (proven working):
+      1. Search Gamma /events?q=<term> with multiple weather terms
+      2. Collect unique slugs (search returns events with EMPTY markets[])
+      3. Fetch each event individually by slug (returns full event)
+      4. Extract resolution ICAO from description → match to our cities
+      5. Fall back to slug/title alias matching
+    """
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(City).where(City.active == True, City.polymarket_slug != None)
         )
-        cities = result.scalars().all()
+        cities = list(result.scalars().all())
         if not cities:
             logger.warning("job_discover_markets: no cities with polymarket_slug")
             return
 
-        # Build alias -> city map
         alias_to_city: dict[str, City] = {}
         for city in cities:
             for alias in _city_aliases(city):
                 alias_to_city[alias.lower()] = city
 
-        events = await _fetch_all_active_events()
-        logger.info(f"job_discover_markets: fetched {len(events)} open events from Gamma")
+        # 1. Collect slugs across all search terms
+        all_slugs: set[str] = set()
+        for q in POLYMARKET_QUERIES:
+            found = await _search_event_slugs(q, limit=100)
+            all_slugs |= found
+        logger.info(
+            f"job_discover_markets: found {len(all_slugs)} unique slugs across "
+            f"{len(POLYMARKET_QUERIES)} search queries"
+        )
+        if not all_slugs:
+            return
 
-        # Optional: log temperature-looking events for debugging
-        temp_events = []
-        unmatched_aliases: set[str] = set()
-        today = date.today()
-        horizon = today + timedelta(days=FORECAST_DAYS_AHEAD)
-        total_new = 0
-
-        for event in events:
-            slug = (event.get("slug") or "").lower()
-            if "temperature" not in slug:
+        # 2. Fetch full event for each slug (cap at 200 for safety)
+        new_outcomes = 0
+        matched_cities: dict[str, int] = {}
+        unmatched: list[str] = []
+        for slug in list(all_slugs)[:200]:
+            event = await _fetch_event_by_slug(slug)
+            if not event:
                 continue
-            temp_events.append(slug)
-            parsed = _parse_temp_slug(slug)
-            if not parsed:
-                continue
-            city_alias, target_date = parsed
-            if target_date < today or target_date > horizon:
-                continue
-            city = alias_to_city.get(city_alias)
+            city = _match_event_to_city(event, alias_to_city)
             if not city:
-                unmatched_aliases.add(city_alias)
+                unmatched.append(slug)
                 continue
             try:
-                total_new += await _create_market_from_event(event, city, target_date, db)
+                added = await _ingest_event(event, city, db)
+                if added > 0:
+                    new_outcomes += added
+                    matched_cities[city.name] = matched_cities.get(city.name, 0) + 1
             except Exception as e:
-                logger.error(f"_create_market_from_event failed for {slug}: {e}", exc_info=True)
+                logger.error(f"_ingest_event failed for slug={slug}: {e}", exc_info=True)
 
         logger.info(
-            f"job_discover_markets: temp_events_seen={len(temp_events)} "
-            f"unmatched_city_aliases={sorted(unmatched_aliases)} new_outcomes={total_new}"
+            f"job_discover_markets: ingested={new_outcomes} outcomes "
+            f"matched_cities={matched_cities}"
         )
-        if temp_events and total_new == 0:
-            # Help debugging: show first few slugs that we saw but didn't import
-            sample = temp_events[:8]
-            logger.info(f"job_discover_markets: sample temperature slugs seen: {sample}")
+        if unmatched:
+            sample = unmatched[:10]
+            logger.info(f"job_discover_markets: unmatched slugs (sample): {sample}")
 
 
 async def job_fetch_metars():
@@ -434,7 +547,6 @@ async def job_check_resolutions():
             )
             actual_high_raw = temp_result.scalar_one_or_none()
             if actual_high_raw is None:
-                logger.debug(f"No METAR for {city.name} {market.event_date} — skip resolution")
                 continue
             actual_high_f = float(actual_high_raw)
             logger.info(f"Resolving {market.external_id}: actual high = {actual_high_f}°F")
