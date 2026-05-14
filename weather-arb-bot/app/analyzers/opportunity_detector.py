@@ -17,11 +17,7 @@ logger = logging.getLogger(__name__)
 
 aggregator = SignalAggregator()
 
-
-def _required_edge(market_price: float) -> float:
-    if 0.30 <= market_price <= 0.70:
-        return settings.min_edge_for_alert
-    return settings.min_edge_for_alert * 0.67
+MIN_CONFIDENCE = 80  # hard floor — overrides settings so it cannot be lowered accidentally
 
 
 async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
@@ -68,22 +64,22 @@ async def _analyze_outcome(db: AsyncSession, city: City, outcome: MarketOutcome)
     true_prob = estimate_true_probability(signals, outcome.bucket_min, outcome.bucket_max)
     confidence = compute_confidence(signals, outcome.bucket_min, outcome.bucket_max)
 
+    # Only flag when the market is UNDERPRICING the outcome relative to our model.
+    # i.e. we think YES is more likely than what the market charges.
+    # Never fire on the NO side — shorting a weather bucket is not our use-case.
     yes_edge = true_prob - yes_price
-    no_edge = (1 - true_prob) - (1 - yes_price)
-    best_edge = yes_edge if yes_edge >= no_edge else no_edge
-    best_side = "YES" if yes_edge >= no_edge else "NO"
 
-    req_edge = _required_edge(yes_price)
-    if best_edge < req_edge or confidence < settings.min_confidence_for_alert:
+    min_conf = max(MIN_CONFIDENCE, settings.min_confidence_for_alert)
+    if yes_edge < settings.min_edge_for_alert or confidence < min_conf:
         return None
 
     opp = Opportunity(
         outcome_id=outcome.id,
         detected_at=datetime.now(timezone.utc),
-        side=best_side,
+        side="YES",
         market_price=yes_price,
         estimated_true_prob=true_prob,
-        edge=best_edge,
+        edge=yes_edge,
         confidence_score=confidence,
         signals=signals,
         alert_sent=False,
