@@ -19,7 +19,7 @@
   .card .label { font-size:11px; color: var(--mute); text-transform:uppercase; letter-spacing:0.5px; }
   .card .value { font-size:24px; font-weight:600; margin-top:4px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:8px 10px; border-bottom: 1px solid var(--border); }
+  th, td { text-align:left; padding:8px 10px; border-bottom: 1px solid var(--border); vertical-align:middle; }
   th { color: var(--mute); font-weight:500; font-size:11px; text-transform:uppercase; }
   tr:hover td { background: rgba(255,255,255,0.02); }
   .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
@@ -28,9 +28,11 @@
   .pill.open { background: rgba(74,158,255,0.15); color: var(--accent); }
   input, button.btn, select { background: var(--panel); border:1px solid var(--border); color: var(--fg);
          padding:6px 10px; border-radius:6px; font-size:14px; }
+  input[type=number] { -moz-appearance: textfield; }
   button.btn { cursor:pointer; }
   button.btn:hover { background: var(--border); }
   button.btn.primary { background: var(--accent); border-color: var(--accent); color:white; }
+  button.btn:disabled { opacity: 0.5; cursor: default; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .toolbar { display:flex; gap:10px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
   .log { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:12px; white-space:pre-wrap;
@@ -99,10 +101,23 @@
     </section>
 
     <section id="tab-cities" class="hidden">
-      <div class="toolbar"><button class="btn" onclick="loadCities()">Refresh</button></div>
+      <div class="toolbar">
+        <button class="btn" onclick="loadCities()">Refresh</button>
+        <button class="btn primary" onclick="runDiscovery(this)">Run Discovery</button>
+        <span id="discoveryStatus" class="small"></span>
+      </div>
+      <p class="small">Edit lat/lon, ICAO codes, or Polymarket slug, then click Save. Coordinates are used for all weather model queries.</p>
       <table>
-        <thead><tr><th>Name</th><th>Primary</th><th>Reference</th><th>Poly slug</th>
-          <th>Lat,Lon</th><th>Active</th><th></th></tr></thead>
+        <thead><tr>
+          <th>Name</th>
+          <th>Primary ICAO</th>
+          <th>Reference ICAO</th>
+          <th>Poly slug</th>
+          <th>Lat</th>
+          <th>Lon</th>
+          <th>Active</th>
+          <th></th>
+        </tr></thead>
         <tbody id="citiesBody"></tbody>
       </table>
     </section>
@@ -230,10 +245,11 @@ async function loadCities() {
   document.getElementById('citiesBody').innerHTML = rows.map(c => `
     <tr>
       <td>${c.name}</td>
-      <td>${c.primary_icao}</td>
-      <td>${c.reference_icao || ''}</td>
-      <td><input style="width:140px;" value="${c.polymarket_slug || ''}" id="city-slug-${c.id}"/></td>
-      <td class="small">${c.nws_lat?.toFixed(3)}, ${c.nws_lon?.toFixed(3)}</td>
+      <td><input style="width:68px;" value="${escapeHtml(c.primary_icao || '')}" id="city-picao-${c.id}"/></td>
+      <td><input style="width:68px;" value="${escapeHtml(c.reference_icao || '')}" id="city-ricao-${c.id}"/></td>
+      <td><input style="width:130px;" value="${escapeHtml(c.polymarket_slug || '')}" id="city-slug-${c.id}"/></td>
+      <td><input style="width:82px;" type="number" step="0.0001" value="${c.nws_lat != null ? c.nws_lat.toFixed(4) : ''}" id="city-lat-${c.id}"/></td>
+      <td><input style="width:88px;" type="number" step="0.0001" value="${c.nws_lon != null ? c.nws_lon.toFixed(4) : ''}" id="city-lon-${c.id}"/></td>
       <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
       <td><button class="btn primary" onclick="saveCity(${c.id})">Save</button></td>
     </tr>
@@ -241,12 +257,36 @@ async function loadCities() {
 }
 
 async function saveCity(id) {
+  const latVal = document.getElementById('city-lat-'+id).value;
+  const lonVal = document.getElementById('city-lon-'+id).value;
   const payload = {
-    polymarket_slug: document.getElementById('city-slug-'+id).value || null,
+    primary_icao: document.getElementById('city-picao-'+id).value.trim().toUpperCase() || null,
+    reference_icao: document.getElementById('city-ricao-'+id).value.trim().toUpperCase() || null,
+    polymarket_slug: document.getElementById('city-slug-'+id).value.trim() || null,
+    nws_lat: latVal !== '' ? parseFloat(latVal) : null,
+    nws_lon: lonVal !== '' ? parseFloat(lonVal) : null,
     active: document.getElementById('city-active-'+id).checked,
   };
   const r = await api('/cities/'+id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-  if (r.ok) loadCities(); else alert('Save failed');
+  if (r.ok) { loadCities(); } else { alert('Save failed'); }
+}
+
+async function runDiscovery(btn) {
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  const status = document.getElementById('discoveryStatus');
+  status.textContent = 'Discovery running, please wait…';
+  try {
+    const r = await api('/discover', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    status.textContent = `Done: ${j.markets_ingested || 0} new markets, ${j.markets_refreshed || 0} refreshed, ${j.events_found || 0} events scanned.`;
+  } catch (e) {
+    status.textContent = 'Discovery failed: ' + e;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
 }
 
 async function loadSettings() {
@@ -293,7 +333,7 @@ async function loadLogs() {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 init();

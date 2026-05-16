@@ -32,7 +32,6 @@ async def lifespan(app: FastAPI):
     install_buffer_handler()
     logger.info("Weather Arbitrage Bot starting up...")
 
-    # Auto-seed cities on every startup (idempotent, no-op if already up to date)
     try:
         from app.utils.seed import seed_cities
         summary = await seed_cities()
@@ -53,6 +52,7 @@ async def lifespan(app: FastAPI):
             job_fetch_metars, job_fetch_wunderground, job_fetch_nws,
             job_fetch_models, job_fetch_pireps, job_fetch_polymarket,
             job_run_analyzer, job_check_resolutions,
+            job_fetch_external_forecasts,
         )
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
@@ -67,6 +67,10 @@ async def lifespan(app: FastAPI):
                            id="nws", next_run_time=now, max_instances=1, misfire_grace_time=300)
         _scheduler.add_job(job_fetch_models, IntervalTrigger(seconds=3600),
                            id="models", next_run_time=now, max_instances=1, misfire_grace_time=600)
+        _scheduler.add_job(job_fetch_external_forecasts,
+                           IntervalTrigger(seconds=settings.external_forecast_fetch_interval),
+                           id="external_forecasts", next_run_time=now,
+                           max_instances=1, misfire_grace_time=600)
         _scheduler.add_job(job_fetch_pireps, IntervalTrigger(seconds=900),
                            id="pireps", next_run_time=now, max_instances=1, misfire_grace_time=120)
         _scheduler.add_job(job_fetch_polymarket, IntervalTrigger(seconds=settings.polymarket_fetch_interval),
