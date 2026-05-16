@@ -20,6 +20,9 @@ from app.collectors.metar_collector import MetarCollector
 from app.collectors.wunderground_collector import WundergroundCollector
 from app.collectors.nws_collector import NWSCollector
 from app.collectors.gfs_collector import GFSCollector
+from app.collectors.hrrr_collector import HRRRCollector
+from app.collectors.tomorrowio_collector import TomorrowioCollector
+from app.collectors.meteosource_collector import MeteosourceCollector
 from app.collectors.pirep_collector import PirepCollector
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.analyzers.opportunity_detector import detect_opportunities
@@ -40,10 +43,15 @@ metar_col = MetarCollector()
 wunder_col = WundergroundCollector()
 nws_col = NWSCollector()
 gfs_col = GFSCollector()
+hrrr_col = HRRRCollector()
+tomorrowio_col = TomorrowioCollector(api_key=settings.tomorrowio_api_key)
+meteosource_col = MeteosourceCollector(api_key=settings.meteosource_api_key)
 pirep_col = PirepCollector()
 poly_col = PolymarketCollector()
 
 FORECAST_DAYS_AHEAD = 7
+# External rate-limited APIs only fetched 3 days ahead to conserve quota.
+EXTERNAL_FORECAST_DAYS = 3
 DISCOVERY_CONCURRENCY = 3
 
 POLYMARKET_ICAO_TO_CITY_SLUG = {
@@ -75,11 +83,9 @@ _DATE_PROSE_RX = re.compile(
     re.IGNORECASE,
 )
 _DATE_SLUG_RX = re.compile(
-    rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?", re.IGNORECASE,
+    rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?" , re.IGNORECASE,
 )
 
-# Skip markets whose question text contains any of these tokens (case-insensitive).
-# For now we only trade "highest temperature" markets — daily-low markets are disabled.
 SKIP_MARKET_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
 
 LAST_DISCOVERY: dict = {
@@ -129,16 +135,6 @@ def _extract_icao_from_description(desc: str) -> Optional[str]:
 
 
 def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
-    """Parse temperature bucket bounds from a label string.
-
-    Handles (in priority order):
-      "65-70°F" / "65 to 70"     → (65, 70)
-      "85+°F" / "X or above/higher/over/more" → (X, None)
-      "X or below/lower/under/less"            → (None, X)
-      "below/under/less than X"                → (None, X)
-      "above/over/greater than X"              → (X, None)
-      "11°C" (single exact value)              → (11, 12)  ← treated as [X, X+1)
-    """
     if not text:
         return None, None
     t = text.lower().replace("°", "").strip()
@@ -176,7 +172,6 @@ def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
 
 
 def _is_celsius_bucket(label: str) -> bool:
-    """Return True if the bucket label uses Celsius units."""
     lo = label.lower()
     if "°c" in lo:
         return True
@@ -192,7 +187,6 @@ def _c_to_f(celsius: Optional[int]) -> Optional[int]:
 
 
 def _parse_bucket(label: str) -> tuple[Optional[int], Optional[int]]:
-    """Parse a bucket label into (min, max) in °F (converting from Celsius if needed)."""
     bmin, bmax = _parse_temp_range(label)
     if _is_celsius_bucket(label):
         bmin = _c_to_f(bmin)
@@ -201,11 +195,6 @@ def _parse_bucket(label: str) -> tuple[Optional[int], Optional[int]]:
 
 
 async def _refresh_outcome_bounds(db: AsyncSession, market: Market, raw_markets: list) -> int:
-    """Re-parse every outcome of an existing market and update bucket_min/max if changed.
-
-    Needed because rows ingested before the parser/Celsius fixes have wrong bounds.
-    Returns the count of outcomes updated.
-    """
     existing_outcomes_q = await db.execute(
         select(MarketOutcome).where(MarketOutcome.market_id == market.id)
     )
@@ -240,12 +229,6 @@ async def _refresh_outcome_bounds(db: AsyncSession, market: Market, raw_markets:
 
 
 async def _ingest_event(event: dict, city: City, db: AsyncSession) -> tuple[int, int]:
-    """Ingest a Polymarket event. Returns (new_outcomes, refreshed_outcomes).
-
-    If the market already exists, re-parse and refresh existing outcome bounds
-    (so old rows with wrong bucket_min/max get corrected on next discovery).
-    Skips markets whose title says "lowest" — we only trade highest-temp for now.
-    """
     slug = event.get("slug")
     if not slug:
         return 0, 0
@@ -605,9 +588,43 @@ async def job_fetch_models():
                     except Exception as e:
                         logger.error(f"{model} job failed for {city.name} {d}: {e}")
                 try:
+                    await hrrr_col.collect_and_store(city.id, lat, lon, d, db)
+                except Exception as e:
+                    logger.error(f"HRRR job failed for {city.name} {d}: {e}")
+                try:
                     await gfs_col.collect_ensemble_and_store(city.id, lat, lon, d, db)
                 except Exception as e:
                     logger.error(f"GFS ensemble job failed for {city.name} {d}: {e}")
+
+
+async def job_fetch_external_forecasts():
+    """Fetch Tomorrow.io and Meteosource for active cities, 3 days ahead.
+
+    Rate-limited to 3 days to conserve daily API quota.
+    Skipped silently when API keys are not configured.
+    """
+    if not tomorrowio_col.api_key and not meteosource_col.api_key:
+        return
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(City).where(City.active == True))
+        cities = result.scalars().all()
+        today = date.today()
+        dates = [today + timedelta(days=i) for i in range(EXTERNAL_FORECAST_DAYS)]
+        for city in cities:
+            if city.nws_lat is None or city.nws_lon is None:
+                continue
+            lat, lon = float(city.nws_lat), float(city.nws_lon)
+            for d in dates:
+                if tomorrowio_col.api_key:
+                    try:
+                        await tomorrowio_col.collect_and_store(city.id, lat, lon, d, db)
+                    except Exception as e:
+                        logger.error(f"Tomorrow.io job failed for {city.name} {d}: {e}")
+                if meteosource_col.api_key:
+                    try:
+                        await meteosource_col.collect_and_store(city.id, lat, lon, d, db)
+                    except Exception as e:
+                        logger.error(f"Meteosource job failed for {city.name} {d}: {e}")
 
 
 async def job_fetch_pireps():
