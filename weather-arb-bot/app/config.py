@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     wunderground_api_key: str = ""
     openweather_api_key: str = ""
     polymarket_api_key: str = ""
+    tomorrowio_api_key: str = ""
+    meteosource_api_key: str = ""
     app_env: str = "development"
     secret_key: str = "changeme"
     admin_password: str = ""
@@ -19,6 +21,7 @@ class Settings(BaseSettings):
     polymarket_fetch_interval: int = 300  # 5 min
     wunderground_fetch_interval: int = 1800
     analyzer_run_interval: int = 300      # 5 min
+    external_forecast_fetch_interval: int = 14400  # 4h — rate-limited external APIs
     # Minimum directional certainty (in %) required to alert.
     # certainty = max(true_prob, 1 - true_prob). 80 means we need to be
     # at least 80% sure the bucket will (YES) or will not (NO) be the answer.
