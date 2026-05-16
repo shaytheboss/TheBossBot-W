@@ -18,6 +18,8 @@ class SignalAggregator:
         self, db, city_id, primary_icao, reference_icao, outcome,
         forecast_date: Optional[date] = None,
         is_low_market: bool = False,
+        city_lat: Optional[float] = None,
+        city_lon: Optional[float] = None,
     ) -> dict:
         signals = {}
         signals["primary_metar"] = await self._latest_metar(db, primary_icao)
@@ -27,6 +29,10 @@ class SignalAggregator:
         signals["wunderground_forecast"] = await self._latest_forecast(db, city_id, "wunderground", forecast_date)
         signals["gfs_forecast"] = await self._latest_forecast(db, city_id, "gfs", forecast_date)
         signals["ecmwf_forecast"] = await self._latest_forecast(db, city_id, "ecmwf", forecast_date)
+        signals["hrrr_forecast"] = await self._latest_forecast(db, city_id, "hrrr", forecast_date)
+        signals["nws_forecast"] = await self._latest_forecast(db, city_id, "nws", forecast_date)
+        signals["tomorrowio_forecast"] = await self._latest_forecast(db, city_id, "tomorrowio", forecast_date)
+        signals["meteosource_forecast"] = await self._latest_forecast(db, city_id, "meteosource", forecast_date)
         signals["gfs_ensemble"] = await self._latest_forecast(db, city_id, "gfs_ensemble", forecast_date)
         signals["pireps"] = await self._recent_pireps(db, primary_icao, hours=2)
         signals["market_price"] = await self._latest_price(db, outcome.id)
@@ -35,6 +41,8 @@ class SignalAggregator:
         signals["is_low_market"] = is_low_market
         signals["_bucket_min"] = outcome.bucket_min
         signals["_bucket_max"] = outcome.bucket_max
+        signals["city_lat"] = city_lat
+        signals["city_lon"] = city_lon
         return signals
 
     async def _latest_metar(self, db, icao):
@@ -98,7 +106,6 @@ class SignalAggregator:
             "conditions": row.conditions,
             "retrieved_at": row.retrieved_at.isoformat(),
         }
-        # Include ensemble distribution if stored in raw_data
         if row.raw_data and isinstance(row.raw_data, dict):
             for k in ("ensemble_highs", "ensemble_lows", "ensemble_count",
                       "mean_high_f", "mean_low_f",

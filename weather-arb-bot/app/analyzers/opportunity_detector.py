@@ -16,8 +16,7 @@ logger = logging.getLogger(__name__)
 
 aggregator = SignalAggregator()
 
-# Skip markets whose question contains any of these tokens — only "highest"
-# temperature markets are analyzed for now.
+# Skip markets whose question contains any of these tokens.
 SKIP_QUESTION_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
 
 
@@ -71,12 +70,17 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
 
         is_low_market = False  # only "highest" markets pass the skip filter
 
+        city_lat = float(city.nws_lat) if city.nws_lat is not None else None
+        city_lon = float(city.nws_lon) if city.nws_lon is not None else None
+
         # Evaluate every bucket but only keep the single best-edge opportunity
-        # per market — prevents contradictory or duplicate alerts for the same city/date.
+        # per market — prevents contradictory or duplicate alerts for same city/date.
         best_opp: Optional[Opportunity] = None
         for outcome in outcomes:
             try:
-                opp = await _analyze_outcome(db, city, outcome, market, is_low_market)
+                opp = await _analyze_outcome(
+                    db, city, outcome, market, is_low_market, city_lat, city_lon
+                )
                 if opp is not None:
                     if best_opp is None or opp.edge > best_opp.edge:
                         best_opp = opp
@@ -95,19 +99,9 @@ async def _analyze_outcome(
     outcome: MarketOutcome,
     market: Market,
     is_low_market: bool,
+    city_lat: Optional[float] = None,
+    city_lon: Optional[float] = None,
 ) -> Optional[Opportunity]:
-    """Detect an opportunity for a single bucket.
-
-    Gate: our directional certainty = max(true_prob, 1 - true_prob) must be
-    >= settings.min_confidence_for_alert percent, AND the edge for that side
-    must be >= settings.min_edge_for_alert.
-
-    side=YES when true_prob >= 0.5 (market underprices YES).
-    side=NO  when true_prob <  0.5 (market underprices NO).
-
-    Dedup: if we already sent an alert for this (outcome, side) and it isn't
-    resolved yet, skip — even if signals have shifted significantly.
-    """
     signals = await aggregator.aggregate(
         db=db,
         city_id=city.id,
@@ -116,6 +110,8 @@ async def _analyze_outcome(
         outcome=outcome,
         forecast_date=market.event_date,
         is_low_market=is_low_market,
+        city_lat=city_lat,
+        city_lon=city_lon,
     )
 
     price_info = signals.get("market_price")
@@ -143,9 +139,7 @@ async def _analyze_outcome(
         return None
 
     if await _has_prior_alert(db, outcome.id, side):
-        logger.debug(
-            f"Dedup: already alerted on outcome={outcome.id} side={side}; skipping"
-        )
+        logger.debug(f"Dedup: already alerted outcome={outcome.id} side={side}; skipping")
         return None
 
     opp = Opportunity(
