@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +10,15 @@ _FORECAST_SIGMA_F = 3.0
 
 _PROB_CLIP_LO = 0.03
 _PROB_CLIP_HI = 0.97
+
+_DET_SOURCES = (
+    ("gfs_forecast", "GFS (global)"),
+    ("ecmwf_forecast", "ECMWF"),
+    ("hrrr_forecast", "HRRR (3km CONUS)"),
+    ("nws_forecast", "NWS (official)"),
+    ("tomorrowio_forecast", "Tomorrow.io"),
+    ("meteosource_forecast", "Meteosource"),
+)
 
 
 def _bucket_contains(value: float, bucket_min: Optional[int], bucket_max: Optional[int]) -> bool:
@@ -23,7 +32,6 @@ def _bucket_contains(value: float, bucket_min: Optional[int], bucket_max: Option
 
 
 def _norm_cdf(z: float) -> float:
-    """Standard normal CDF via math.erf (no scipy required)."""
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
@@ -65,49 +73,78 @@ def _clip(p: float, lo: float = _PROB_CLIP_LO, hi: float = _PROB_CLIP_HI) -> flo
     return max(lo, min(hi, p))
 
 
-def estimate_true_probability(
+def estimate_with_breakdown(
     signals: dict,
     bucket_min: Optional[int],
     bucket_max: Optional[int],
-) -> float:
-    """Estimate P(daily high/low falls in [bucket_min, bucket_max]).
-
-    Blend:
-      70% GFS ensemble (Laplace-smoothed) +
-      30% average Gaussian probability across all available deterministic
-          models (GFS, ECMWF, HRRR, NWS, Tomorrow.io, Meteosource).
-    WunderGround applied as a soft 10% correction on top.
-    Always clipped to [3%, 97%].
+) -> Tuple[float, dict]:
+    """Same blend logic as estimate_true_probability, but also returns the
+    intermediate per-source probabilities so the formatter can render an audit
+    trail ("How we got to 97% NO").
     """
     is_low_market = signals.get("is_low_market", False)
     fc_key = "predicted_low_f" if is_low_market else "predicted_high_f"
     ensemble_key = "ensemble_lows" if is_low_market else "ensemble_highs"
+    p50_key = "p50_low_f" if is_low_market else "p50_high_f"
 
-    # ── 1. Ensemble probability (Laplace-smoothed) ─────────────────────────────────────────
+    breakdown: dict = {
+        "is_low_market": bool(is_low_market),
+        "deterministic": [],
+        "ensemble": None,
+        "wunderground": None,
+        "det_avg": None,
+        "ens_p": None,
+        "wg_p": None,
+        "blend_before_adjustments": None,
+        "adjustments": [],
+        "final": None,
+    }
+
+    # ── 1. Deterministic sources ───────────────────────────────────────
+    det_probs = []
+    for key, label in _DET_SOURCES:
+        val = (signals.get(key) or {}).get(fc_key)
+        if val is None:
+            continue
+        p = _gaussian_bucket_prob(val, bucket_min, bucket_max)
+        if p is None:
+            continue
+        det_probs.append(p)
+        breakdown["deterministic"].append({
+            "source": label,
+            "value_f": float(val),
+            "p_in_bucket": float(p),
+        })
+    det_p = sum(det_probs) / len(det_probs) if det_probs else None
+    breakdown["det_avg"] = float(det_p) if det_p is not None else None
+
+    # ── 2. GFS Ensemble ───────────────────────────────────────────────
     ensemble_fc = signals.get("gfs_ensemble") or {}
     ensemble_vals = ensemble_fc.get(ensemble_key) or []
     ens_p = _ensemble_bucket_prob(ensemble_vals, bucket_min, bucket_max)
+    if ens_p is not None:
+        hits = sum(1 for v in ensemble_vals if _bucket_contains(v, bucket_min, bucket_max))
+        n = len(ensemble_vals)
+        breakdown["ensemble"] = {
+            "n": n,
+            "hits": hits,
+            "median_f": ensemble_fc.get(p50_key),
+            "raw_pct": round(100 * hits / n, 1) if n else None,
+            "smoothed_pct": round(100 * ens_p, 1),
+        }
+    breakdown["ens_p"] = float(ens_p) if ens_p is not None else None
 
-    # ── 2. Deterministic Gaussian average across all available models ──────────
-    det_source_keys = (
-        "gfs_forecast", "ecmwf_forecast", "hrrr_forecast",
-        "nws_forecast", "tomorrowio_forecast", "meteosource_forecast",
-    )
-    det_probs = [
-        p
-        for key in det_source_keys
-        for val in [(signals.get(key) or {}).get(fc_key)]
-        if val is not None
-        for p in [_gaussian_bucket_prob(val, bucket_min, bucket_max)]
-        if p is not None
-    ]
-    det_p = sum(det_probs) / len(det_probs) if det_probs else None
-
-    # ── 3. WunderGround as soft correction (private, less reliable) ─────────────
+    # ── 3. Wunderground (soft) ─────────────────────────────────────────
     wg_val = (signals.get("wunderground_forecast") or {}).get(fc_key)
     wg_p = _gaussian_bucket_prob(wg_val, bucket_min, bucket_max)
+    if wg_val is not None:
+        breakdown["wunderground"] = {
+            "value_f": float(wg_val),
+            "p_in_bucket": float(wg_p) if wg_p is not None else None,
+        }
+    breakdown["wg_p"] = float(wg_p) if wg_p is not None else None
 
-    # ── Blend ──────────────────────────────────────────────────────────────
+    # ── Core blend: 70% ensemble + 30% deterministic, then 90/10 with WG ────────
     if ens_p is not None and det_p is not None:
         p = 0.70 * ens_p + 0.30 * det_p
     elif ens_p is not None:
@@ -117,12 +154,13 @@ def estimate_true_probability(
     elif wg_p is not None:
         p = wg_p
     else:
-        p = 0.25  # no data — weak uninformed prior
-
+        p = 0.25
     if wg_p is not None and (ens_p is not None or det_p is not None):
         p = 0.90 * p + 0.10 * wg_p
+    breakdown["blend_before_adjustments"] = float(p)
 
-    # ── METAR trend adjustment ────────────────────────────────────────────────
+    # ── Soft adjustments ───────────────────────────────────────────────
+    p_before = p
     trend = signals.get("metar_trend") or {}
     rate = trend.get("temp_rate_per_hour", 0.0) or 0.0
     current_temp = trend.get("current_temp_f")
@@ -132,8 +170,10 @@ def estimate_true_probability(
             p = min(_PROB_CLIP_HI, p * 1.08)
         elif abs(rate) > 2.0:
             p = max(_PROB_CLIP_LO, p * 0.93)
+    if abs(p - p_before) > 1e-6:
+        breakdown["adjustments"].append({"name": "METAR trend", "delta": float(p - p_before)})
+    p_before = p
 
-    # ── Reference station wind adjustment ─────────────────────────────────────────
     bucket_requires_warmth = bucket_min is not None and bucket_min >= 66
     ref = signals.get("reference_metar") or {}
     ref_wind_dir = ref.get("wind_direction")
@@ -146,8 +186,10 @@ def estimate_true_probability(
             p *= 1.10
         elif not onshore and bucket_requires_warmth:
             p *= 1.10
+    if abs(p - p_before) > 1e-6:
+        breakdown["adjustments"].append({"name": "Reference wind", "delta": float(p - p_before)})
+    p_before = p
 
-    # ── Low-altitude PIREP soft correction ────────────────────────────────────────
     pireps = signals.get("pireps") or []
     low_pireps = [
         r for r in pireps
@@ -160,5 +202,19 @@ def estimate_true_probability(
         pirep_p = _gaussian_bucket_prob(avg_f, bucket_min, bucket_max, sigma=4.0)
         if pirep_p is not None:
             p = 0.95 * p + 0.05 * pirep_p
+    if abs(p - p_before) > 1e-6:
+        breakdown["adjustments"].append({"name": "Low-altitude PIREP", "delta": float(p - p_before)})
 
-    return _clip(p)
+    final = _clip(p)
+    breakdown["final"] = float(final)
+    return final, breakdown
+
+
+def estimate_true_probability(
+    signals: dict,
+    bucket_min: Optional[int],
+    bucket_max: Optional[int],
+) -> float:
+    """Thin wrapper kept for callers that only need the final probability."""
+    p, _ = estimate_with_breakdown(signals, bucket_min, bucket_max)
+    return p

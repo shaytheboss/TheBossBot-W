@@ -72,6 +72,35 @@ class PolymarketCollector(BaseCollector):
             logger.error(f"Failed to fetch orderbook for {token_id}: {e}")
             return None
 
+    async def get_book_summary(self, token_id: str) -> Optional[dict]:
+        """Return {bid, ask, spread, mid} from the CLOB orderbook, or None if
+        no two-sided market exists. This is the realistic price you'd trade at,
+        not the midpoint — essential for low-volume markets where midpoint can
+        be far from any executable quote.
+        """
+        book = await self.get_orderbook(token_id)
+        if not book:
+            return None
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            return None
+        try:
+            best_bid = max(float(b["price"]) for b in bids if b.get("price") is not None)
+            best_ask = min(float(a["price"]) for a in asks if a.get("price") is not None)
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning(f"Malformed book for {token_id}: {e}")
+            return None
+        if best_bid > best_ask:
+            # Crossed book — treat as malformed
+            return None
+        return {
+            "bid": round(best_bid, 4),
+            "ask": round(best_ask, 4),
+            "spread": round(best_ask - best_bid, 4),
+            "mid": round((best_bid + best_ask) / 2, 4),
+        }
+
     async def collect_and_store(
         self, outcome_id: int, token_id: str, db: AsyncSession
     ) -> Optional[dict]:

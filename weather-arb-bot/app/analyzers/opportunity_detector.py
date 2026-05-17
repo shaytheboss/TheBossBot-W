@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.analyzers.signal_aggregator import SignalAggregator
-from app.analyzers.probability_estimator import estimate_true_probability
+from app.analyzers.probability_estimator import estimate_with_breakdown
+from app.collectors.polymarket_collector import PolymarketCollector
 from app.config import settings
 from app.models.city import City
 from app.models.market import Market, MarketOutcome
@@ -15,8 +16,11 @@ from app.models.opportunity import Opportunity
 logger = logging.getLogger(__name__)
 
 aggregator = SignalAggregator()
+_poly_col = PolymarketCollector()
 
-# Skip markets whose question contains any of these tokens.
+# Liquidity gate: skip outcomes whose orderbook spread exceeds this. 10¢ = wide.
+MAX_BOOK_SPREAD = 0.10
+
 SKIP_QUESTION_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
 
 
@@ -28,13 +32,7 @@ def _should_skip_market(question: Optional[str]) -> bool:
 
 
 async def _has_prior_alert(db: AsyncSession, outcome_id: int, side: str) -> bool:
-    """Has an alert already been sent for this exact (outcome, side) pair?
-
-    Dedup key = outcome_id + side. outcome_id uniquely identifies
-    (city, event_date, bucket), so we never re-alert on the same
-    (station, date, bucket, YES/NO) tuple even if values shift.
-    Only un-resolved prior alerts block; once resolved we can re-evaluate.
-    """
+    """Has an alert already been sent for this exact (outcome, side) pair?"""
     q = await db.execute(
         select(Opportunity.id).where(
             Opportunity.outcome_id == outcome_id,
@@ -118,19 +116,45 @@ async def _analyze_outcome(
     if not price_info:
         return None
 
-    yes_price = price_info["yes_price"]
-    true_prob = estimate_true_probability(signals, outcome.bucket_min, outcome.bucket_max)
+    # ── Liquidity gate: fetch live orderbook ──────────────────────────────────
+    book = None
+    if outcome.token_id:
+        book = await _poly_col.get_book_summary(outcome.token_id)
+    if book is None:
+        logger.debug(
+            f"Skipping outcome {outcome.id}: no two-sided orderbook (illiquid)"
+        )
+        return None
+    if book["spread"] > MAX_BOOK_SPREAD:
+        logger.debug(
+            f"Skipping outcome {outcome.id}: book spread {book['spread']:.2f} > "
+            f"{MAX_BOOK_SPREAD:.2f} (illiquid)"
+        )
+        return None
+
+    yes_price_mid = price_info["yes_price"]  # kept for DB compatibility
+    yes_bid = book["bid"]
+    yes_ask = book["ask"]
+    # Cost to actually enter each side at the top of the book:
+    yes_entry_cost = yes_ask              # buying YES means paying the ask
+    no_entry_cost = round(1.0 - yes_bid, 4)  # buying NO = selling YES at the bid
+
+    # ── Probability + breakdown ──────────────────────────────────────────────
+    true_prob, breakdown = estimate_with_breakdown(
+        signals, outcome.bucket_min, outcome.bucket_max
+    )
 
     if true_prob >= 0.5:
         side = "YES"
         certainty = true_prob
-        market_implied = yes_price
+        entry_cost = yes_entry_cost
     else:
         side = "NO"
         certainty = 1.0 - true_prob
-        market_implied = 1.0 - yes_price
+        entry_cost = no_entry_cost
 
-    edge = certainty - market_implied
+    # Realistic edge: estimate minus what you'd actually pay
+    edge = certainty - entry_cost
 
     min_certainty = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
     if certainty < min_certainty:
@@ -142,11 +166,16 @@ async def _analyze_outcome(
         logger.debug(f"Dedup: already alerted outcome={outcome.id} side={side}; skipping")
         return None
 
+    # Surface for the Telegram formatter
+    signals["_book"] = book
+    signals["_entry_cost"] = float(entry_cost)
+    signals["_blend"] = breakdown
+
     opp = Opportunity(
         outcome_id=outcome.id,
         detected_at=datetime.now(timezone.utc),
         side=side,
-        market_price=yes_price,
+        market_price=yes_price_mid,           # historical midpoint (DB compat)
         estimated_true_prob=true_prob,
         edge=edge,
         confidence_score=int(round(certainty * 100)),
