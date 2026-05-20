@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,7 +32,6 @@ def _should_skip_market(question: Optional[str]) -> bool:
 
 
 async def _has_prior_alert(db: AsyncSession, outcome_id: int, side: str) -> bool:
-    """Has an alert already been sent for this exact (outcome, side) pair?"""
     q = await db.execute(
         select(Opportunity.id).where(
             Opportunity.outcome_id == outcome_id,
@@ -66,13 +65,10 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         )
         outcomes: List[MarketOutcome] = outcomes_result.scalars().all()
 
-        is_low_market = False  # only "highest" markets pass the skip filter
-
+        is_low_market = False
         city_lat = float(city.nws_lat) if city.nws_lat is not None else None
         city_lon = float(city.nws_lon) if city.nws_lon is not None else None
 
-        # Evaluate every bucket but only keep the single best-edge opportunity
-        # per market — prevents contradictory or duplicate alerts for same city/date.
         best_opp: Optional[Opportunity] = None
         for outcome in outcomes:
             try:
@@ -116,32 +112,30 @@ async def _analyze_outcome(
     if not price_info:
         return None
 
-    # ── Liquidity gate: fetch live orderbook ──────────────────────────────────
+    # ── Liquidity gate ───────────────────────────────────────────────────
     book = None
     if outcome.token_id:
         book = await _poly_col.get_book_summary(outcome.token_id)
     if book is None:
-        logger.debug(
-            f"Skipping outcome {outcome.id}: no two-sided orderbook (illiquid)"
-        )
+        logger.debug(f"Skipping outcome {outcome.id}: no two-sided orderbook")
         return None
     if book["spread"] > MAX_BOOK_SPREAD:
         logger.debug(
-            f"Skipping outcome {outcome.id}: book spread {book['spread']:.2f} > "
-            f"{MAX_BOOK_SPREAD:.2f} (illiquid)"
+            f"Skipping outcome {outcome.id}: spread {book['spread']:.2f} "
+            f"> {MAX_BOOK_SPREAD:.2f}"
         )
         return None
 
-    yes_price_mid = price_info["yes_price"]  # kept for DB compatibility
+    yes_price_mid = price_info["yes_price"]
     yes_bid = book["bid"]
     yes_ask = book["ask"]
-    # Cost to actually enter each side at the top of the book:
-    yes_entry_cost = yes_ask              # buying YES means paying the ask
-    no_entry_cost = round(1.0 - yes_bid, 4)  # buying NO = selling YES at the bid
+    yes_entry_cost = yes_ask
+    no_entry_cost = round(1.0 - yes_bid, 4)
 
-    # ── Probability + breakdown ──────────────────────────────────────────────
+    # ── Probability + breakdown with lead-time-aware σ and gating ───────────────────
+    days_ahead = (market.event_date - date.today()).days
     true_prob, breakdown = estimate_with_breakdown(
-        signals, outcome.bucket_min, outcome.bucket_max
+        signals, outcome.bucket_min, outcome.bucket_max, days_ahead=days_ahead
     )
 
     if true_prob >= 0.5:
@@ -153,7 +147,6 @@ async def _analyze_outcome(
         certainty = 1.0 - true_prob
         entry_cost = no_entry_cost
 
-    # Realistic edge: estimate minus what you'd actually pay
     edge = certainty - entry_cost
 
     min_certainty = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
@@ -166,7 +159,6 @@ async def _analyze_outcome(
         logger.debug(f"Dedup: already alerted outcome={outcome.id} side={side}; skipping")
         return None
 
-    # Surface for the Telegram formatter
     signals["_book"] = book
     signals["_entry_cost"] = float(entry_cost)
     signals["_blend"] = breakdown
@@ -175,7 +167,7 @@ async def _analyze_outcome(
         outcome_id=outcome.id,
         detected_at=datetime.now(timezone.utc),
         side=side,
-        market_price=yes_price_mid,           # historical midpoint (DB compat)
+        market_price=yes_price_mid,
         estimated_true_prob=true_prob,
         edge=edge,
         confidence_score=int(round(certainty * 100)),

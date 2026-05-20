@@ -55,6 +55,19 @@ class SettingsIn(BaseModel):
     min_edge_for_alert: Optional[float] = None
 
 
+class CityCreateIn(BaseModel):
+    name: str
+    primary_icao: str
+    reference_icao: Optional[str] = None
+    polymarket_slug: Optional[str] = None
+    nws_lat: Optional[float] = None
+    nws_lon: Optional[float] = None
+    wunderground_url: Optional[str] = None
+    timezone: str = "America/Los_Angeles"
+    buoy_id: Optional[str] = None
+    active: bool = True
+
+
 @router.post("/login")
 async def admin_login(body: LoginIn, response: Response):
     if not settings.admin_password:
@@ -114,11 +127,6 @@ async def admin_diag_polymarket(
     slug: str = Query(..., description="Exact Polymarket event slug to fetch"),
     _: str = Depends(require_admin),
 ):
-    """Hit Gamma /events?slug=<slug> from the server and return the raw response.
-
-    Useful for testing what Polymarket returns for a slug we expect to exist,
-    e.g. `highest-temperature-in-nyc-on-may-16-2026`.
-    """
     async with httpx.AsyncClient(headers={"User-Agent": "weather-arb-bot/1.0"}) as client:
         try:
             r = await client.get(
@@ -150,7 +158,6 @@ async def admin_diag_candidates(
     _: str = Depends(require_admin), db: AsyncSession = Depends(get_db),
     days: int = Query(default=7, ge=1, le=14),
 ):
-    """Preview the candidate slugs we'd try for every active city x next N days."""
     cities = (await db.execute(
         select(City).where(City.active == True, City.polymarket_slug != None)
     )).scalars().all()
@@ -276,12 +283,38 @@ async def admin_cities(_: str = Depends(require_admin), db: AsyncSession = Depen
             "primary_icao": c.primary_icao,
             "reference_icao": c.reference_icao,
             "polymarket_slug": c.polymarket_slug,
+            "wunderground_url": c.wunderground_url,
+            "timezone": c.timezone,
+            "buoy_id": c.buoy_id,
             "nws_lat": float(c.nws_lat) if c.nws_lat else None,
             "nws_lon": float(c.nws_lon) if c.nws_lon else None,
             "active": c.active,
         }
         for c in rows
     ]
+
+
+@router.post("/cities", status_code=201)
+async def admin_city_create(
+    body: CityCreateIn,
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new monitored city. `wunderground_url` defaults to empty string
+    if not provided, since the City model requires it as NOT NULL."""
+    payload = body.model_dump()
+    # City.wunderground_url is NOT NULL but admin UI doesn't always know it.
+    if not payload.get("wunderground_url"):
+        payload["wunderground_url"] = ""
+    payload["primary_icao"] = payload["primary_icao"].strip().upper()
+    if payload.get("reference_icao"):
+        payload["reference_icao"] = payload["reference_icao"].strip().upper()
+    city = City(**payload)
+    db.add(city)
+    await db.commit()
+    await db.refresh(city)
+    logger.info(f"Admin created city #{city.id} {city.name} ({city.primary_icao})")
+    return {"ok": True, "id": city.id, "name": city.name}
 
 
 @router.patch("/cities/{city_id}")
@@ -295,14 +328,40 @@ async def admin_city_update(
     city = res.scalar_one_or_none()
     if not city:
         raise HTTPException(404, "City not found")
-    for k in ("name", "primary_icao", "reference_icao", "polymarket_slug", "active"):
+    str_fields = (
+        "name", "primary_icao", "reference_icao", "polymarket_slug",
+        "wunderground_url", "timezone", "buoy_id",
+    )
+    for k in str_fields:
         if k in payload:
-            setattr(city, k, payload[k])
+            val = payload[k]
+            if k in ("primary_icao", "reference_icao") and val:
+                val = str(val).strip().upper()
+            setattr(city, k, val)
+    if "active" in payload:
+        city.active = bool(payload["active"])
     for k in ("nws_lat", "nws_lon"):
         if k in payload and payload[k] is not None:
             setattr(city, k, float(payload[k]))
     await db.commit()
     return {"ok": True}
+
+
+@router.delete("/cities/{city_id}", status_code=204)
+async def admin_city_delete(
+    city_id: int,
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(City).where(City.id == city_id))
+    city = res.scalar_one_or_none()
+    if not city:
+        raise HTTPException(404, "City not found")
+    city_name = city.name
+    await db.delete(city)
+    await db.commit()
+    logger.info(f"Admin deleted city #{city_id} {city_name}")
+    return Response(status_code=204)
 
 
 @router.get("/settings")

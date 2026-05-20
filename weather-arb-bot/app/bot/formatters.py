@@ -6,7 +6,6 @@ from app.utils.units import (
     f_to_c,
     fmt_temp_dual,
     fmt_bucket_range_f,
-    fmt_bucket_range_c,
 )
 
 
@@ -24,6 +23,137 @@ def _agreement_label(spread_f: float) -> str:
     if spread_f <= 6:
         return "⚠️ moderate spread"
     return "\U0001f6a8 HIGH spread (models disagree)"
+
+
+def _lead_label(days_ahead: Optional[int]) -> str:
+    if days_ahead is None:
+        return "unknown lead"
+    if days_ahead == 0:
+        return "same-day"
+    if days_ahead == 1:
+        return "1-day lead"
+    return f"{days_ahead}-day lead"
+
+
+def _bottom_line(
+    blend: dict, bucket_min, bucket_max, side: str, is_c: bool
+) -> Optional[str]:
+    """One- or two-sentence verbal verdict pulling from the breakdown."""
+    det = blend.get("deterministic") or []
+    ens = blend.get("ensemble")
+    if not det and not ens:
+        return None
+
+    parts: list[str] = []
+
+    if det:
+        vals = [d["value_f"] for d in det]
+        n = len(vals)
+        avg = sum(vals) / n
+        lo = min(vals)
+        hi = max(vals)
+        spread = hi - lo
+        if spread <= 3:
+            parts.append(
+                f"All {n} forecasts cluster around {fmt_temp_dual(avg, is_c)} "
+                f"(±{round(spread)}°F)."
+            )
+        elif spread <= 6:
+            parts.append(
+                f"Forecasts span {fmt_temp_dual(lo, is_c)}–"
+                f"{fmt_temp_dual(hi, is_c)} (moderate spread, Δ{round(spread)}°F)."
+            )
+        else:
+            parts.append(
+                f"Forecasts span {fmt_temp_dual(lo, is_c)}–"
+                f"{fmt_temp_dual(hi, is_c)} (large Δ{round(spread)}°F disagreement)."
+            )
+
+        if bucket_min is not None and bucket_max is not None:
+            bucket_mid = (bucket_min + bucket_max) / 2
+            if avg > bucket_max + 2:
+                parts.append(
+                    f"That's well above the {bucket_min}–{bucket_max}°F bucket."
+                )
+            elif avg < bucket_min - 2:
+                parts.append(
+                    f"That's well below the {bucket_min}–{bucket_max}°F bucket."
+                )
+            elif avg > bucket_max:
+                parts.append(
+                    f"That sits just above the {bucket_min}–{bucket_max}°F bucket."
+                )
+            elif avg < bucket_min:
+                parts.append(
+                    f"That sits just below the {bucket_min}–{bucket_max}°F bucket."
+                )
+            else:
+                parts.append(
+                    f"That sits inside the {bucket_min}–{bucket_max}°F bucket."
+                )
+
+    if ens:
+        hits = ens["hits"]
+        n_ens = ens["n"]
+        if hits == 0:
+            parts.append(
+                f"The ensemble fully agrees: all {n_ens} perturbed runs land outside."
+            )
+        elif hits == n_ens:
+            parts.append(
+                f"The ensemble fully agrees: all {n_ens} perturbed runs land inside."
+            )
+        elif hits / n_ens > 0.7:
+            parts.append(
+                f"Ensemble leans the same way ({hits}/{n_ens} inside the bucket)."
+            )
+        else:
+            parts.append(
+                f"Ensemble is mixed ({hits}/{n_ens} inside the bucket)."
+            )
+
+    parts.append(f"→ *{side}*.")
+    return " ".join(parts)
+
+
+def _ensemble_verdict(
+    ens: dict, bucket_min, bucket_max, is_c: bool, fc_kind_lower: str
+) -> str:
+    hits = ens["hits"]
+    n = ens["n"]
+    med = ens.get("median_f")
+    if hits == 0:
+        base = (
+            f"Verdict: zero of {n} runs land inside — the actual {fc_kind_lower} "
+            f"will almost certainly fall outside the bucket."
+        )
+    elif hits == n:
+        base = (
+            f"Verdict: all {n} runs land inside — the actual {fc_kind_lower} "
+            f"is almost certain to fall inside the bucket."
+        )
+    elif hits / n > 0.7:
+        base = (
+            f"Verdict: most runs ({hits}/{n}) agree on falling inside the bucket."
+        )
+    elif hits / n < 0.3:
+        base = (
+            f"Verdict: most runs ({n - hits}/{n}) agree on falling outside the bucket."
+        )
+    else:
+        base = (
+            f"Verdict: mixed signal ({hits}/{n} inside) — high uncertainty."
+        )
+    if med is not None and bucket_min is not None and bucket_max is not None:
+        if med > bucket_max:
+            base += (
+                f" Median run is {round(med - bucket_max)}°F above the bucket top."
+            )
+        elif med < bucket_min:
+            base += (
+                f" Median run is {round(bucket_min - med)}°F below the bucket bottom."
+            )
+    return base
 
 
 def fmt_opportunity(
@@ -46,9 +176,15 @@ def fmt_opportunity(
     is_c = is_celsius_bucket(bucket_label)
     is_low_market = signals.get("is_low_market", False)
     fc_kind = "daily LOW" if is_low_market else "daily HIGH"
+    fc_kind_lower = fc_kind.lower()
 
     bucket_min = signals.get("_bucket_min")
     bucket_max = signals.get("_bucket_max")
+
+    blend = signals.get("_blend") or {}
+    days_ahead = blend.get("days_ahead")
+    sigma_used = blend.get("sigma_used")
+    obs_skipped = blend.get("observation_skipped", False)
 
     side_prob_pct = round((1 - true_prob if is_no else true_prob) * 100)
     edge_pct = round(edge * 100)
@@ -78,7 +214,7 @@ def fmt_opportunity(
     elif (not is_c) and f_range and f_range.replace("–", "-") not in bucket_label.replace("–", "-"):
         bucket_display = f"{bucket_label} ({f_range})"
 
-    # ── Realistic pricing line ───────────────────────────────────────────────
+    # ── Pricing line ──────────────────────────────────────────────────────
     book = signals.get("_book") or {}
     entry_cost = signals.get("_entry_cost")
     if entry_cost is not None and book.get("bid") is not None:
@@ -98,8 +234,21 @@ def fmt_opportunity(
         side_price_cents = round((1 - market_price if is_no else market_price) * 100)
         price_line = f"\U0001f4b0 Market {side} price: {side_price_cents}¢"
 
+    # ── Bottom-line verbal verdict ──────────────────────────────────────────
+    bottom_line = _bottom_line(blend, bucket_min, bucket_max, side, is_c)
+    bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
+
     # ── Per-source forecast breakdown ────────────────────────────────────────
-    blend = signals.get("_blend") or {}
+    sigma_hint = (
+        f" · σ=±{sigma_used:.1f}°F ({_lead_label(days_ahead)})"
+        if sigma_used is not None else ""
+    )
+    breakdown_intro = (
+        f"_Each row: model's point forecast → probability the actual "
+        f"{fc_kind_lower} lands in the bucket. Narrow buckets give small "
+        f"P(in bucket) even when the forecast is centred on them._"
+    )
+
     det_rows = blend.get("deterministic") or []
     forecast_vals_f: list[float] = []
     breakdown_lines: list[str] = []
@@ -127,7 +276,6 @@ def fmt_opportunity(
     if not breakdown_lines:
         breakdown_lines = ["• No forecast data available"]
 
-    # ── Source spread ───────────────────────────────────────────────────────
     spread_line = ""
     if len(forecast_vals_f) >= 2:
         lo_f = min(forecast_vals_f)
@@ -139,11 +287,11 @@ def fmt_opportunity(
             f"(Δ{round(spread_f)}°F) — {_agreement_label(spread_f)}"
         )
 
-    breakdown_text = "\n".join(breakdown_lines)
+    breakdown_text = breakdown_intro + "\n" + "\n".join(breakdown_lines)
     if spread_line:
         breakdown_text += "\n" + spread_line
 
-    # ── Ensemble section ──────────────────────────────────────────────────────
+    # ── Ensemble section ────────────────────────────────────────────────────
     ens = blend.get("ensemble")
     ens_section = ""
     if ens:
@@ -153,16 +301,24 @@ def fmt_opportunity(
         smoothed_pct = ens["smoothed_pct"]
         side_smoothed = (100 - smoothed_pct) if is_no else smoothed_pct
         med_str = fmt_temp_dual(med_f, is_c) if med_f is not None else "—"
+        ens_intro = (
+            f"_The ensemble runs GFS {n} times with slightly perturbed "
+            f"initial conditions to estimate forecast uncertainty. Each "
+            f"'member' is a complete forecast for the target date._"
+        )
+        verdict = _ensemble_verdict(ens, bucket_min, bucket_max, is_c, fc_kind_lower)
         ens_section = (
             f"\n\n\U0001f3b2 *GFS Ensemble ({n} members)*\n"
-            f"• {hits}/{n} members forecast a {fc_kind.lower()} inside the bucket\n"
-            f"• Median {fc_kind.lower()}: {med_str}\n"
+            f"{ens_intro}\n"
+            f"• {hits}/{n} members forecast a {fc_kind_lower} inside the bucket\n"
+            f"• Median {fc_kind_lower}: {med_str}\n"
             f"• Laplace-smoothed P(in bucket) = ({hits}+0.5)/({n}+1) = "
             f"{round(smoothed_pct, 1)}%\n"
-            f"• ⇒ P({side}) ≈ {round(side_smoothed, 1)}%"
+            f"• ⇒ P({side}) ≈ {round(side_smoothed, 1)}%\n"
+            f"_{verdict}_"
         )
 
-    # ── Math walkthrough ──────────────────────────────────────────────────────
+    # ── Math walkthrough ────────────────────────────────────────────────────
     det_avg = blend.get("det_avg")
     ens_p = blend.get("ens_p")
     wg_p = blend.get("wg_p")
@@ -175,7 +331,14 @@ def fmt_opportunity(
             return None
         return 1 - p if is_no else p
 
+    math_intro = (
+        f"_Forecast σ = ±{sigma_used:.1f}°F for a {_lead_label(days_ahead)}; "
+        f"this controls how confident a single point forecast can be._"
+        if sigma_used is not None else ""
+    )
     math_lines = ["⚗️ *How we got to this estimate*"]
+    if math_intro:
+        math_lines.append(math_intro)
     if det_avg is not None:
         math_lines.append(
             f"• Deterministic average P({side}) = "
@@ -195,12 +358,25 @@ def fmt_opportunity(
         math_lines.append(
             f"• Pre-adjustment P({side}) = {round(_to_side(blend_pre) * 100, 1)}%"
         )
-    for adj in adjustments:
-        delta_side = -adj["delta"] if is_no else adj["delta"]
-        sign = "+" if delta_side >= 0 else "−"
+
+    if obs_skipped:
         math_lines.append(
-            f"• {adj['name']}: {sign}{round(abs(delta_side) * 100, 1)}pp"
+            "• _Observation-based adjustments (METAR trend, ref wind, PIREP) "
+            f"skipped — this market is {_lead_label(days_ahead)}, so today's "
+            "surface obs don't predict the target date._"
         )
+    else:
+        for adj in adjustments:
+            delta_side = -adj["delta"] if is_no else adj["delta"]
+            sign = "+" if delta_side >= 0 else "−"
+            math_lines.append(
+                f"• {adj['name']}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"_(based on today's METAR/PIREP — same-day only)_"
+            )
+        if not adjustments:
+            math_lines.append(
+                "• _No observation-based adjustments triggered._"
+            )
     if final_p is not None:
         math_lines.append(
             f"• *Final P({side}) = {round(_to_side(final_p) * 100, 1)}%* "
@@ -209,37 +385,47 @@ def fmt_opportunity(
     math_section = "\n".join(math_lines)
 
     # ── Atmospheric signals ──────────────────────────────────────────────────
-    atm_lines: list[str] = []
-    ref = signals.get("reference_metar") or {}
-    if ref.get("wind_direction") is not None and ref.get("wind_speed_kt") is not None:
-        atm_lines.append(
-            f"• Ref station wind {ref['wind_direction']:03d}°/"
-            f"{ref['wind_speed_kt']}kt"
+    atm_section = ""
+    if obs_skipped:
+        atm_section = (
+            f"\n\n\U0001f321️ *Atmospheric signals* (today's obs)\n"
+            f"_Skipped for this market — {_lead_label(days_ahead)}. "
+            "Today's wind/dew don't tell us about the daily high "
+            f"on {date_str}._"
         )
-    trend = signals.get("metar_trend") or {}
-    primary = signals.get("primary_metar") or {}
-    if trend.get("dew_rate_per_hour") and abs(trend["dew_rate_per_hour"]) > 0.3:
-        direction = "rising" if trend["dew_rate_per_hour"] > 0 else "falling"
-        dp = primary.get("dew_point_f")
-        atm_lines.append(
-            f"• Dew point {direction} ({fmt_temp_dual(dp, is_c)})"
-        )
-    pireps = signals.get("pireps") or []
-    low_pireps = [
-        p for p in pireps
-        if (p.get("flight_level_ft") or 99999) <= 5000
-        and p.get("temperature_c") is not None
-    ]
-    if low_pireps:
-        avg_c = sum(p["temperature_c"] for p in low_pireps) / len(low_pireps)
-        avg_f = avg_c * 9 / 5 + 32
-        atm_lines.append(
-            f"• PIREP: {fmt_temp_dual(avg_f, is_c)} avg at low altitude"
-        )
-    atm_section = (
-        "\n\n\U0001f321️ *Atmospheric signals*\n" + "\n".join(atm_lines)
-        if atm_lines else ""
-    )
+    else:
+        atm_lines: list[str] = []
+        ref = signals.get("reference_metar") or {}
+        if ref.get("wind_direction") is not None and ref.get("wind_speed_kt") is not None:
+            atm_lines.append(
+                f"• Ref station wind {ref['wind_direction']:03d}°/"
+                f"{ref['wind_speed_kt']}kt"
+            )
+        trend = signals.get("metar_trend") or {}
+        primary = signals.get("primary_metar") or {}
+        if trend.get("dew_rate_per_hour") and abs(trend["dew_rate_per_hour"]) > 0.3:
+            direction = "rising" if trend["dew_rate_per_hour"] > 0 else "falling"
+            dp = primary.get("dew_point_f")
+            atm_lines.append(
+                f"• Dew point {direction} ({fmt_temp_dual(dp, is_c)})"
+            )
+        pireps = signals.get("pireps") or []
+        low_pireps = [
+            p for p in pireps
+            if (p.get("flight_level_ft") or 99999) <= 5000
+            and p.get("temperature_c") is not None
+        ]
+        if low_pireps:
+            avg_c = sum(p["temperature_c"] for p in low_pireps) / len(low_pireps)
+            avg_f = avg_c * 9 / 5 + 32
+            atm_lines.append(
+                f"• PIREP: {fmt_temp_dual(avg_f, is_c)} avg at low altitude"
+            )
+        if atm_lines:
+            atm_section = (
+                "\n\n\U0001f321️ *Atmospheric signals* (today's obs — used because "
+                "market resolves today)\n" + "\n".join(atm_lines)
+            )
 
     # ── Footer ───────────────────────────────────────────────────────────────
     hours_left = ""
@@ -263,8 +449,9 @@ def fmt_opportunity(
         f"\U0001f3e2 Bucket: {bucket_display} (*{side}*)\n\n"
         f"{price_line}\n"
         f"\U0001f9e0 Our P({side}) estimate: {side_prob_pct}%\n"
-        f"\U0001f4c8 Edge vs ask: +{edge_pct}pp\n\n"
-        f"\U0001f4d0 *Forecast breakdown* (forecasts for {fc_kind})\n"
+        f"\U0001f4c8 Edge vs ask: +{edge_pct}pp"
+        f"{bottom_line_section}\n\n"
+        f"\U0001f4d0 *Forecast breakdown* ({fc_kind}{sigma_hint})\n"
         f"{breakdown_text}"
         f"{ens_section}\n\n"
         f"{math_section}"
