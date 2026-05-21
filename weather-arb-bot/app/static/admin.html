@@ -32,6 +32,7 @@
   button.btn { cursor:pointer; }
   button.btn:hover { background: var(--border); }
   button.btn.primary { background: var(--accent); border-color: var(--accent); color:white; }
+  button.btn.danger { background: var(--loss); border-color: var(--loss); color:white; }
   button.btn:disabled { opacity: 0.5; cursor: default; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .toolbar { display:flex; gap:10px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
@@ -49,6 +50,10 @@
   a:hover { text-decoration: underline; }
   .small { font-size:12px; color: var(--mute); }
   .hidden { display: none !important; }
+  .panel { background: var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px; margin-bottom:12px; }
+  .panel h4 { margin: 0 0 10px 0; font-size:14px; }
+  .form-grid { display:grid; gap:8px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .form-grid label { display:flex; flex-direction:column; font-size:11px; color: var(--mute); gap:4px; }
 </style>
 </head>
 <body>
@@ -103,10 +108,30 @@
     <section id="tab-cities" class="hidden">
       <div class="toolbar">
         <button class="btn" onclick="loadCities()">Refresh</button>
+        <button class="btn primary" onclick="toggleAddCity()" id="addCityToggle">+ Add City</button>
         <button class="btn primary" onclick="runDiscovery(this)">Run Discovery</button>
         <span id="discoveryStatus" class="small"></span>
       </div>
-      <p class="small">Edit lat/lon, ICAO codes, or Polymarket slug, then click Save. Coordinates are used for all weather model queries.</p>
+      <p class="small">Edit any field, then click Save. Coordinates are used for all weather model queries (GFS, ECMWF, NWS, HRRR, Tomorrow.io, Meteosource). For airports, use city-centre coords rather than the airport itself if the market resolves on a city-wide reading.</p>
+      <div id="addCityPanel" class="panel hidden">
+        <h4>Add new city</h4>
+        <div class="form-grid">
+          <label>Name<input id="nc-name" placeholder="e.g. Boston" /></label>
+          <label>Primary ICAO<input id="nc-picao" placeholder="KBOS" /></label>
+          <label>Reference ICAO<input id="nc-ricao" placeholder="(optional)" /></label>
+          <label>Polymarket slug<input id="nc-slug" placeholder="boston" /></label>
+          <label>Lat<input id="nc-lat" type="number" step="0.0001" placeholder="42.36" /></label>
+          <label>Lon<input id="nc-lon" type="number" step="0.0001" placeholder="-71.06" /></label>
+          <label>Timezone<input id="nc-tz" value="America/New_York" /></label>
+          <label>Buoy ID<input id="nc-buoy" placeholder="(optional)" /></label>
+          <label>Wunderground URL<input id="nc-wu" placeholder="(optional)" /></label>
+        </div>
+        <p style="margin-top:10px;">
+          <button class="btn primary" onclick="createCity()">Create</button>
+          <button class="btn" onclick="toggleAddCity()">Cancel</button>
+          <span id="createCityStatus" class="small"></span>
+        </p>
+      </div>
       <table>
         <thead><tr>
           <th>Name</th>
@@ -244,14 +269,17 @@ async function loadCities() {
   const rows = await r.json();
   document.getElementById('citiesBody').innerHTML = rows.map(c => `
     <tr>
-      <td>${c.name}</td>
+      <td><input style="width:140px;" value="${escapeHtml(c.name || '')}" id="city-name-${c.id}"/></td>
       <td><input style="width:68px;" value="${escapeHtml(c.primary_icao || '')}" id="city-picao-${c.id}"/></td>
       <td><input style="width:68px;" value="${escapeHtml(c.reference_icao || '')}" id="city-ricao-${c.id}"/></td>
       <td><input style="width:130px;" value="${escapeHtml(c.polymarket_slug || '')}" id="city-slug-${c.id}"/></td>
       <td><input style="width:82px;" type="number" step="0.0001" value="${c.nws_lat != null ? c.nws_lat.toFixed(4) : ''}" id="city-lat-${c.id}"/></td>
       <td><input style="width:88px;" type="number" step="0.0001" value="${c.nws_lon != null ? c.nws_lon.toFixed(4) : ''}" id="city-lon-${c.id}"/></td>
       <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
-      <td><button class="btn primary" onclick="saveCity(${c.id})">Save</button></td>
+      <td>
+        <button class="btn primary" onclick="saveCity(${c.id})">Save</button>
+        <button class="btn danger" onclick="deleteCity(${c.id}, ${JSON.stringify(c.name || '').replace(/'/g,"\\'")})">Delete</button>
+      </td>
     </tr>
   `).join('');
 }
@@ -260,6 +288,7 @@ async function saveCity(id) {
   const latVal = document.getElementById('city-lat-'+id).value;
   const lonVal = document.getElementById('city-lon-'+id).value;
   const payload = {
+    name: document.getElementById('city-name-'+id).value.trim() || null,
     primary_icao: document.getElementById('city-picao-'+id).value.trim().toUpperCase() || null,
     reference_icao: document.getElementById('city-ricao-'+id).value.trim().toUpperCase() || null,
     polymarket_slug: document.getElementById('city-slug-'+id).value.trim() || null,
@@ -269,6 +298,61 @@ async function saveCity(id) {
   };
   const r = await api('/cities/'+id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { loadCities(); } else { alert('Save failed'); }
+}
+
+async function deleteCity(id, name) {
+  if (!confirm(`Delete "${name}"? This removes the city from active monitoring. Existing markets/opportunities stay in the DB but won't get new data.`)) return;
+  const r = await api('/cities/'+id, { method:'DELETE' });
+  if (r.ok || r.status === 204) {
+    loadCities();
+  } else {
+    const j = await r.json().catch(() => ({}));
+    alert('Delete failed: ' + (j.detail || r.status));
+  }
+}
+
+function toggleAddCity() {
+  const panel = document.getElementById('addCityPanel');
+  panel.classList.toggle('hidden');
+  document.getElementById('createCityStatus').textContent = '';
+}
+
+async function createCity() {
+  const status = document.getElementById('createCityStatus');
+  status.textContent = '';
+  const name = document.getElementById('nc-name').value.trim();
+  const primary = document.getElementById('nc-picao').value.trim().toUpperCase();
+  if (!name || !primary) {
+    status.textContent = 'Name and Primary ICAO are required';
+    return;
+  }
+  const latVal = document.getElementById('nc-lat').value;
+  const lonVal = document.getElementById('nc-lon').value;
+  const refIcao = document.getElementById('nc-ricao').value.trim().toUpperCase();
+  const payload = {
+    name,
+    primary_icao: primary,
+    reference_icao: refIcao || null,
+    polymarket_slug: document.getElementById('nc-slug').value.trim() || null,
+    nws_lat: latVal !== '' ? parseFloat(latVal) : null,
+    nws_lon: lonVal !== '' ? parseFloat(lonVal) : null,
+    timezone: document.getElementById('nc-tz').value.trim() || 'America/Los_Angeles',
+    buoy_id: document.getElementById('nc-buoy').value.trim() || null,
+    wunderground_url: document.getElementById('nc-wu').value.trim() || null,
+    active: true,
+  };
+  const r = await api('/cities', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  if (r.ok) {
+    const j = await r.json();
+    status.textContent = `Created city #${j.id} — ${j.name}.`;
+    ['nc-name','nc-picao','nc-ricao','nc-slug','nc-lat','nc-lon','nc-buoy','nc-wu'].forEach(id => {
+      document.getElementById(id).value = '';
+    });
+    loadCities();
+  } else {
+    const j = await r.json().catch(() => ({}));
+    status.textContent = 'Create failed: ' + (j.detail || r.status);
+  }
 }
 
 async function runDiscovery(btn) {
