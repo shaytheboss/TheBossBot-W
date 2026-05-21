@@ -70,7 +70,6 @@ def _bottom_line(
             )
 
         if bucket_min is not None and bucket_max is not None:
-            bucket_mid = (bucket_min + bucket_max) / 2
             if avg > bucket_max + 2:
                 parts.append(
                     f"That's well above the {bucket_min}–{bucket_max}°F bucket."
@@ -111,6 +110,13 @@ def _bottom_line(
             parts.append(
                 f"Ensemble is mixed ({hits}/{n_ens} inside the bucket)."
             )
+
+    br = blend.get("boundary_risk")
+    if br and br.get("min_distance_to_edge_f") is not None:
+        parts.append(
+            f"⚠️ Forecast sits only {br['min_distance_to_edge_f']:.1f}°F from a "
+            f"bucket edge — resolution-risk premium applied."
+        )
 
     parts.append(f"→ *{side}*.")
     return " ".join(parts)
@@ -325,6 +331,7 @@ def fmt_opportunity(
     blend_pre = blend.get("blend_before_adjustments")
     final_p = blend.get("final")
     adjustments = blend.get("adjustments") or []
+    boundary_risk = blend.get("boundary_risk")
 
     def _to_side(p: Optional[float]) -> Optional[float]:
         if p is None:
@@ -365,18 +372,35 @@ def fmt_opportunity(
             f"skipped — this market is {_lead_label(days_ahead)}, so today's "
             "surface obs don't predict the target date._"
         )
-    else:
-        for adj in adjustments:
-            delta_side = -adj["delta"] if is_no else adj["delta"]
-            sign = "+" if delta_side >= 0 else "−"
+    for adj in adjustments:
+        name = adj["name"]
+        delta_side = -adj["delta"] if is_no else adj["delta"]
+        sign = "+" if delta_side >= 0 else "−"
+        if name == "Boundary proximity" and boundary_risk:
+            dist = boundary_risk.get("min_distance_to_edge_f")
+            fc_avg = boundary_risk.get("forecast_avg_f")
+            extra = ""
+            if dist is not None and fc_avg is not None:
+                extra = (
+                    f" _(forecast {fc_avg:.1f}°F is {dist:.1f}°F from a "
+                    "bucket edge — pulls P toward 50% to price resolution risk)_"
+                )
             math_lines.append(
-                f"• {adj['name']}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp{extra}"
+            )
+        elif name == "Boundary proximity":
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp"
+            )
+        else:
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
                 f"_(based on today's METAR/PIREP — same-day only)_"
             )
-        if not adjustments:
-            math_lines.append(
-                "• _No observation-based adjustments triggered._"
-            )
+    if not adjustments and not obs_skipped:
+        math_lines.append(
+            "• _No observation-based or boundary adjustments triggered._"
+        )
     if final_p is not None:
         math_lines.append(
             f"• *Final P({side}) = {round(_to_side(final_p) * 100, 1)}%* "

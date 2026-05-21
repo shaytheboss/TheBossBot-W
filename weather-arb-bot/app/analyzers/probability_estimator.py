@@ -16,6 +16,14 @@ _DET_SOURCES = (
     ("meteosource_forecast", "Meteosource"),
 )
 
+# Empirical: in the May 20, 2026 retrospective, 5 of 5 losing bets had
+# the actual high land within 1.0°F of a bucket edge — i.e. the bot was
+# over-confident on NO bets adjacent to the eventual outcome. This window
+# (1.5°F) plus the 25% blend toward 50% would have pushed all five back
+# under the alert threshold.
+BOUNDARY_WINDOW_F = 1.5
+BOUNDARY_MAX_BLEND = 0.25
+
 
 def forecast_sigma_for_lead(days_ahead: Optional[int]) -> float:
     """1-sigma forecast uncertainty (°F) for daily max/min by lead time.
@@ -27,14 +35,32 @@ def forecast_sigma_for_lead(days_ahead: Optional[int]) -> float:
     - day 3: ~3.0°F  (matches the prior hard-coded value)
     - day 4: ~3.5°F
     - day 5+: 4.0–4.5°F (capped)
-
-    Old code used a flat 3.0°F for every lead time, which made narrow
-    same-day buckets (e.g. 72–73°F) look way less likely than they
-    actually are when a forecast lands right on top of them.
     """
     if days_ahead is None or days_ahead < 0:
         return 3.0
     return min(4.5, 1.5 + 0.5 * days_ahead)
+
+
+def boundary_uncertainty_blend(
+    forecast_avg: Optional[float],
+    bucket_min: Optional[int],
+    bucket_max: Optional[int],
+) -> float:
+    """Blend weight toward 50% when forecast lies near a bucket edge.
+
+    Returns 0.0 when forecast is ≥ BOUNDARY_WINDOW_F away from every edge,
+    BOUNDARY_MAX_BLEND when forecast sits exactly on an edge, and linearly
+    interpolates in between.
+    """
+    if forecast_avg is None:
+        return 0.0
+    edges = [e for e in (bucket_min, bucket_max) if e is not None]
+    if not edges:
+        return 0.0
+    nearest = min(abs(forecast_avg - e) for e in edges)
+    if nearest >= BOUNDARY_WINDOW_F:
+        return 0.0
+    return (BOUNDARY_WINDOW_F - nearest) / BOUNDARY_WINDOW_F * BOUNDARY_MAX_BLEND
 
 
 def _bucket_contains(value: float, bucket_min: Optional[int], bucket_max: Optional[int]) -> bool:
@@ -122,12 +148,14 @@ def estimate_with_breakdown(
         "ens_p": None,
         "wg_p": None,
         "blend_before_adjustments": None,
+        "boundary_risk": None,
         "adjustments": [],
         "final": None,
     }
 
     # ── 1. Deterministic sources ───────────────────────────────────────────
     det_probs = []
+    det_vals: list[float] = []
     for key, label in _DET_SOURCES:
         val = (signals.get(key) or {}).get(fc_key)
         if val is None:
@@ -136,6 +164,7 @@ def estimate_with_breakdown(
         if p is None:
             continue
         det_probs.append(p)
+        det_vals.append(float(val))
         breakdown["deterministic"].append({
             "source": label,
             "value_f": float(val),
@@ -185,11 +214,33 @@ def estimate_with_breakdown(
         p = 0.90 * p + 0.10 * wg_p
     breakdown["blend_before_adjustments"] = float(p)
 
+    # ── Boundary-proximity uncertainty premium ──────────────────────────
+    # When the forecast average sits within 1.5°F of a bucket edge, blend
+    # the probability toward 50%. Fixes the May 20 boundary-loss pattern
+    # where NO bets adjacent to the eventual outcome were over-confident.
+    fc_for_boundary: Optional[float] = None
+    if det_vals:
+        fc_for_boundary = sum(det_vals) / len(det_vals)
+    elif wg_val is not None:
+        fc_for_boundary = float(wg_val)
+    if fc_for_boundary is not None:
+        blend_w = boundary_uncertainty_blend(fc_for_boundary, bucket_min, bucket_max)
+        if blend_w > 0:
+            p_before = p
+            p = (1.0 - blend_w) * p + blend_w * 0.5
+            edges = [e for e in (bucket_min, bucket_max) if e is not None]
+            nearest = min(abs(fc_for_boundary - e) for e in edges) if edges else None
+            breakdown["boundary_risk"] = {
+                "forecast_avg_f": float(fc_for_boundary),
+                "min_distance_to_edge_f": float(nearest) if nearest is not None else None,
+                "blend_weight": float(blend_w),
+            }
+            breakdown["adjustments"].append({
+                "name": "Boundary proximity",
+                "delta": float(p - p_before),
+            })
+
     # ── Observation-based adjustments — SAME DAY ONLY ───────────────────────────
-    # METAR trend, reference station wind, and PIREP are all based on
-    # CURRENT observations. They only inform the daily high if the market
-    # resolves today. Multi-day markets must rely solely on the forecast
-    # blend — today's 5kt south wind tells us nothing about Wednesday.
     if not observation_skipped:
         p_before = p
         trend = signals.get("metar_trend") or {}
