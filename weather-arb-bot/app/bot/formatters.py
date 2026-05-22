@@ -28,6 +28,8 @@ def _agreement_label(spread_f: float) -> str:
 def _lead_label(days_ahead: Optional[int]) -> str:
     if days_ahead is None:
         return "unknown lead"
+    if days_ahead < 0:
+        return "past market"
     if days_ahead == 0:
         return "same-day"
     if days_ahead == 1:
@@ -50,9 +52,9 @@ def _bottom_line(
         vals = [d["value_f"] for d in det]
         n = len(vals)
         avg = sum(vals) / n
-        lo = min(vals)
-        hi = max(vals)
-        spread = hi - lo
+        lo_f = min(vals)
+        hi_f = max(vals)
+        spread = hi_f - lo_f
         if spread <= 3:
             parts.append(
                 f"All {n} forecasts cluster around {fmt_temp_dual(avg, is_c)} "
@@ -60,36 +62,64 @@ def _bottom_line(
             )
         elif spread <= 6:
             parts.append(
-                f"Forecasts span {fmt_temp_dual(lo, is_c)}–"
-                f"{fmt_temp_dual(hi, is_c)} (moderate spread, Δ{round(spread)}°F)."
+                f"Forecasts span {fmt_temp_dual(lo_f, is_c)}–"
+                f"{fmt_temp_dual(hi_f, is_c)} (moderate spread, Δ{round(spread)}°F)."
             )
         else:
             parts.append(
-                f"Forecasts span {fmt_temp_dual(lo, is_c)}–"
-                f"{fmt_temp_dual(hi, is_c)} (large Δ{round(spread)}°F disagreement)."
+                f"Forecasts span {fmt_temp_dual(lo_f, is_c)}–"
+                f"{fmt_temp_dual(hi_f, is_c)} (large Δ{round(spread)}°F disagreement)."
             )
 
         if bucket_min is not None and bucket_max is not None:
-            if avg > bucket_max + 2:
+            # Use min/max of sources (not avg) so we don't say "well above"
+            # when the lowest source is right at the bucket top.
+            if lo_f > bucket_max + 2:
                 parts.append(
                     f"That's well above the {bucket_min}–{bucket_max}°F bucket."
                 )
-            elif avg < bucket_min - 2:
+            elif lo_f >= bucket_max:
                 parts.append(
-                    f"That's well below the {bucket_min}–{bucket_max}°F bucket."
+                    f"Forecasts mostly above the {bucket_min}–{bucket_max}°F bucket "
+                    f"(lowest source {round(lo_f)}°F is at or above the top)."
                 )
             elif avg > bucket_max:
                 parts.append(
-                    f"That sits just above the {bucket_min}–{bucket_max}°F bucket."
+                    f"Average above the {bucket_min}–{bucket_max}°F bucket, "
+                    f"but source range starts at {round(lo_f)}°F (inside the bucket)."
+                )
+            elif hi_f < bucket_min - 2:
+                parts.append(
+                    f"That's well below the {bucket_min}–{bucket_max}°F bucket."
+                )
+            elif hi_f <= bucket_min:
+                parts.append(
+                    f"Forecasts mostly below the {bucket_min}–{bucket_max}°F bucket "
+                    f"(highest source {round(hi_f)}°F is at or below the bottom)."
                 )
             elif avg < bucket_min:
                 parts.append(
-                    f"That sits just below the {bucket_min}–{bucket_max}°F bucket."
+                    f"Average below the {bucket_min}–{bucket_max}°F bucket, "
+                    f"but source range ends at {round(hi_f)}°F (inside the bucket)."
                 )
             else:
                 parts.append(
                     f"That sits inside the {bucket_min}–{bucket_max}°F bucket."
                 )
+        elif bucket_min is not None and bucket_max is None:
+            if avg >= bucket_min + 2:
+                parts.append(f"That's well above the ≥{bucket_min}°F threshold.")
+            elif avg >= bucket_min:
+                parts.append(f"That sits just above the ≥{bucket_min}°F threshold.")
+            else:
+                parts.append(f"That sits below the ≥{bucket_min}°F threshold.")
+        elif bucket_min is None and bucket_max is not None:
+            if avg <= bucket_max - 2:
+                parts.append(f"That's well below the ≤{bucket_max}°F threshold.")
+            elif avg <= bucket_max:
+                parts.append(f"That sits just below the ≤{bucket_max}°F threshold.")
+            else:
+                parts.append(f"That sits above the ≤{bucket_max}°F threshold.")
 
     if ens:
         hits = ens["hits"]
@@ -204,7 +234,7 @@ def fmt_opportunity(
     else:
         date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
 
-    # ── Header / location ─────────────────────────────────────────────────
+    # ── Header / location ─────────────────────────────────────────────────────
     lat = signals.get("city_lat")
     lon = signals.get("city_lon")
     coord_str = _coord_str(lat, lon)
@@ -212,7 +242,7 @@ def fmt_opportunity(
     coord_part = f" | {coord_str}" if coord_str else ""
     loc_line = f"\U0001f4cd {city_name}{station_part}{coord_part} | {date_str}"
 
-    # ── Bucket display (dual unit when Celsius market) ──────────────────────────
+    # ── Bucket display (dual unit when Celsius market) ──────────────────────────────
     bucket_display = bucket_label
     f_range = fmt_bucket_range_f(bucket_min, bucket_max)
     if is_c and f_range:
@@ -220,7 +250,7 @@ def fmt_opportunity(
     elif (not is_c) and f_range and f_range.replace("–", "-") not in bucket_label.replace("–", "-"):
         bucket_display = f"{bucket_label} ({f_range})"
 
-    # ── Pricing line ──────────────────────────────────────────────────────
+    # ── Pricing line ────────────────────────────────────────────────────────────
     book = signals.get("_book") or {}
     entry_cost = signals.get("_entry_cost")
     if entry_cost is not None and book.get("bid") is not None:
@@ -240,11 +270,11 @@ def fmt_opportunity(
         side_price_cents = round((1 - market_price if is_no else market_price) * 100)
         price_line = f"\U0001f4b0 Market {side} price: {side_price_cents}¢"
 
-    # ── Bottom-line verbal verdict ──────────────────────────────────────────
+    # ── Bottom-line verbal verdict ──────────────────────────────────────────────
     bottom_line = _bottom_line(blend, bucket_min, bucket_max, side, is_c)
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
 
-    # ── Per-source forecast breakdown ────────────────────────────────────────
+    # ── Per-source forecast breakdown ────────────────────────────────────────────
     sigma_hint = (
         f" · σ=±{sigma_used:.1f}°F ({_lead_label(days_ahead)})"
         if sigma_used is not None else ""
@@ -297,7 +327,7 @@ def fmt_opportunity(
     if spread_line:
         breakdown_text += "\n" + spread_line
 
-    # ── Ensemble section ────────────────────────────────────────────────────
+    # ── Ensemble section ──────────────────────────────────────────────────
     ens = blend.get("ensemble")
     ens_section = ""
     if ens:
@@ -324,7 +354,7 @@ def fmt_opportunity(
             f"_{verdict}_"
         )
 
-    # ── Math walkthrough ────────────────────────────────────────────────────
+    # ── Math walkthrough ────────────────────────────────────────────────────────────
     det_avg = blend.get("det_avg")
     ens_p = blend.get("ens_p")
     wg_p = blend.get("wg_p")
@@ -408,7 +438,7 @@ def fmt_opportunity(
         )
     math_section = "\n".join(math_lines)
 
-    # ── Atmospheric signals ──────────────────────────────────────────────────
+    # ── Atmospheric signals ──────────────────────────────────────────────────────
     atm_section = ""
     if obs_skipped:
         atm_section = (
@@ -451,7 +481,7 @@ def fmt_opportunity(
                 "market resolves today)\n" + "\n".join(atm_lines)
             )
 
-    # ── Footer ───────────────────────────────────────────────────────────────
+    # ── Footer ───────────────────────────────────────────────────────────────────
     hours_left = ""
     if resolution_time:
         delta = resolution_time - datetime.now(timezone.utc)

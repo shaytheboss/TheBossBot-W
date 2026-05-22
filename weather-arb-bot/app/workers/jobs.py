@@ -68,7 +68,7 @@ POLYMARKET_ICAO_TO_CITY_SLUG = {
 }
 
 WUNDERGROUND_ICAO_RX = re.compile(
-    r"wunderground\.com/[\w/\-]+/([A-Z]{4})(?=[/\s\)\.,]|$)", re.IGNORECASE
+    r"wunderground\.com/[\w/\-]+/([A-Z]{4})(?=[/\s\)\.\,]|$)", re.IGNORECASE
 )
 
 _MONTH_BY_NAME = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
@@ -83,7 +83,7 @@ _DATE_PROSE_RX = re.compile(
     re.IGNORECASE,
 )
 _DATE_SLUG_RX = re.compile(
-    rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?" , re.IGNORECASE,
+    rf"({_MONTHS_RX})-(\d{{1,2}})(?:-(\d{{4}}))?", re.IGNORECASE,
 )
 
 SKIP_MARKET_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
@@ -598,11 +598,6 @@ async def job_fetch_models():
 
 
 async def job_fetch_external_forecasts():
-    """Fetch Tomorrow.io and Meteosource for active cities, 3 days ahead.
-
-    Rate-limited to 3 days to conserve daily API quota.
-    Skipped silently when API keys are not configured.
-    """
     if not tomorrowio_col.api_key and not meteosource_col.api_key:
         return
     async with AsyncSessionLocal() as db:
@@ -766,7 +761,10 @@ async def job_check_resolutions():
             for outcome in outcomes:
                 bn, bx = outcome.bucket_min, outcome.bucket_max
                 if bn is not None and bx is not None:
-                    if bn <= actual_high_f < bx:
+                    # Polymarket resolves "80-81°F" as any reading in [80.0, 82.0°F).
+                    # The bucket label covers integers bn through bx inclusive, so
+                    # the upper exclusive bound is bx+1.
+                    if bn <= actual_high_f < bx + 1:
                         winning_outcome_ids.add(outcome.id)
                 elif bn is not None and bx is None:
                     if actual_high_f >= bn:
