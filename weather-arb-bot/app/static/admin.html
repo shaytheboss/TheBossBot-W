@@ -117,8 +117,8 @@
         <h4>Add new city</h4>
         <div class="form-grid">
           <label>Name<input id="nc-name" placeholder="e.g. Boston" /></label>
-          <label>Primary ICAO<input id="nc-picao" placeholder="KBOS" /></label>
-          <label>Reference ICAO<input id="nc-ricao" placeholder="(optional)" /></label>
+          <label>Primary ICAO <span style="color:var(--warn)">(4 chars, e.g. KBOS)</span><input id="nc-picao" placeholder="KBOS" maxlength="4" /></label>
+          <label>Reference ICAO<input id="nc-ricao" placeholder="(optional)" maxlength="4" /></label>
           <label>Polymarket slug<input id="nc-slug" placeholder="boston" /></label>
           <label>Lat<input id="nc-lat" type="number" step="0.0001" placeholder="42.36" /></label>
           <label>Lon<input id="nc-lon" type="number" step="0.0001" placeholder="-71.06" /></label>
@@ -149,7 +149,7 @@
 
     <section id="tab-settings" class="hidden">
       <div id="settingsBody"></div>
-      <p class="small">Min edge → needs &ge; this to trigger an alert (0.0–1.0). Min confidence → 0–100. Polling intervals require restart.</p>
+      <p class="small">Min edge → needs &ge; this to trigger an alert (0.0–1.0). Min confidence → 0–100. Max days ahead → 0=same-day only, 1=today+tomorrow, 3=default. Polling intervals require restart.</p>
     </section>
 
     <section id="tab-logs" class="hidden">
@@ -278,7 +278,7 @@ async function loadCities() {
       <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
       <td>
         <button class="btn primary" onclick="saveCity(${c.id})">Save</button>
-        <button class="btn danger" onclick="deleteCity(${c.id}, ${JSON.stringify(c.name || '').replace(/'/g,"\\'")})">Delete</button>
+        <button class="btn danger" onclick="deleteCity(${c.id}, ${JSON.stringify(c.name || '').replace(/'/g,"\\'")})">מחק</button>
       </td>
     </tr>
   `).join('');
@@ -326,9 +326,17 @@ async function createCity() {
     status.textContent = 'Name and Primary ICAO are required';
     return;
   }
+  if (primary.length !== 4) {
+    status.textContent = `Primary ICAO must be exactly 4 characters (e.g. KBOS, EGLL). Got: "${primary}" (${primary.length} chars)`;
+    return;
+  }
+  const refIcao = document.getElementById('nc-ricao').value.trim().toUpperCase();
+  if (refIcao && refIcao.length !== 4) {
+    status.textContent = `Reference ICAO must be exactly 4 characters. Got: "${refIcao}" (${refIcao.length} chars)`;
+    return;
+  }
   const latVal = document.getElementById('nc-lat').value;
   const lonVal = document.getElementById('nc-lon').value;
-  const refIcao = document.getElementById('nc-ricao').value.trim().toUpperCase();
   const payload = {
     name,
     primary_icao: primary,
@@ -380,6 +388,7 @@ async function loadSettings() {
     <table>
       <tr><td>Min confidence (0–100)</td><td><input id="set-mc" type="number" value="${s.min_confidence_for_alert}" /></td></tr>
       <tr><td>Min edge (0.0–1.0)</td><td><input id="set-me" type="number" step="0.01" value="${s.min_edge_for_alert}" /></td></tr>
+      <tr><td>Max days ahead (0–14)</td><td><input id="set-mda" type="number" min="0" max="14" value="${s.max_days_ahead_for_alert}" /></td></tr>
       <tr><td>METAR interval (s)</td><td>${s.metar_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Polymarket interval (s)</td><td>${s.polymarket_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Analyzer interval (s)</td><td>${s.analyzer_run_interval} <span class="small">(restart)</span></td></tr>
@@ -394,6 +403,7 @@ async function saveSettings() {
   const payload = {
     min_confidence_for_alert: parseInt(document.getElementById('set-mc').value),
     min_edge_for_alert: parseFloat(document.getElementById('set-me').value),
+    max_days_ahead_for_alert: parseInt(document.getElementById('set-mda').value),
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
