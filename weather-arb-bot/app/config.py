@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     min_confidence_for_alert: int = 80
     min_edge_for_alert: float = 0.15
     alert_dedup_minutes: int = 30
+    # Only alert for markets resolving within this many days.
+    # 0 = same-day only, 1 = today+tomorrow, 3 = default.
+    # Markets further out have less reliable forecasts and wider spreads.
+    max_days_ahead_for_alert: int = 3
     sentry_dsn: str = ""
 
     @property

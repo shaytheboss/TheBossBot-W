@@ -53,6 +53,7 @@ class LoginIn(BaseModel):
 class SettingsIn(BaseModel):
     min_confidence_for_alert: Optional[int] = None
     min_edge_for_alert: Optional[float] = None
+    max_days_ahead_for_alert: Optional[int] = None
 
 
 class CityCreateIn(BaseModel):
@@ -300,15 +301,28 @@ async def admin_city_create(
     _: str = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new monitored city. `wunderground_url` defaults to empty string
-    if not provided, since the City model requires it as NOT NULL."""
     payload = body.model_dump()
-    # City.wunderground_url is NOT NULL but admin UI doesn't always know it.
-    if not payload.get("wunderground_url"):
-        payload["wunderground_url"] = ""
     payload["primary_icao"] = payload["primary_icao"].strip().upper()
     if payload.get("reference_icao"):
         payload["reference_icao"] = payload["reference_icao"].strip().upper()
+
+    # Validate ICAO lengths before hitting the DB String(4) column constraint.
+    if len(payload["primary_icao"]) > 4:
+        raise HTTPException(
+            400,
+            f"primary_icao must be a 4-character ICAO station code (e.g. KBOS, EGLL). "
+            f"Got '{payload['primary_icao']}' ({len(payload['primary_icao'])} chars)."
+        )
+    if payload.get("reference_icao") and len(payload["reference_icao"]) > 4:
+        raise HTTPException(
+            400,
+            f"reference_icao must be a 4-character ICAO station code. "
+            f"Got '{payload['reference_icao']}' ({len(payload['reference_icao'])} chars)."
+        )
+
+    if not payload.get("wunderground_url"):
+        payload["wunderground_url"] = ""
+
     city = City(**payload)
     db.add(city)
     await db.commit()
@@ -369,6 +383,7 @@ async def admin_get_settings(_: str = Depends(require_admin)):
     return {
         "min_confidence_for_alert": settings.min_confidence_for_alert,
         "min_edge_for_alert": settings.min_edge_for_alert,
+        "max_days_ahead_for_alert": settings.max_days_ahead_for_alert,
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -387,9 +402,14 @@ async def admin_set_settings(payload: SettingsIn, _: str = Depends(require_admin
         if not (0.0 <= payload.min_edge_for_alert <= 1.0):
             raise HTTPException(400, "min_edge_for_alert must be 0.0-1.0")
         settings.min_edge_for_alert = payload.min_edge_for_alert
+    if payload.max_days_ahead_for_alert is not None:
+        if not (0 <= payload.max_days_ahead_for_alert <= 14):
+            raise HTTPException(400, "max_days_ahead_for_alert must be 0-14")
+        settings.max_days_ahead_for_alert = payload.max_days_ahead_for_alert
     logger.info(
         f"Admin updated thresholds: min_conf={settings.min_confidence_for_alert} "
-        f"min_edge={settings.min_edge_for_alert}"
+        f"min_edge={settings.min_edge_for_alert} "
+        f"max_days_ahead={settings.max_days_ahead_for_alert}"
     )
     return {"ok": True}
 

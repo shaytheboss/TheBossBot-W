@@ -31,13 +31,19 @@ def _should_skip_market(question: Optional[str]) -> bool:
     return any(kw in lo for kw in SKIP_QUESTION_KEYWORDS)
 
 
-async def _has_prior_alert(db: AsyncSession, outcome_id: int, side: str) -> bool:
+async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -> bool:
+    """True if we already created an opportunity for this outcome+side today.
+
+    Using a per-calendar-day window (not a permanent block) lets multi-day markets
+    be re-evaluated each morning as the forecast updates, while still preventing
+    duplicate alerts within the same day.
+    """
+    today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
     q = await db.execute(
         select(Opportunity.id).where(
             Opportunity.outcome_id == outcome_id,
             Opportunity.side == side,
-            Opportunity.alert_sent == True,
-            Opportunity.outcome == None,
+            Opportunity.detected_at >= today_start,
         ).limit(1)
     )
     return q.scalar_one_or_none() is not None
@@ -53,6 +59,13 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
 
     for market in markets:
         if _should_skip_market(market.question):
+            continue
+
+        days_ahead = (market.event_date - date.today()).days
+        if days_ahead < 0:
+            # Already past; resolution job will mark it resolved.
+            continue
+        if days_ahead > settings.max_days_ahead_for_alert:
             continue
 
         city_result = await db.execute(select(City).where(City.id == market.city_id))
@@ -73,7 +86,7 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         for outcome in outcomes:
             try:
                 opp = await _analyze_outcome(
-                    db, city, outcome, market, is_low_market, city_lat, city_lon
+                    db, city, outcome, market, is_low_market, city_lat, city_lon, days_ahead
                 )
                 if opp is not None:
                     if best_opp is None or opp.edge > best_opp.edge:
@@ -95,6 +108,7 @@ async def _analyze_outcome(
     is_low_market: bool,
     city_lat: Optional[float] = None,
     city_lon: Optional[float] = None,
+    days_ahead: int = 0,
 ) -> Optional[Opportunity]:
     signals = await aggregator.aggregate(
         db=db,
@@ -112,12 +126,15 @@ async def _analyze_outcome(
     if not price_info:
         return None
 
-    # ── Liquidity gate ───────────────────────────────────────────────────
+    # ── Liquidity gate ──────────────────────────────────────────────────
     book = None
     if outcome.token_id:
         book = await _poly_col.get_book_summary(outcome.token_id)
     if book is None:
         logger.debug(f"Skipping outcome {outcome.id}: no two-sided orderbook")
+        return None
+    if book["bid"] == 0 and book["ask"] == 0:
+        logger.debug(f"Skipping outcome {outcome.id}: market closed (bid=ask=0)")
         return None
     if book["spread"] > MAX_BOOK_SPREAD:
         logger.debug(
@@ -132,8 +149,7 @@ async def _analyze_outcome(
     yes_entry_cost = yes_ask
     no_entry_cost = round(1.0 - yes_bid, 4)
 
-    # ── Probability + breakdown with lead-time-aware σ and gating ───────────────────
-    days_ahead = (market.event_date - date.today()).days
+    # ── Probability + breakdown ──────────────────────────────────────────────────
     true_prob, breakdown = estimate_with_breakdown(
         signals, outcome.bucket_min, outcome.bucket_max, days_ahead=days_ahead
     )
@@ -155,8 +171,11 @@ async def _analyze_outcome(
     if edge < settings.min_edge_for_alert:
         return None
 
-    if await _has_prior_alert(db, outcome.id, side):
-        logger.debug(f"Dedup: already alerted outcome={outcome.id} side={side}; skipping")
+    # ── Dedup: one opportunity per outcome+side per calendar day ──────────────────
+    # Multi-day markets are re-evaluated each morning so forecasts can shift
+    # the recommendation. Same-day markets alert at most once.
+    if await _has_opportunity_today(db, outcome.id, side):
+        logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} side={side} today")
         return None
 
     signals["_book"] = book
