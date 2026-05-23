@@ -34,6 +34,31 @@ ENSEMBLE_WEIGHT_BASE = 0.70       # default ensemble weight
 STRADDLE_EXTRA_BLEND = 0.10  # at most 10% additional blend when sources straddle
 
 
+def _parse_coord(val) -> Optional[float]:
+    """Parse a coordinate value that may be a float or a direction-suffixed string.
+
+    Some APIs (e.g. Meteosource) return coordinates as '47.44N' or '97.66W'
+    instead of numeric floats.  This helper handles both formats:
+      '47.44N'  →  47.44
+      '97.66W'  → -97.66
+      30.162    →  30.162
+    Returns None if the value cannot be parsed.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    sign = -1.0 if s[-1].upper() in ('S', 'W') else 1.0
+    s = s.rstrip('NSEWnsew').strip()
+    try:
+        return sign * float(s)
+    except ValueError:
+        return None
+
+
 def forecast_sigma_for_lead(days_ahead: Optional[int]) -> float:
     """1-sigma forecast uncertainty (°F) for daily max/min by lead time.
 
@@ -200,7 +225,7 @@ def estimate_with_breakdown(
         "final": None,
     }
 
-    # ── 1. Deterministic sources ───────────────────────────────────────────
+    # ── 1. Deterministic sources ──────────────────────────────────────────
     det_probs = []
     det_vals: list[float] = []
     for key, label in _DET_SOURCES:
@@ -218,16 +243,19 @@ def estimate_with_breakdown(
             "value_f": float(val),
             "p_in_bucket": float(p),
         }
-        # Carry through API-returned coordinates when available
-        if src_data.get("used_lat") is not None:
-            det_entry["used_lat"] = float(src_data["used_lat"])
-        if src_data.get("used_lon") is not None:
-            det_entry["used_lon"] = float(src_data["used_lon"])
+        # Carry through API-returned coordinates when available.
+        # Use _parse_coord() so string formats like '47.44N' are handled safely.
+        lat_val = _parse_coord(src_data.get("used_lat"))
+        if lat_val is not None:
+            det_entry["used_lat"] = lat_val
+        lon_val = _parse_coord(src_data.get("used_lon"))
+        if lon_val is not None:
+            det_entry["used_lon"] = lon_val
         breakdown["deterministic"].append(det_entry)
     det_p = sum(det_probs) / len(det_probs) if det_probs else None
     breakdown["det_avg"] = float(det_p) if det_p is not None else None
 
-    # ── 2. GFS Ensemble ───────────────────────────────────────────────
+    # ── 2. GFS Ensemble ────────────────────────────────────────────
     ensemble_fc = signals.get("gfs_ensemble") or {}
     ensemble_vals = ensemble_fc.get(ensemble_key) or []
     ens_p = _ensemble_bucket_prob(ensemble_vals, bucket_min, bucket_max)
@@ -243,7 +271,7 @@ def estimate_with_breakdown(
         }
     breakdown["ens_p"] = float(ens_p) if ens_p is not None else None
 
-    # ── 3. Wunderground (soft) ─────────────────────────────────────────
+    # ── 3. Wunderground (soft) ─────────────────────────────────
     wg_src = signals.get("wunderground_forecast") or {}
     wg_val = wg_src.get(fc_key)
     wg_p = _gaussian_bucket_prob(wg_val, bucket_min, bucket_max, sigma=sigma)
@@ -252,10 +280,12 @@ def estimate_with_breakdown(
             "value_f": float(wg_val),
             "p_in_bucket": float(wg_p) if wg_p is not None else None,
         }
-        if wg_src.get("used_lat") is not None:
-            wg_entry["used_lat"] = float(wg_src["used_lat"])
-        if wg_src.get("used_lon") is not None:
-            wg_entry["used_lon"] = float(wg_src["used_lon"])
+        lat_val = _parse_coord(wg_src.get("used_lat"))
+        if lat_val is not None:
+            wg_entry["used_lat"] = lat_val
+        lon_val = _parse_coord(wg_src.get("used_lon"))
+        if lon_val is not None:
+            wg_entry["used_lon"] = lon_val
         breakdown["wunderground"] = wg_entry
     breakdown["wg_p"] = float(wg_p) if wg_p is not None else None
 
@@ -295,7 +325,7 @@ def estimate_with_breakdown(
     else:
         source_spread = 0.0
 
-    # ── Core blend ───────────────────────────────────────────────────────
+    # ── Core blend ────────────────────────────────────────────────
     if ens_p is not None and det_p is not None:
         p = ensemble_weight * ens_p + det_weight * det_p
     elif ens_p is not None:
@@ -340,7 +370,7 @@ def estimate_with_breakdown(
                 "delta": float(p - p_before),
             })
 
-    # ── 1c. Straddle detection ────────────────────────────────────────────────
+    # ── 1c. Straddle detection ───────────────────────────────────────────
     if all_source_forecasts and (bucket_min is not None or bucket_max is not None):
         true_bx = (bucket_max + 1.0) if bucket_max is not None else None
 
@@ -372,7 +402,7 @@ def estimate_with_breakdown(
                 "delta": float(p - p_before),
             })
 
-    # ── Observation-based adjustments — SAME DAY ONLY ───────────────────────────
+    # ── Observation-based adjustments — SAME DAY ONLY ────────────────────────
     if not observation_skipped:
         p_before = p
         trend = signals.get("metar_trend") or {}
