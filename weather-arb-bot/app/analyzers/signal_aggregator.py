@@ -110,7 +110,11 @@ class SignalAggregator:
             for k in ("ensemble_highs", "ensemble_lows", "ensemble_count",
                       "mean_high_f", "mean_low_f",
                       "p10_high_f", "p25_high_f", "p50_high_f", "p75_high_f", "p90_high_f",
-                      "p10_low_f", "p25_low_f", "p50_low_f", "p75_low_f", "p90_low_f"):
+                      "p10_low_f", "p25_low_f", "p50_low_f", "p75_low_f", "p90_low_f",
+                      # API-returned coordinates (for coordinate display in alerts)
+                      "used_lat", "used_lon",
+                      # NWS grid identifiers
+                      "grid_id", "grid_x", "grid_y"):
                 if k in row.raw_data:
                     out[k] = row.raw_data[k]
         return out

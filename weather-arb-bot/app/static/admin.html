@@ -150,6 +150,30 @@
     <section id="tab-settings" class="hidden">
       <div id="settingsBody"></div>
       <p class="small">Min edge → needs &ge; this to trigger an alert (0.0–1.0). Min confidence → 0–100. Max days ahead → 0=same-day only, 1=today+tomorrow, 3=default. Polling intervals require restart.</p>
+
+      <h3 style="margin-top:28px;">🗑️ Data Management</h3>
+      <div style="background:#2a1f0a; border:1px solid var(--warn); padding:12px; border-radius:4px; margin-bottom:12px;">
+        <strong style="color:var(--warn);">⚠️ Warning:</strong> This permanently deletes historical records and cannot be undone.
+      </div>
+      <div class="row" style="gap:12px; margin-bottom:10px; flex-wrap:wrap;">
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mute);">
+          Delete data before
+          <input type="date" id="pruneDate" style="background:var(--panel);border:1px solid var(--border);color:var(--fg);padding:6px 10px;border-radius:6px;font-size:14px;" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mute);">
+          What to delete
+          <select id="pruneTarget" style="background:var(--panel);border:1px solid var(--border);color:var(--fg);padding:6px 10px;border-radius:6px;font-size:14px;">
+            <option value="all">All (opportunities + alerts)</option>
+            <option value="opportunities">Opportunities only</option>
+            <option value="alerts">Alerts only</option>
+          </select>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:4px;">
+          <span style="font-size:12px;color:transparent;">action</span>
+          <button class="btn danger" onclick="confirmPrune()">🗑️ Delete Old Data</button>
+        </label>
+      </div>
+      <div id="pruneStatus" class="small" style="margin-top:6px;"></div>
     </section>
 
     <section id="tab-logs" class="hidden">
@@ -428,6 +452,36 @@ async function loadLogs() {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function confirmPrune() {
+  const date = document.getElementById('pruneDate').value;
+  const target = document.getElementById('pruneTarget').value;
+  const statusEl = document.getElementById('pruneStatus');
+  statusEl.textContent = '';
+  if (!date) { alert('Please select a date'); return; }
+  const confirmed = confirm(
+    `⚠️ This will permanently delete all ${target} records before ${date}.\n\nThis cannot be undone! Continue?`
+  );
+  if (!confirmed) return;
+  statusEl.textContent = 'Deleting…';
+  try {
+    const res = await api('/data/prune', {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ before_date: date, tables: [target] })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      const parts = Object.entries(data.deleted || {}).map(([k,v]) => `${v} ${k}`).join(', ');
+      statusEl.textContent = `✅ Deleted: ${parts || '0 records'} (before ${date})`;
+      loadStats();
+    } else {
+      statusEl.textContent = `❌ Error: ${data.detail || JSON.stringify(data)}`;
+    }
+  } catch (e) {
+    statusEl.textContent = `❌ Error: ${e}`;
+  }
 }
 
 init();

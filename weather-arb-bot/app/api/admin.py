@@ -1,13 +1,13 @@
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -421,3 +421,46 @@ async def admin_logs(
     level: Optional[str] = Query(default=None),
 ):
     return {"logs": recent_logs(limit=limit, level=level)}
+
+
+class DataPruneRequest(BaseModel):
+    before_date: str          # ISO date string "YYYY-MM-DD"
+    tables: List[str]         # which tables to prune: "opportunities", "all"
+
+
+@router.delete("/data/prune")
+async def admin_prune_data(
+    req: DataPruneRequest,
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently delete historical records created before a given date.
+
+    ``tables`` may contain ``"opportunities"``, ``"alerts"``, or ``"all"``
+    (which deletes both opportunities and alerts before the cutoff).
+    """
+    try:
+        cutoff = datetime.fromisoformat(req.before_date).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(400, f"Invalid date format: {req.before_date!r}. Use YYYY-MM-DD.")
+
+    want_opps = "opportunities" in req.tables or "all" in req.tables
+    want_alerts = "alerts" in req.tables or "all" in req.tables
+    deleted: dict = {}
+
+    # Delete alerts first (FK references opportunities)
+    if want_alerts:
+        result = await db.execute(
+            delete(Alert).where(Alert.sent_at < cutoff)
+        )
+        deleted["alerts"] = result.rowcount
+
+    if want_opps:
+        result = await db.execute(
+            delete(Opportunity).where(Opportunity.detected_at < cutoff)
+        )
+        deleted["opportunities"] = result.rowcount
+
+    await db.commit()
+    logger.info(f"Admin pruned data before {req.before_date}: {deleted}")
+    return {"deleted": deleted, "before": req.before_date}

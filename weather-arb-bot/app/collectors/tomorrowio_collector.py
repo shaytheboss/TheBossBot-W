@@ -50,11 +50,17 @@ class TomorrowioCollector(BaseCollector):
                     low = vals.get("temperatureMin")
                     if high is None:
                         continue
+                    # Extract returned coordinates if available
+                    location = data.get("location") or {}
+                    used_lat = location.get("lat")
+                    used_lon = location.get("lon")
                     return {
                         "predicted_high_f": round(high),
                         "predicted_low_f": round(low) if low is not None else None,
                         "model": "tomorrowio",
                         "forecast_date": target_str,
+                        "used_lat": used_lat,
+                        "used_lon": used_lon,
                     }
 
             logger.warning(f"Tomorrow.io: {target_str} not found for ({lat},{lon})")
