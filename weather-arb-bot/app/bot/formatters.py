@@ -1,6 +1,8 @@
 from datetime import date, datetime, timezone
 from typing import Optional
 
+import pytz
+
 from app.utils.units import (
     is_celsius_bucket,
     f_to_c,
@@ -15,6 +17,15 @@ def _coord_str(lat: Optional[float], lon: Optional[float]) -> str:
     ns = "N" if lat >= 0 else "S"
     ew = "E" if lon >= 0 else "W"
     return f"{abs(lat):.3f}°{ns}, {abs(lon):.3f}°{ew}"
+
+
+def _api_coord_tag(used_lat: Optional[float], used_lon: Optional[float]) -> str:
+    """Return a short coordinate tag for source lines, e.g. [📍 30.162°N, 97.664°W]."""
+    if used_lat is None or used_lon is None:
+        return ""
+    ns = "N" if used_lat >= 0 else "S"
+    ew = "E" if used_lon >= 0 else "W"
+    return f" [📍 {abs(used_lat):.3f}°{ns}, {abs(used_lon):.3f}°{ew}]"
 
 
 def _agreement_label(spread_f: float) -> str:
@@ -35,6 +46,34 @@ def _lead_label(days_ahead: Optional[int]) -> str:
     if days_ahead == 1:
         return "1-day lead"
     return f"{days_ahead}-day lead"
+
+
+def _closes_in_text(market_date: date, city_tz_str: Optional[str]) -> str:
+    """Compute time-to-close using the city's local timezone.
+
+    Market resolves at end of market_date in local TZ (23:59:59).
+    Returns human-readable string like '~24h', '~45min', or 'closed'.
+    """
+    tz_str = city_tz_str or "UTC"
+    try:
+        tz = pytz.timezone(tz_str)
+    except Exception:
+        tz = pytz.utc
+
+    local_end = tz.localize(
+        datetime(market_date.year, market_date.month, market_date.day, 23, 59, 59)
+    )
+    utc_now = datetime.now(timezone.utc)
+    delta = local_end.astimezone(timezone.utc) - utc_now
+    total_seconds = delta.total_seconds()
+
+    if total_seconds < 0:
+        return "closed"
+    elif total_seconds < 3600:
+        return f"~{int(total_seconds / 60)}min"
+    else:
+        total_hours = total_seconds / 3600
+        return f"~{total_hours:.0f}h"
 
 
 def _bottom_line(
@@ -142,11 +181,21 @@ def _bottom_line(
             )
 
     br = blend.get("boundary_risk")
-    if br and br.get("min_distance_to_edge_f") is not None:
-        parts.append(
-            f"⚠️ Forecast sits only {br['min_distance_to_edge_f']:.1f}°F from a "
-            f"bucket edge — resolution-risk premium applied."
-        )
+    if br:
+        closest_f = br.get("closest_source_f")
+        closest_dist = br.get("closest_source_dist_f")
+        avg_f = br.get("avg_forecast_f")
+        if closest_f is not None and closest_dist is not None:
+            if closest_f != avg_f:
+                parts.append(
+                    f"⚠️ Source {closest_f:.1f}°F sits {closest_dist:.1f}°F from a "
+                    f"bucket edge — resolution-risk premium applied."
+                )
+            else:
+                parts.append(
+                    f"⚠️ Forecast sits only {closest_dist:.1f}°F from a "
+                    f"bucket edge — resolution-risk premium applied."
+                )
 
     parts.append(f"→ *{side}*.")
     return " ".join(parts)
@@ -192,6 +241,128 @@ def _ensemble_verdict(
     return base
 
 
+def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
+    """Build the verbose uncertainty breakdown section for the alert.
+
+    Shows model disagreement weight reduction, boundary proximity using closest
+    source, and straddle detection when applicable.
+    Returns empty string when no uncertainty adjustments were applied.
+    """
+    side = "NO" if is_no else "YES"
+    lines: list[str] = []
+
+    model_dis = blend.get("model_disagreement")
+    br = blend.get("boundary_risk")
+    straddle = blend.get("straddle_info")
+
+    has_model_dis = model_dis and model_dis.get("source_spread_f", 0) > 3.0
+    has_boundary = br and br.get("blend_weight", 0) > 0
+    has_straddle = straddle and straddle.get("straddles", False)
+
+    if not has_model_dis and not has_boundary and not has_straddle:
+        return ""
+
+    lines.append("⚗️ *Uncertainty breakdown:*")
+
+    if has_model_dis:
+        spread_f = model_dis["source_spread_f"]
+        ew_used = model_dis["ensemble_weight_used"]
+        ew_base = 0.70
+        ew_pct_base = round(ew_base * 100)
+        ew_pct_used = round(ew_used * 100)
+
+        # Find which sources contributed to the spread
+        det = blend.get("deterministic") or []
+        wg = blend.get("wunderground")
+        all_sources_named = [(d["source"], d["value_f"]) for d in det]
+        if wg and wg.get("value_f") is not None:
+            all_sources_named.append(("Wunderground", wg["value_f"]))
+
+        spread_detail = ""
+        if all_sources_named:
+            lo_src = min(all_sources_named, key=lambda x: x[1])
+            hi_src = max(all_sources_named, key=lambda x: x[1])
+            if lo_src[0] != hi_src[0]:
+                spread_detail = (
+                    f" ({lo_src[0]}={round(lo_src[1])}°F, "
+                    f"{hi_src[0]}={round(hi_src[1])}°F)"
+                )
+
+        lines.append(
+            f"• Model spread: Δ{round(spread_f)}°F{spread_detail} → "
+            f"ensemble weight reduced {ew_pct_base}%→{ew_pct_used}%"
+        )
+        lines.append(
+            "  ↳ High spread means GFS ensemble under-represents model disagreement"
+        )
+
+    if has_boundary:
+        avg_f = br.get("avg_forecast_f")
+        closest_f = br.get("closest_source_f")
+        closest_dist = br.get("closest_source_dist_f")
+        blend_w = br.get("blend_weight", 0)
+        b_min = br.get("bucket_true_min")
+        b_max = br.get("bucket_true_max")
+
+        edge_desc = ""
+        if b_min is not None and closest_f is not None:
+            if abs(closest_f - b_min) <= abs(closest_f - (b_max or 1e9)):
+                edge_desc = f"bucket low edge ({closest_dist:.1f}°F from boundary)"
+            else:
+                edge_desc = f"bucket high edge ({closest_dist:.1f}°F from boundary)"
+
+        source_name = ""
+        if closest_f is not None and closest_f != avg_f:
+            det = blend.get("deterministic") or []
+            for d in det:
+                if abs(d["value_f"] - closest_f) < 0.01:
+                    source_name = d["source"]
+                    break
+            if not source_name:
+                wg = blend.get("wunderground")
+                if wg and abs((wg.get("value_f") or 0) - closest_f) < 0.01:
+                    source_name = "Wunderground"
+            src_str = f"{source_name} ({closest_f:.0f}°F)" if source_name else f"{closest_f:.1f}°F"
+        elif avg_f is not None:
+            src_str = f"avg forecast {avg_f:.1f}°F"
+        else:
+            src_str = "forecast"
+
+        lines.append(
+            f"• Boundary proximity: {src_str} at {edge_desc}"
+        )
+        lines.append(
+            f"  ↳ Blend toward 50% applied (weight={round(blend_w * 100)}%)"
+        )
+
+    if has_straddle:
+        inside = straddle.get("inside_sources", [])
+        outside = straddle.get("outside_sources", [])
+        br_min = blend.get("boundary_risk", {}).get("bucket_true_min")
+        br_max_display = None
+        if blend.get("boundary_risk", {}).get("bucket_true_max") is not None:
+            br_max_display = round(blend["boundary_risk"]["bucket_true_max"] - 1)
+        bucket_str = ""
+        if br_min is not None and br_max_display is not None:
+            bucket_str = f" [{round(br_min)}–{br_max_display}°F]"
+        elif br_min is not None:
+            bucket_str = f" [≥{round(br_min)}°F]"
+
+        n_inside = len(inside)
+        n_outside = len(outside)
+        fraction_inside = n_inside / (n_inside + n_outside) if (n_inside + n_outside) > 0 else 0
+        extra_blend_pct = round(0.10 * fraction_inside * 100)
+        lines.append(
+            f"• ⚠️ Sources straddle bucket: {n_inside} source{'s' if n_inside != 1 else ''} "
+            f"inside{bucket_str}, {n_outside} outside"
+        )
+        lines.append(
+            f"  ↳ Additional {extra_blend_pct}% blend toward 50% applied"
+        )
+
+    return "\n".join(lines)
+
+
 def fmt_opportunity(
     city_name,
     market_question,
@@ -206,6 +377,8 @@ def fmt_opportunity(
     resolution_time=None,
     market_url=None,
     station_icao=None,
+    city_timezone=None,
+    prior_opportunity=None,
 ) -> str:
     """Render a high-confidence opportunity for Telegram (Markdown)."""
     is_no = (side == "NO")
@@ -233,6 +406,63 @@ def fmt_opportunity(
         )
     else:
         date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
+
+    # ── UPDATE header (re-alert detection) ─────────────────────────────────────
+    update_section = ""
+    if prior_opportunity is not None:
+        prior_dt = prior_opportunity.detected_at
+        if prior_dt:
+            prior_ts = prior_dt.strftime("%b %d %H:%M UTC")
+        else:
+            prior_ts = "unknown time"
+        prior_prob = float(prior_opportunity.estimated_true_prob)
+        prior_side_prob = round((1 - prior_prob if is_no else prior_prob) * 100)
+        prior_edge = float(prior_opportunity.edge)
+        prior_edge_pp = round(prior_edge * 100)
+        prior_price = float(prior_opportunity.market_price)
+        if is_no:
+            prior_ask_c = round((1 - prior_price) * 100)
+        else:
+            prior_ask_c = round(prior_price * 100)
+
+        current_side_prob = side_prob_pct
+        prob_change = current_side_prob - prior_side_prob
+        edge_change = edge_pct - prior_edge_pp
+
+        if prob_change >= 0:
+            conf_arrow = f"↑{abs(prob_change)}pp"
+        else:
+            conf_arrow = f"↓{abs(prob_change)}pp"
+
+        # Current ask price for comparison
+        book = signals.get("_book") or {}
+        entry_cost = signals.get("_entry_cost")
+        if entry_cost is not None:
+            current_ask_c = round(entry_cost * 100)
+        elif book.get("ask") is not None:
+            if is_no:
+                current_ask_c = round((1 - book["ask"]) * 100)
+            else:
+                current_ask_c = round(book["ask"] * 100)
+        else:
+            current_ask_c = round((1 - market_price if is_no else market_price) * 100)
+
+        price_change = current_ask_c - prior_ask_c
+
+        confidence_decreased = prob_change < 0
+        warn_flag = " ⚠️" if confidence_decreased else ""
+        update_section = (
+            f"🔁 *UPDATE{warn_flag}* (previously alerted {prior_ts})\n"
+            f"   Was: P({side})={prior_side_prob}%, ask={prior_ask_c}¢ | Edge=+{prior_edge_pp}pp\n"
+            f"   Now: P({side})={current_side_prob}%, ask={current_ask_c}¢ | Edge=+{edge_pct}pp\n"
+            f"   Change: confidence {conf_arrow}"
+        )
+        if confidence_decreased:
+            update_section += " — consider exiting position"
+        if price_change != 0:
+            price_arrow = f"↑{abs(price_change)}¢" if price_change > 0 else f"↓{abs(price_change)}¢"
+            update_section += f", price {price_arrow}"
+        update_section += "\n\n"
 
     # ── Header / location ─────────────────────────────────────────────────────
     lat = signals.get("city_lat")
@@ -293,9 +523,12 @@ def fmt_opportunity(
         forecast_vals_f.append(val_f)
         p_in = det.get("p_in_bucket") or 0.0
         side_p = 1 - p_in if is_no else p_in
+        # Include API coordinates if available in the det entry
+        coord_tag = _api_coord_tag(det.get("used_lat"), det.get("used_lon"))
         breakdown_lines.append(
             f"• {det['source']}: {fmt_temp_dual(val_f, is_c)} "
             f"→ P(in bucket)={round(p_in * 100)}% ⇒ P({side})={round(side_p * 100)}%"
+            f"{coord_tag}"
         )
 
     wg = blend.get("wunderground")
@@ -304,9 +537,11 @@ def fmt_opportunity(
         forecast_vals_f.append(val_f)
         p_in = wg.get("p_in_bucket") or 0.0
         side_p = 1 - p_in if is_no else p_in
+        coord_tag = _api_coord_tag(wg.get("used_lat"), wg.get("used_lon"))
         breakdown_lines.append(
             f"• Wunderground (soft): {fmt_temp_dual(val_f, is_c)} "
             f"→ P(in bucket)={round(p_in * 100)}% ⇒ P({side})={round(side_p * 100)}%"
+            f"{coord_tag}"
         )
 
     if not breakdown_lines:
@@ -362,6 +597,7 @@ def fmt_opportunity(
     final_p = blend.get("final")
     adjustments = blend.get("adjustments") or []
     boundary_risk = blend.get("boundary_risk")
+    model_dis = blend.get("model_disagreement")
 
     def _to_side(p: Optional[float]) -> Optional[float]:
         if p is None:
@@ -385,7 +621,15 @@ def fmt_opportunity(
     if ens_p is not None:
         math_lines.append(f"• Ensemble P({side}) = {round(_to_side(ens_p) * 100, 1)}%")
     if det_avg is not None and ens_p is not None:
-        math_lines.append("• Blend = 70% × ensemble + 30% × deterministic")
+        if model_dis and model_dis.get("source_spread_f", 0) > 3.0:
+            ew_pct = round(model_dis["ensemble_weight_used"] * 100)
+            dw_pct = round(model_dis["det_weight_used"] * 100)
+            math_lines.append(
+                f"• Blend = {ew_pct}% × ensemble + {dw_pct}% × deterministic "
+                f"_(spread-adjusted from 70/30)_"
+            )
+        else:
+            math_lines.append("• Blend = 70% × ensemble + 30% × deterministic")
     if wg_p is not None and (det_avg is not None or ens_p is not None):
         math_lines.append(
             f"• Wunderground soft mix: 90% blend + 10% WG "
@@ -407,20 +651,32 @@ def fmt_opportunity(
         delta_side = -adj["delta"] if is_no else adj["delta"]
         sign = "+" if delta_side >= 0 else "−"
         if name == "Boundary proximity" and boundary_risk:
-            dist = boundary_risk.get("min_distance_to_edge_f")
-            fc_avg = boundary_risk.get("forecast_avg_f")
+            closest_f = boundary_risk.get("closest_source_f")
+            closest_dist = boundary_risk.get("closest_source_dist_f")
+            avg_f = boundary_risk.get("avg_forecast_f")
             extra = ""
-            if dist is not None and fc_avg is not None:
-                extra = (
-                    f" _(forecast {fc_avg:.1f}°F is {dist:.1f}°F from a "
-                    "bucket edge — pulls P toward 50% to price resolution risk)_"
-                )
+            if closest_dist is not None and closest_f is not None:
+                if closest_f != avg_f:
+                    extra = (
+                        f" _(closest source {closest_f:.1f}°F is {closest_dist:.1f}°F from a "
+                        "bucket edge — pulls P toward 50% to price resolution risk)_"
+                    )
+                else:
+                    extra = (
+                        f" _(forecast {avg_f:.1f}°F is {closest_dist:.1f}°F from a "
+                        "bucket edge — pulls P toward 50% to price resolution risk)_"
+                    )
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp{extra}"
             )
         elif name == "Boundary proximity":
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp"
+            )
+        elif name == "Straddle blend":
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"_(sources on both sides of bucket edge)_"
             )
         else:
             math_lines.append(
@@ -437,6 +693,12 @@ def fmt_opportunity(
             f"(clipped to [3%, 97%])"
         )
     math_section = "\n".join(math_lines)
+
+    # ── Uncertainty breakdown section (Change 3) ─────────────────────────────────
+    uncertainty_text = _build_uncertainty_section(blend, is_no)
+    uncertainty_section = (
+        f"\n\n{uncertainty_text}" if uncertainty_text else ""
+    )
 
     # ── Atmospheric signals ──────────────────────────────────────────────────────
     atm_section = ""
@@ -483,7 +745,15 @@ def fmt_opportunity(
 
     # ── Footer ───────────────────────────────────────────────────────────────────
     hours_left = ""
-    if resolution_time:
+    # Change 2: timezone-correct closes-in calculation
+    if event_date and isinstance(event_date, date):
+        closes_txt = _closes_in_text(event_date, city_timezone)
+        if closes_txt and closes_txt != "closed":
+            hours_left = f"\n⏰ Closes in {closes_txt}"
+        elif closes_txt == "closed":
+            hours_left = "\n⏰ Market closed"
+    elif resolution_time:
+        # Fallback: use raw resolution_time if no event_date
         delta = resolution_time - datetime.now(timezone.utc)
         h = int(delta.total_seconds() // 3600)
         if h > 0:
@@ -497,6 +767,7 @@ def fmt_opportunity(
     )
 
     return (
+        f"{update_section}"
         f"\U0001f3af *HIGH CONFIDENCE OPPORTUNITY*\n\n"
         f"{loc_line}\n"
         f"\U0001f4ca Market: {market_question}\n"
@@ -509,6 +780,7 @@ def fmt_opportunity(
         f"{breakdown_text}"
         f"{ens_section}\n\n"
         f"{math_section}"
+        f"{uncertainty_section}"
         f"{atm_section}"
         f"{certainty_note}{hours_left}{link_line}"
     )

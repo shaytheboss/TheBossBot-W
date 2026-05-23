@@ -59,6 +59,9 @@ class GFSCollector(BaseCollector):
                 "wind_max_kt": daily.get("windspeed_10m_max", [None])[idx],
                 "model": model,
                 "forecast_date": target_str,
+                # Open-Meteo returns the actual grid point used
+                "used_lat": data.get("latitude"),
+                "used_lon": data.get("longitude"),
             }
         except Exception as e:
             logger.error(f"GFS/ECMWF fetch failed ({model}) for {target_str}: {e}")

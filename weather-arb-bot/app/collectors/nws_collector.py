@@ -15,15 +15,33 @@ NWS_POINTS_URL = "https://api.weather.gov/points/{lat},{lon}"
 class NWSCollector(BaseCollector):
     name = "nws"
 
-    async def _get_forecast_url(self, lat: float, lon: float) -> Optional[str]:
-        """Resolve NWS grid forecast URL from coordinates."""
+    async def _get_forecast_url(self, lat: float, lon: float) -> tuple:
+        """Resolve NWS grid forecast URL from coordinates.
+
+        Returns (forecast_url, grid_info_dict) where grid_info_dict may contain
+        used_lat, used_lon, and grid identifiers from the NWS points response.
+        """
         try:
             resp = await self._get(NWS_POINTS_URL.format(lat=lat, lon=lon))
             data = resp.json()
-            return data["properties"]["forecast"]
+            props = data.get("properties") or {}
+            forecast_url = props.get("forecast")
+            grid_info: dict = {}
+            # NWS returns the precise grid center point coordinates
+            relative_location = props.get("relativeLocation") or {}
+            rl_geom = relative_location.get("geometry") or {}
+            rl_coords = rl_geom.get("coordinates")
+            if rl_coords and len(rl_coords) >= 2:
+                grid_info["used_lon"] = rl_coords[0]
+                grid_info["used_lat"] = rl_coords[1]
+            # Also store grid office / x / y identifiers
+            grid_info["grid_id"] = props.get("gridId")
+            grid_info["grid_x"] = props.get("gridX")
+            grid_info["grid_y"] = props.get("gridY")
+            return forecast_url, grid_info
         except Exception as e:
             logger.error(f"NWS points lookup failed for ({lat},{lon}): {e}")
-            return None
+            return None, {}
 
     async def collect(
         self, lat: float, lon: float, forecast_date: Optional[date] = None
@@ -36,7 +54,7 @@ class NWSCollector(BaseCollector):
         target = forecast_date or date.today()
         target_str = str(target)
 
-        forecast_url = await self._get_forecast_url(lat, lon)
+        forecast_url, grid_info = await self._get_forecast_url(lat, lon)
         if not forecast_url:
             return None
         try:
@@ -44,6 +62,9 @@ class NWSCollector(BaseCollector):
             data = resp.json()
             periods = data["properties"]["periods"]
             result: dict = {"raw_periods": periods}
+
+            # Include grid / coordinate info returned by the NWS points API
+            result.update(grid_info)
 
             for period in periods:
                 # startTime looks like "2024-05-17T06:00:00-05:00"; first 10 chars = date

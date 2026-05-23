@@ -24,6 +24,15 @@ _DET_SOURCES = (
 BOUNDARY_WINDOW_F = 1.5
 BOUNDARY_MAX_BLEND = 0.25
 
+# Model disagreement thresholds — when sources disagree, reduce ensemble weight.
+SOURCE_SPREAD_THRESHOLD_F = 3.0   # spreads below this get full ensemble weight
+SOURCE_SPREAD_MAX_BLEND_F = 6.0   # at this spread, ensemble weight is at minimum
+ENSEMBLE_WEIGHT_MIN = 0.40        # minimum ensemble weight even with huge spread
+ENSEMBLE_WEIGHT_BASE = 0.70       # default ensemble weight
+
+# Straddle: when sources sit on opposite sides of the bucket, apply extra blend.
+STRADDLE_EXTRA_BLEND = 0.10  # at most 10% additional blend when sources straddle
+
 
 def forecast_sigma_for_lead(days_ahead: Optional[int]) -> float:
     """1-sigma forecast uncertainty (°F) for daily max/min by lead time.
@@ -45,22 +54,58 @@ def boundary_uncertainty_blend(
     forecast_avg: Optional[float],
     bucket_min: Optional[int],
     bucket_max: Optional[int],
-) -> float:
+    all_source_forecasts: Optional[list] = None,
+) -> tuple:
     """Blend weight toward 50% when forecast lies near a bucket edge.
 
-    Returns 0.0 when forecast is ≥ BOUNDARY_WINDOW_F away from every edge,
-    BOUNDARY_MAX_BLEND when forecast sits exactly on an edge, and linearly
-    interpolates in between.
+    Polymarket convention: bucket is [bucket_min, bucket_max + 1).
+    Uses the closest source forecast (not just the average) to the bucket edge,
+    so a single outlier source can trigger the boundary premium.
+
+    Returns (blend_weight, closest_source_f, closest_source_dist_f).
     """
     if forecast_avg is None:
-        return 0.0
-    edges = [e for e in (bucket_min, bucket_max) if e is not None]
+        return 0.0, None, None
+
+    # Polymarket bucket: [bucket_min, bucket_max + 1)
+    true_bucket_max = (bucket_max + 1.0) if bucket_max is not None else None
+    edges = []
+    if bucket_min is not None:
+        edges.append(float(bucket_min))
+    if true_bucket_max is not None:
+        edges.append(true_bucket_max)
+
     if not edges:
-        return 0.0
-    nearest = min(abs(forecast_avg - e) for e in edges)
-    if nearest >= BOUNDARY_WINDOW_F:
-        return 0.0
-    return (BOUNDARY_WINDOW_F - nearest) / BOUNDARY_WINDOW_F * BOUNDARY_MAX_BLEND
+        return 0.0, None, None
+
+    # Distance from average
+    dist_avg = min(abs(forecast_avg - e) for e in edges)
+
+    # Distance from closest source
+    dist_min = dist_avg
+    closest_source_f = None
+    if all_source_forecasts:
+        for f in all_source_forecasts:
+            d = min(abs(f - e) for e in edges)
+            if d < dist_min:
+                dist_min = d
+                closest_source_f = f
+
+    # If average is closest, record it
+    if closest_source_f is None:
+        closest_source_f = forecast_avg
+        closest_source_dist_f = dist_avg
+    else:
+        closest_source_dist_f = dist_min
+
+    # Use the smaller of avg dist and closest-source dist
+    effective_dist = dist_min
+
+    if effective_dist >= BOUNDARY_WINDOW_F:
+        return 0.0, closest_source_f, closest_source_dist_f
+
+    blend = BOUNDARY_MAX_BLEND * (1.0 - effective_dist / BOUNDARY_WINDOW_F)
+    return blend, closest_source_f, closest_source_dist_f
 
 
 def _bucket_contains(value: float, bucket_min: Optional[int], bucket_max: Optional[int]) -> bool:
@@ -149,6 +194,8 @@ def estimate_with_breakdown(
         "wg_p": None,
         "blend_before_adjustments": None,
         "boundary_risk": None,
+        "model_disagreement": None,
+        "straddle_info": None,
         "adjustments": [],
         "final": None,
     }
@@ -157,7 +204,8 @@ def estimate_with_breakdown(
     det_probs = []
     det_vals: list[float] = []
     for key, label in _DET_SOURCES:
-        val = (signals.get(key) or {}).get(fc_key)
+        src_data = signals.get(key) or {}
+        val = src_data.get(fc_key)
         if val is None:
             continue
         p = _gaussian_bucket_prob(val, bucket_min, bucket_max, sigma=sigma)
@@ -165,11 +213,17 @@ def estimate_with_breakdown(
             continue
         det_probs.append(p)
         det_vals.append(float(val))
-        breakdown["deterministic"].append({
+        det_entry: dict = {
             "source": label,
             "value_f": float(val),
             "p_in_bucket": float(p),
-        })
+        }
+        # Carry through API-returned coordinates when available
+        if src_data.get("used_lat") is not None:
+            det_entry["used_lat"] = float(src_data["used_lat"])
+        if src_data.get("used_lon") is not None:
+            det_entry["used_lon"] = float(src_data["used_lon"])
+        breakdown["deterministic"].append(det_entry)
     det_p = sum(det_probs) / len(det_probs) if det_probs else None
     breakdown["det_avg"] = float(det_p) if det_p is not None else None
 
@@ -190,18 +244,60 @@ def estimate_with_breakdown(
     breakdown["ens_p"] = float(ens_p) if ens_p is not None else None
 
     # ── 3. Wunderground (soft) ─────────────────────────────────────────
-    wg_val = (signals.get("wunderground_forecast") or {}).get(fc_key)
+    wg_src = signals.get("wunderground_forecast") or {}
+    wg_val = wg_src.get(fc_key)
     wg_p = _gaussian_bucket_prob(wg_val, bucket_min, bucket_max, sigma=sigma)
     if wg_val is not None:
-        breakdown["wunderground"] = {
+        wg_entry: dict = {
             "value_f": float(wg_val),
             "p_in_bucket": float(wg_p) if wg_p is not None else None,
         }
+        if wg_src.get("used_lat") is not None:
+            wg_entry["used_lat"] = float(wg_src["used_lat"])
+        if wg_src.get("used_lon") is not None:
+            wg_entry["used_lon"] = float(wg_src["used_lon"])
+        breakdown["wunderground"] = wg_entry
     breakdown["wg_p"] = float(wg_p) if wg_p is not None else None
+
+    # ── 1a. Model disagreement: adapt ensemble weight based on source spread ──────
+    all_source_forecasts = list(det_vals)
+    if wg_val is not None:
+        all_source_forecasts.append(float(wg_val))
+
+    ensemble_weight = ENSEMBLE_WEIGHT_BASE
+    det_weight = 1.0 - ensemble_weight
+
+    if len(all_source_forecasts) >= 2:
+        min_source_f = min(all_source_forecasts)
+        max_source_f = max(all_source_forecasts)
+        source_spread = max_source_f - min_source_f
+
+        if source_spread > SOURCE_SPREAD_THRESHOLD_F:
+            excess = min(
+                source_spread - SOURCE_SPREAD_THRESHOLD_F,
+                SOURCE_SPREAD_MAX_BLEND_F - SOURCE_SPREAD_THRESHOLD_F,
+            )
+            reduction = (
+                (excess / (SOURCE_SPREAD_MAX_BLEND_F - SOURCE_SPREAD_THRESHOLD_F))
+                * (ENSEMBLE_WEIGHT_BASE - ENSEMBLE_WEIGHT_MIN)
+            )
+            ensemble_weight = ENSEMBLE_WEIGHT_BASE - reduction
+        else:
+            source_spread = 0.0 if len(all_source_forecasts) < 2 else source_spread
+
+        breakdown["model_disagreement"] = {
+            "source_spread_f": round(source_spread, 2),
+            "ensemble_weight_used": round(ensemble_weight, 4),
+            "det_weight_used": round(1.0 - ensemble_weight, 4),
+            "threshold_f": SOURCE_SPREAD_THRESHOLD_F,
+        }
+        det_weight = 1.0 - ensemble_weight
+    else:
+        source_spread = 0.0
 
     # ── Core blend ───────────────────────────────────────────────────────
     if ens_p is not None and det_p is not None:
-        p = 0.70 * ens_p + 0.30 * det_p
+        p = ensemble_weight * ens_p + det_weight * det_p
     elif ens_p is not None:
         p = ens_p
     elif det_p is not None:
@@ -214,29 +310,65 @@ def estimate_with_breakdown(
         p = 0.90 * p + 0.10 * wg_p
     breakdown["blend_before_adjustments"] = float(p)
 
-    # ── Boundary-proximity uncertainty premium ──────────────────────────
-    # When the forecast average sits within 1.5°F of a bucket edge, blend
-    # the probability toward 50%. Fixes the May 20 boundary-loss pattern
-    # where NO bets adjacent to the eventual outcome were over-confident.
+    # ── 1b. Boundary-proximity uncertainty premium (closest source, not avg) ───
     fc_for_boundary: Optional[float] = None
     if det_vals:
         fc_for_boundary = sum(det_vals) / len(det_vals)
     elif wg_val is not None:
         fc_for_boundary = float(wg_val)
+
     if fc_for_boundary is not None:
-        blend_w = boundary_uncertainty_blend(fc_for_boundary, bucket_min, bucket_max)
+        blend_w, closest_source_f, closest_source_dist_f = boundary_uncertainty_blend(
+            fc_for_boundary, bucket_min, bucket_max,
+            all_source_forecasts=all_source_forecasts if all_source_forecasts else None,
+        )
         if blend_w > 0:
             p_before = p
             p = (1.0 - blend_w) * p + blend_w * 0.5
-            edges = [e for e in (bucket_min, bucket_max) if e is not None]
-            nearest = min(abs(fc_for_boundary - e) for e in edges) if edges else None
+
+            true_bmax = (bucket_max + 1.0) if bucket_max is not None else None
             breakdown["boundary_risk"] = {
-                "forecast_avg_f": float(fc_for_boundary),
-                "min_distance_to_edge_f": float(nearest) if nearest is not None else None,
+                "avg_forecast_f": float(fc_for_boundary),
+                "closest_source_f": float(closest_source_f) if closest_source_f is not None else None,
+                "closest_source_dist_f": float(closest_source_dist_f) if closest_source_dist_f is not None else None,
                 "blend_weight": float(blend_w),
+                "bucket_true_min": float(bucket_min) if bucket_min is not None else None,
+                "bucket_true_max": float(true_bmax) if true_bmax is not None else None,
             }
             breakdown["adjustments"].append({
                 "name": "Boundary proximity",
+                "delta": float(p - p_before),
+            })
+
+    # ── 1c. Straddle detection ────────────────────────────────────────────────
+    if all_source_forecasts and (bucket_min is not None or bucket_max is not None):
+        true_bx = (bucket_max + 1.0) if bucket_max is not None else None
+
+        def _inside(f: float) -> bool:
+            below_min = (bucket_min is not None and f < bucket_min)
+            if true_bx is not None:
+                above_max = (f >= true_bx)
+            else:
+                above_max = False
+            return not below_min and not above_max
+
+        sources_inside = [f for f in all_source_forecasts if _inside(f)]
+        sources_outside = [f for f in all_source_forecasts if not _inside(f)]
+        straddles = len(sources_inside) > 0 and len(sources_outside) > 0
+
+        breakdown["straddle_info"] = {
+            "straddles": straddles,
+            "inside_sources": [round(f, 2) for f in sources_inside],
+            "outside_sources": [round(f, 2) for f in sources_outside],
+        }
+
+        if straddles:
+            fraction_inside = len(sources_inside) / len(all_source_forecasts)
+            straddle_blend = STRADDLE_EXTRA_BLEND * fraction_inside
+            p_before = p
+            p = p * (1 - straddle_blend) + 0.50 * straddle_blend
+            breakdown["adjustments"].append({
+                "name": "Straddle blend",
                 "delta": float(p - p_before),
             })
 

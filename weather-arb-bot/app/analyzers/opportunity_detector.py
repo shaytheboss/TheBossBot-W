@@ -49,6 +49,24 @@ async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -
     return q.scalar_one_or_none() is not None
 
 
+async def _get_prior_opportunity(
+    db: AsyncSession, outcome_id: int, side: str
+) -> Optional[Opportunity]:
+    """Return the most recent prior Opportunity for this (outcome_id, side), if any.
+
+    Looks across all time (not just today) so UPDATE messages can reference
+    the previous alert even for markets detected on a prior day.
+    """
+    result = await db.execute(
+        select(Opportunity)
+        .where(Opportunity.outcome_id == outcome_id)
+        .where(Opportunity.side == side)
+        .order_by(Opportunity.detected_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     found: List[Opportunity] = []
 
@@ -178,9 +196,18 @@ async def _analyze_outcome(
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} side={side} today")
         return None
 
+    # Look up any prior opportunity for this (outcome, side) so the formatter
+    # can generate an UPDATE message. We do this after dedup so we only reach
+    # here if there's no existing opportunity *today* — any match here is from
+    # a prior day.
+    prior_opp = await _get_prior_opportunity(db, outcome.id, side)
+    # If prior_opp exists and was created today it would have been caught by
+    # _has_opportunity_today above, so any match here is genuinely from a prior period.
+
     signals["_book"] = book
     signals["_entry_cost"] = float(entry_cost)
     signals["_blend"] = breakdown
+    signals["_prior_opportunity_id"] = prior_opp.id if prior_opp else None
 
     opp = Opportunity(
         outcome_id=outcome.id,

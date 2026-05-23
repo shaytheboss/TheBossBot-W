@@ -38,6 +38,7 @@ async def send_opportunity_alert(opportunity, db) -> None:
     from app.models.alert import TelegramUser, Alert
     from app.models.market import MarketOutcome, Market
     from app.models.city import City
+    from app.models.opportunity import Opportunity as Opp  # noqa: F401 (used below)
 
     outcome_result = await db.execute(select(MarketOutcome).where(MarketOutcome.id == opportunity.outcome_id))
     outcome = outcome_result.scalar_one_or_none()
@@ -53,6 +54,14 @@ async def send_opportunity_alert(opportunity, db) -> None:
     # Use the actual event slug stored in external_id — guaranteed to match Polymarket's URL
     market_url = f"https://polymarket.com/event/{market.external_id}" if market.external_id else None
 
+    # Look up the prior opportunity for UPDATE detection (stored in signals by detector)
+    signals = opportunity.signals or {}
+    prior_opportunity = None
+    prior_opp_id = signals.get("_prior_opportunity_id")
+    if prior_opp_id is not None:
+        prior_result = await db.execute(select(Opp).where(Opp.id == prior_opp_id))
+        prior_opportunity = prior_result.scalar_one_or_none()
+
     text = fmt_opportunity(
         city_name=city.name if city else "Unknown",
         market_question=market.question,
@@ -61,12 +70,14 @@ async def send_opportunity_alert(opportunity, db) -> None:
         true_prob=float(opportunity.estimated_true_prob),
         edge=float(opportunity.edge),
         confidence=opportunity.confidence_score,
-        signals=opportunity.signals or {},
+        signals=signals,
         side=opportunity.side or "YES",
         event_date=market.event_date,
         resolution_time=market.resolution_time,
         market_url=market_url,
         station_icao=city.primary_icao if city else None,
+        city_timezone=city.timezone if city else None,
+        prior_opportunity=prior_opportunity,
     )
 
     users_result = await db.execute(

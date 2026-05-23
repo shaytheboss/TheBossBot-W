@@ -54,11 +54,16 @@ class MeteosourceCollector(BaseCollector):
                         low = entry.get("temperature_min")
                     if high is None:
                         continue
+                    # Extract returned coordinates if available in the response
+                    used_lat = data.get("lat")
+                    used_lon = data.get("lon")
                     return {
                         "predicted_high_f": round(high),
                         "predicted_low_f": round(low) if low is not None else None,
                         "model": "meteosource",
                         "forecast_date": target_str,
+                        "used_lat": used_lat,
+                        "used_lon": used_lon,
                     }
 
             logger.warning(f"Meteosource: {target_str} not found for ({lat},{lon})")
