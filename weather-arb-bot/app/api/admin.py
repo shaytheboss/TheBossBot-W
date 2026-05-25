@@ -1,6 +1,6 @@
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date as date_cls, datetime, timedelta, timezone
 from typing import List, Optional
 
 import httpx
@@ -54,6 +54,11 @@ class SettingsIn(BaseModel):
     min_confidence_for_alert: Optional[int] = None
     min_edge_for_alert: Optional[float] = None
     max_days_ahead_for_alert: Optional[int] = None
+    # Split alert / buy thresholds (0.0–1.0).
+    min_confidence_alert_near: Optional[float] = None
+    min_confidence_alert_far: Optional[float] = None
+    min_confidence_buy_near: Optional[float] = None
+    min_confidence_buy_far: Optional[float] = None
 
 
 class CityCreateIn(BaseModel):
@@ -171,25 +176,56 @@ async def admin_diag_candidates(
     }
 
 
+def _parse_iso_date(s: Optional[str], name: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        d = date_cls.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(400, f"Invalid {name}: {s!r}. Use YYYY-MM-DD.")
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
+
 @router.get("/stats")
-async def admin_stats(_: str = Depends(require_admin), db: AsyncSession = Depends(get_db)):
-    total_opps = (await db.execute(select(func.count(Opportunity.id)))).scalar() or 0
-    alerted = (
-        await db.execute(select(func.count(Opportunity.id)).where(Opportunity.alert_sent == True))
-    ).scalar() or 0
-    wins = (
-        await db.execute(select(func.count(Opportunity.id)).where(Opportunity.outcome == "WIN"))
-    ).scalar() or 0
-    losses = (
-        await db.execute(select(func.count(Opportunity.id)).where(Opportunity.outcome == "LOSS"))
-    ).scalar() or 0
-    open_pos = (
-        await db.execute(
-            select(func.count(Opportunity.id)).where(
-                Opportunity.alert_sent == True, Opportunity.outcome == None
-            )
-        )
-    ).scalar() or 0
+async def admin_stats(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD; filter by detected_at"),
+    to_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD; exclusive upper"),
+    city_id: Optional[int] = Query(default=None),
+):
+    # Build common WHERE for Opportunity-based aggregates.
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    # Make to_date inclusive of the whole day.
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+
+    def opp_q(base):
+        q = base
+        if from_dt is not None:
+            q = q.where(Opportunity.detected_at >= from_dt)
+        if to_dt is not None:
+            q = q.where(Opportunity.detected_at < to_dt)
+        if city_id is not None:
+            q = q.join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id) \
+                 .join(Market, Market.id == MarketOutcome.market_id) \
+                 .where(Market.city_id == city_id)
+        return q
+
+    total_opps = (await db.execute(opp_q(select(func.count(Opportunity.id))))).scalar() or 0
+    alerted = (await db.execute(
+        opp_q(select(func.count(Opportunity.id))).where(Opportunity.alert_sent == True)
+    )).scalar() or 0
+    wins = (await db.execute(
+        opp_q(select(func.count(Opportunity.id))).where(Opportunity.outcome == "WIN")
+    )).scalar() or 0
+    losses = (await db.execute(
+        opp_q(select(func.count(Opportunity.id))).where(Opportunity.outcome == "LOSS")
+    )).scalar() or 0
+    open_pos = (await db.execute(
+        opp_q(select(func.count(Opportunity.id)))
+        .where(Opportunity.alert_sent == True, Opportunity.outcome == None)
+    )).scalar() or 0
 
     cities = (await db.execute(select(func.count(City.id)))).scalar() or 0
     markets = (await db.execute(select(func.count(Market.id)))).scalar() or 0
@@ -203,7 +239,47 @@ async def admin_stats(_: str = Depends(require_admin), db: AsyncSession = Depend
 
     win_rate = round(wins / max(wins + losses, 1) * 100, 1)
 
+    # ── Virtual position aggregates (filtered) ──────────────────────────────
+    positions_opened = (await db.execute(
+        opp_q(select(func.count(Opportunity.id)))
+        .where(Opportunity.virtual_shares != None)
+    )).scalar() or 0
+    total_cost = (await db.execute(
+        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_cost), 0.0)))
+    )).scalar() or 0.0
+    total_payout = (await db.execute(
+        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_payout), 0.0)))
+        .where(Opportunity.virtual_status.in_(["win", "loss"]))
+    )).scalar() or 0.0
+    net_pnl = (await db.execute(
+        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_pnl), 0.0)))
+        .where(Opportunity.virtual_status.in_(["win", "loss"]))
+    )).scalar() or 0.0
+    pos_wins = (await db.execute(
+        opp_q(select(func.count(Opportunity.id)))
+        .where(Opportunity.virtual_status == "win")
+    )).scalar() or 0
+    pos_losses = (await db.execute(
+        opp_q(select(func.count(Opportunity.id)))
+        .where(Opportunity.virtual_status == "loss")
+    )).scalar() or 0
+    pos_win_rate = round(pos_wins / max(pos_wins + pos_losses, 1) * 100, 1)
+    avg_cost = (float(total_cost) / positions_opened) if positions_opened else 0.0
+    best_pnl = (await db.execute(
+        opp_q(select(func.max(Opportunity.virtual_pnl)))
+        .where(Opportunity.virtual_status.in_(["win", "loss"]))
+    )).scalar()
+    worst_pnl = (await db.execute(
+        opp_q(select(func.min(Opportunity.virtual_pnl)))
+        .where(Opportunity.virtual_status.in_(["win", "loss"]))
+    )).scalar()
+
     return {
+        "filter": {
+            "from_date": from_date,
+            "to_date": to_date,
+            "city_id": city_id,
+        },
         "opportunities": {
             "total": total_opps,
             "alerted": alerted,
@@ -211,6 +287,18 @@ async def admin_stats(_: str = Depends(require_admin), db: AsyncSession = Depend
             "wins": wins,
             "losses": losses,
             "win_rate_pct": win_rate,
+        },
+        "positions": {
+            "opened": positions_opened,
+            "total_cost": round(float(total_cost), 2),
+            "total_payout": round(float(total_payout), 2),
+            "net_pnl": round(float(net_pnl), 2),
+            "wins": pos_wins,
+            "losses": pos_losses,
+            "win_rate_pct": pos_win_rate,
+            "avg_cost": round(avg_cost, 2),
+            "best_pnl": round(float(best_pnl), 2) if best_pnl is not None else None,
+            "worst_pnl": round(float(worst_pnl), 2) if worst_pnl is not None else None,
         },
         "inventory": {
             "cities": cities,
@@ -220,6 +308,58 @@ async def admin_stats(_: str = Depends(require_admin), db: AsyncSession = Depend
             "telegram_users": telegram_users,
         },
     }
+
+
+@router.get("/positions")
+async def admin_positions(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+    city_id: Optional[int] = Query(default=None),
+    limit: int = Query(default=200, le=1000),
+):
+    """List virtual positions (opportunities with a virtual buy) for the filter."""
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+
+    q = (
+        select(Opportunity, MarketOutcome, Market, City)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+        .where(Opportunity.virtual_shares != None)
+        .order_by(desc(Opportunity.detected_at))
+        .limit(limit)
+    )
+    if from_dt is not None:
+        q = q.where(Opportunity.detected_at >= from_dt)
+    if to_dt is not None:
+        q = q.where(Opportunity.detected_at < to_dt)
+    if city_id is not None:
+        q = q.where(Market.city_id == city_id)
+
+    rows = (await db.execute(q)).all()
+    out = []
+    for opp, oc, market, city in rows:
+        out.append({
+            "id": opp.id,
+            "detected_at": opp.detected_at.isoformat() if opp.detected_at else None,
+            "event_date": market.event_date.isoformat() if market.event_date else None,
+            "city": city.name,
+            "market": market.question,
+            "bucket": oc.bucket_label,
+            "side": opp.side,
+            "shares": opp.virtual_shares,
+            "entry_price": float(opp.virtual_entry_price) if opp.virtual_entry_price is not None else None,
+            "cost": float(opp.virtual_cost) if opp.virtual_cost is not None else None,
+            "payout": float(opp.virtual_payout) if opp.virtual_payout is not None else None,
+            "pnl": float(opp.virtual_pnl) if opp.virtual_pnl is not None else None,
+            "status": opp.virtual_status,
+            "outcome": opp.outcome,
+        })
+    return out
 
 
 @router.get("/opportunities")
@@ -384,12 +524,21 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "min_confidence_for_alert": settings.min_confidence_for_alert,
         "min_edge_for_alert": settings.min_edge_for_alert,
         "max_days_ahead_for_alert": settings.max_days_ahead_for_alert,
+        "min_confidence_alert_near": settings.min_confidence_alert_near,
+        "min_confidence_alert_far": settings.min_confidence_alert_far,
+        "min_confidence_buy_near": settings.min_confidence_buy_near,
+        "min_confidence_buy_far": settings.min_confidence_buy_far,
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
         "alert_dedup_minutes": settings.alert_dedup_minutes,
         "app_env": settings.app_env,
     }
+
+
+def _validate_unit(value: float, name: str) -> None:
+    if not (0.0 <= value <= 1.0):
+        raise HTTPException(400, f"{name} must be in [0.0, 1.0]")
 
 
 @router.patch("/settings")
@@ -406,10 +555,38 @@ async def admin_set_settings(payload: SettingsIn, _: str = Depends(require_admin
         if not (0 <= payload.max_days_ahead_for_alert <= 14):
             raise HTTPException(400, "max_days_ahead_for_alert must be 0-14")
         settings.max_days_ahead_for_alert = payload.max_days_ahead_for_alert
+    if payload.min_confidence_alert_near is not None:
+        _validate_unit(payload.min_confidence_alert_near, "min_confidence_alert_near")
+        settings.min_confidence_alert_near = payload.min_confidence_alert_near
+    if payload.min_confidence_alert_far is not None:
+        _validate_unit(payload.min_confidence_alert_far, "min_confidence_alert_far")
+        settings.min_confidence_alert_far = payload.min_confidence_alert_far
+    if payload.min_confidence_buy_near is not None:
+        _validate_unit(payload.min_confidence_buy_near, "min_confidence_buy_near")
+        settings.min_confidence_buy_near = payload.min_confidence_buy_near
+    if payload.min_confidence_buy_far is not None:
+        _validate_unit(payload.min_confidence_buy_far, "min_confidence_buy_far")
+        settings.min_confidence_buy_far = payload.min_confidence_buy_far
+    # Soft check: buy >= alert (we don't 400 on this since the detector clamps,
+    # but warn in the log to make config drift visible).
+    if settings.min_confidence_buy_near < settings.min_confidence_alert_near:
+        logger.warning(
+            f"min_confidence_buy_near ({settings.min_confidence_buy_near}) < "
+            f"min_confidence_alert_near ({settings.min_confidence_alert_near}); "
+            "buy will be clamped to alert at runtime."
+        )
+    if settings.min_confidence_buy_far < settings.min_confidence_alert_far:
+        logger.warning(
+            f"min_confidence_buy_far ({settings.min_confidence_buy_far}) < "
+            f"min_confidence_alert_far ({settings.min_confidence_alert_far}); "
+            "buy will be clamped to alert at runtime."
+        )
     logger.info(
         f"Admin updated thresholds: min_conf={settings.min_confidence_for_alert} "
         f"min_edge={settings.min_edge_for_alert} "
-        f"max_days_ahead={settings.max_days_ahead_for_alert}"
+        f"max_days_ahead={settings.max_days_ahead_for_alert} "
+        f"alert(near/far)={settings.min_confidence_alert_near}/{settings.min_confidence_alert_far} "
+        f"buy(near/far)={settings.min_confidence_buy_near}/{settings.min_confidence_buy_far}"
     )
     return {"ok": True}
 

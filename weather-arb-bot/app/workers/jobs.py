@@ -696,14 +696,52 @@ async def _send_resolution_alert(
         f"[Polymarket]({poly_url})",
         "",
     ]
+    total_pnl = 0.0
+    wins_n = 0
+    losses_n = 0
     for opp in opps:
         oc_res = await db.execute(select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id))
         oc = oc_res.scalar_one_or_none()
         label = oc.bucket_label if oc else f"outcome #{opp.outcome_id}"
         emoji = "✅" if opp.outcome == "WIN" else "❌"
-        lines.append(
-            f"{emoji} {label[:35]} {opp.side} @ {round(float(opp.market_price)*100)}¢ → {opp.outcome}"
-        )
+
+        # ── Display the ACTUAL price paid for the bet side (BUG FIX) ──────────
+        # Opportunity.market_price stores the YES mid price. For a NO bet the
+        # entry cost is 1 - YES_price, NOT the YES price itself. The previous
+        # code displayed YES price for both sides, making NO bets appear to
+        # have been bought at 20-40¢ when they were actually bought at 60-80¢.
+        # Prefer the stored per-share virtual entry price when present (it's
+        # the real ASK we'd have paid); otherwise derive from market_price.
+        if opp.virtual_entry_price is not None:
+            entry_cents = round(float(opp.virtual_entry_price) * 100)
+        else:
+            yes_price = float(opp.market_price)
+            side_price = (1.0 - yes_price) if opp.side == "NO" else yes_price
+            entry_cents = round(side_price * 100)
+
+        line = f"{emoji} {label[:35]} {opp.side} @ {entry_cents}¢ → {opp.outcome}"
+
+        # Append virtual P&L tail when this opportunity had a virtual position.
+        if opp.virtual_pnl is not None and opp.virtual_shares:
+            cost = float(opp.virtual_cost or 0.0)
+            payout = float(opp.virtual_payout or 0.0)
+            pnl = float(opp.virtual_pnl)
+            total_pnl += pnl
+            if opp.outcome == "WIN":
+                wins_n += 1
+            elif opp.outcome == "LOSS":
+                losses_n += 1
+            pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+            line += (
+                f" | {opp.virtual_shares} sh × {entry_cents}¢ = ${cost:.2f} cost "
+                f"→ payout ${payout:.2f} → {pnl_str} P&L"
+            )
+        lines.append(line)
+
+    if wins_n + losses_n > 0:
+        pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+        lines.append("")
+        lines.append(f"\U0001f4ca Day P&L: {pnl_str} ({wins_n} wins, {losses_n} losses)")
 
     text = "\n".join(lines)
     users_result = await db.execute(select(TelegramUser))
@@ -794,6 +832,19 @@ async def job_check_resolutions():
                 else:
                     opp.outcome = "WIN" if not bucket_won else "LOSS"
                 opp.closed_at = now
+
+                # Settle virtual position if one was opened at alert time.
+                if opp.virtual_status == "open" and opp.virtual_shares:
+                    cost = float(opp.virtual_cost or 0.0)
+                    if opp.outcome == "WIN":
+                        payout = float(opp.virtual_shares) * 1.00
+                        opp.virtual_payout = payout
+                        opp.virtual_status = "win"
+                    else:
+                        payout = 0.0
+                        opp.virtual_payout = payout
+                        opp.virtual_status = "loss"
+                    opp.virtual_pnl = payout - cost
             await db.commit()
 
             if opps:

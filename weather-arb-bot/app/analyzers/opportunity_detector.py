@@ -21,6 +21,27 @@ _poly_col = PolymarketCollector()
 # Liquidity gate: skip outcomes whose orderbook spread exceeds this. 10¢ = wide.
 MAX_BOOK_SPREAD = 0.10
 
+# Standard simulated buy size (per opportunity that clears the buy threshold).
+SHARES_PER_BUY = 5
+
+
+def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
+    """Return (alert_threshold, buy_threshold) in 0-1 range for the given lead.
+
+    near = days_ahead <= 1, far = days_ahead >= 2. If a split setting is
+    missing, falls back to ``min_confidence_for_alert / 100``.
+    """
+    fallback = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
+    if days_ahead is not None and days_ahead >= 2:
+        alert_t = getattr(settings, "min_confidence_alert_far", None) or fallback
+        buy_t = getattr(settings, "min_confidence_buy_far", None) or fallback
+    else:
+        alert_t = getattr(settings, "min_confidence_alert_near", None) or fallback
+        buy_t = getattr(settings, "min_confidence_buy_near", None) or fallback
+    # buy >= alert by definition (buy implies alert).
+    buy_t = max(buy_t, alert_t)
+    return alert_t, buy_t
+
 SKIP_QUESTION_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
 
 
@@ -183,11 +204,12 @@ async def _analyze_outcome(
 
     edge = certainty - entry_cost
 
-    min_certainty = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
-    if certainty < min_certainty:
+    alert_thresh, buy_thresh = _alert_and_buy_thresholds(days_ahead)
+    if certainty < alert_thresh:
         return None
     if edge < settings.min_edge_for_alert:
         return None
+    create_virtual_buy = certainty >= buy_thresh
 
     # ── Dedup: one opportunity per outcome+side per calendar day ──────────────────
     # Multi-day markets are re-evaluated each morning so forecasts can shift
@@ -208,6 +230,11 @@ async def _analyze_outcome(
     signals["_entry_cost"] = float(entry_cost)
     signals["_blend"] = breakdown
     signals["_prior_opportunity_id"] = prior_opp.id if prior_opp else None
+    # Surface threshold metadata for the formatter (so the alert can explain
+    # whether a virtual buy was made or not, and against which threshold).
+    signals["_alert_threshold"] = float(alert_thresh)
+    signals["_buy_threshold"] = float(buy_thresh)
+    signals["_create_virtual_buy"] = bool(create_virtual_buy)
 
     opp = Opportunity(
         outcome_id=outcome.id,
@@ -220,6 +247,14 @@ async def _analyze_outcome(
         signals=signals,
         alert_sent=False,
     )
+    if create_virtual_buy:
+        # Per-share entry price is the actual ASK we'd pay for the bet side:
+        # YES → book["ask"]; NO → 1 - book["bid"] (i.e. the NO ask).
+        # entry_cost above is already computed with this convention.
+        opp.virtual_shares = SHARES_PER_BUY
+        opp.virtual_entry_price = float(entry_cost)
+        opp.virtual_cost = float(SHARES_PER_BUY) * float(entry_cost)
+        opp.virtual_status = "open"
     db.add(opp)
     await db.commit()
     await db.refresh(opp)
