@@ -25,8 +25,20 @@ class Settings(BaseSettings):
     # Minimum directional certainty (in %) required to alert.
     # certainty = max(true_prob, 1 - true_prob). 80 means we need to be
     # at least 80% sure the bucket will (YES) or will not (NO) be the answer.
+    # NOTE: kept as backward-compat fallback. Prefer the 4 split thresholds below.
     min_confidence_for_alert: int = 80
     min_edge_for_alert: float = 0.15
+
+    # ── Split alert / virtual-buy thresholds (0.0–1.0) ──────────────────────────
+    # "near" = market resolves within 1 day (days_ahead <= 1)
+    # "far"  = market resolves 2+ days out (days_ahead >= 2)
+    # Alert thresholds control whether an opportunity becomes a Telegram alert.
+    min_confidence_alert_near: float = 0.75
+    min_confidence_alert_far: float = 0.80
+    # Virtual-buy thresholds control whether a simulated 5-share position is
+    # opened at alert time. Buy implies alert, so these must be >= alert thresholds.
+    min_confidence_buy_near: float = 0.90
+    min_confidence_buy_far: float = 0.90
     alert_dedup_minutes: int = 30
     # Only alert for markets resolving within this many days.
     # 0 = same-day only, 1 = today+tomorrow, 3 = default.

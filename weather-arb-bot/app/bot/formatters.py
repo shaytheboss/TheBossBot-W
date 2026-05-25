@@ -500,6 +500,30 @@ def fmt_opportunity(
         side_price_cents = round((1 - market_price if is_no else market_price) * 100)
         price_line = f"\U0001f4b0 Market {side} price: {side_price_cents}¢"
 
+    # ── Virtual buy section ─────────────────────────────────────────────────────
+    # Driven by the detector's `_create_virtual_buy` flag (truthful, since the
+    # actual Opportunity row may not yet be visible to the formatter caller).
+    virtual_section = ""
+    create_buy = signals.get("_create_virtual_buy")
+    buy_thresh = signals.get("_buy_threshold")
+    SHARES = 5
+    if entry_cost is not None and create_buy:
+        entry_cents_v = round(float(entry_cost) * 100)
+        cost_v = SHARES * float(entry_cost)
+        if_win_pnl = SHARES * 1.00 - cost_v
+        if_loss_pnl = -cost_v
+        virtual_section = (
+            f"\n\n\U0001f6d2 *Virtual buy*: {SHARES} shares × {entry_cents_v}¢ "
+            f"= ${cost_v:.2f} cost\n"
+            f"   If WIN: +${if_win_pnl:.2f} P&L  |  "
+            f"If LOSS: -${cost_v:.2f} P&L"
+        )
+    elif create_buy is False and buy_thresh is not None:
+        virtual_section = (
+            f"\n\n\U0001f6d2 *No virtual buy* (confidence {confidence}% below "
+            f"buy threshold {round(float(buy_thresh) * 100)}%)"
+        )
+
     # ── Bottom-line verbal verdict ──────────────────────────────────────────────
     bottom_line = _bottom_line(blend, bucket_min, bucket_max, side, is_c)
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
@@ -775,6 +799,7 @@ def fmt_opportunity(
         f"{price_line}\n"
         f"\U0001f9e0 Our P({side}) estimate: {side_prob_pct}%\n"
         f"\U0001f4c8 Edge vs ask: +{edge_pct}pp"
+        f"{virtual_section}"
         f"{bottom_line_section}\n\n"
         f"\U0001f4d0 *Forecast breakdown* ({fc_kind}{sigma_hint})\n"
         f"{breakdown_text}"
