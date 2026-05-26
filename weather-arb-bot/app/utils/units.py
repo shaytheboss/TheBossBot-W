@@ -3,6 +3,7 @@
 Used by:
 - app/workers/jobs.py to detect & normalise Celsius bucket labels at ingest time
 - app/bot/formatters.py to render dual-unit (°F + °C) display in alerts
+- app/analyzers/* to resolve effective bucket unit even before migration 005 runs
 """
 import re
 from typing import Optional
@@ -18,6 +19,24 @@ def is_celsius_bucket(label: Optional[str]) -> bool:
     if "°c" in lo or "celsius" in lo:
         return True
     return bool(_C_PATTERN.search(lo))
+
+
+def resolve_bucket_unit(outcome) -> str:
+    """Return the effective bucket unit ('C' or 'F') for an outcome.
+
+    The persisted `bucket_unit` column defaults to 'F'. When migration 005
+    hasn't run yet, or when an older outcome was ingested before bucket_unit
+    was wired up, the column may report 'F' even though `bucket_min` stores
+    native Celsius integers (parsed straight from a "°C" label).
+
+    Falling back to label inspection guarantees downstream code (probability
+    estimator, resolution, display) treats the bucket bounds in the unit
+    they were actually parsed in.
+    """
+    unit = (getattr(outcome, "bucket_unit", None) or "F").upper()
+    if unit != "C" and is_celsius_bucket(getattr(outcome, "bucket_label", None)):
+        return "C"
+    return unit
 
 
 def c_to_f(celsius: Optional[float]) -> Optional[int]:

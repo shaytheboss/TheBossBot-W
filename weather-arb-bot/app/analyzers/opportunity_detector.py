@@ -12,6 +12,7 @@ from app.config import settings
 from app.models.city import City
 from app.models.market import Market, MarketOutcome
 from app.models.opportunity import Opportunity
+from app.utils.units import resolve_bucket_unit
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,12 @@ async def _analyze_outcome(
     yes_entry_cost = yes_ask
     no_entry_cost = round(1.0 - yes_bid, 4)
 
-    bucket_unit = (getattr(outcome, "bucket_unit", None) or "F").upper()
+    # Defensive: when the bucket_unit column on the DB hasn't been backfilled
+    # by migration 005 yet, fall back to detecting Celsius from the label.
+    # Without this, native C integers (e.g. 29 for "29°C or higher") get fed
+    # into the estimator as Fahrenheit → P(>=29°F) ≈ 100% for any plausible
+    # forecast, producing spurious 1-6¢ virtual buys at "97% confidence".
+    bucket_unit = resolve_bucket_unit(outcome)
     true_prob, breakdown = estimate_with_breakdown(
         signals,
         outcome.bucket_min,

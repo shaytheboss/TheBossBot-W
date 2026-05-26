@@ -27,6 +27,7 @@ from app.collectors.pirep_collector import PirepCollector
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.analyzers.opportunity_detector import detect_opportunities
 from app.bot.telegram_bot import send_opportunity_alert
+from app.utils.units import resolve_bucket_unit
 from app.utils.polymarket_discovery import (
     build_all_candidates,
     extract_event_slug,
@@ -705,9 +706,9 @@ async def _send_resolution_alert(
     poly_url = f"https://polymarket.com/event/{market.external_id}"
 
     # Show dual-unit actual high when this market has any Celsius outcomes.
-    has_c_bucket = any(
-        (getattr(o, "bucket_unit", "F") or "F").upper() == "C" for o in outcomes
-    )
+    # Use label-based fallback so we still flag dual-unit if the column hasn't
+    # been backfilled by migration 005.
+    has_c_bucket = any(resolve_bucket_unit(o) == "C" for o in outcomes)
     if has_c_bucket:
         actual_c = (actual_high_f - 32.0) * 5.0 / 9.0
         actual_str = f"*{actual_high_f}°F / {actual_c:.1f}°C*"
@@ -816,7 +817,9 @@ async def job_check_resolutions():
             winning_outcome_ids: set = set()
             for outcome in outcomes:
                 bn, bx = outcome.bucket_min, outcome.bucket_max
-                unit = (getattr(outcome, "bucket_unit", "F") or "F").upper()
+                # Use label-based fallback so we resolve in the correct unit
+                # even when migration 005 hasn't run on this DB yet.
+                unit = resolve_bucket_unit(outcome)
                 actual_in_unit = actual_high_c if unit == "C" else actual_high_f
                 if bn is not None and bx is not None:
                     if bn <= actual_in_unit < bx + 1:
