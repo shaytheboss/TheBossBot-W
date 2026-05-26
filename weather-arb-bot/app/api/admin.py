@@ -54,7 +54,6 @@ class SettingsIn(BaseModel):
     min_confidence_for_alert: Optional[int] = None
     min_edge_for_alert: Optional[float] = None
     max_days_ahead_for_alert: Optional[int] = None
-    # Split alert / buy thresholds (0.0–1.0).
     min_confidence_alert_near: Optional[float] = None
     min_confidence_alert_far: Optional[float] = None
     min_confidence_buy_near: Optional[float] = None
@@ -122,7 +121,6 @@ async def admin_seed(_: str = Depends(require_admin)):
 
 @router.post("/discover")
 async def admin_discover(_: str = Depends(require_admin)):
-    """Trigger Polymarket market discovery immediately. Returns the run stats."""
     from app.workers.jobs import job_discover_markets
     stats = await job_discover_markets(notify=False)
     return {"ok": True, **stats}
@@ -194,10 +192,8 @@ async def admin_stats(
     to_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD; exclusive upper"),
     city_id: Optional[int] = Query(default=None),
 ):
-    # Build common WHERE for Opportunity-based aggregates.
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
-    # Make to_date inclusive of the whole day.
     to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
 
     def opp_q(base):
@@ -239,7 +235,6 @@ async def admin_stats(
 
     win_rate = round(wins / max(wins + losses, 1) * 100, 1)
 
-    # ── Virtual position aggregates (filtered) ──────────────────────────────
     positions_opened = (await db.execute(
         opp_q(select(func.count(Opportunity.id)))
         .where(Opportunity.virtual_shares != None)
@@ -319,7 +314,6 @@ async def admin_positions(
     city_id: Optional[int] = Query(default=None),
     limit: int = Query(default=200, le=1000),
 ):
-    """List virtual positions (opportunities with a virtual buy) for the filter."""
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
     to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
@@ -414,6 +408,39 @@ async def admin_opportunities(
     return out
 
 
+@router.get("/opportunities/{opp_id}/alert")
+async def admin_opportunity_alert(
+    opp_id: int,
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the full Telegram alert text for an opportunity.
+
+    The text is the same message that was sent to users at detection time,
+    so this is effectively the audit trail for why the opportunity was
+    flagged.
+    """
+    opp = (await db.execute(
+        select(Opportunity).where(Opportunity.id == opp_id)
+    )).scalar_one_or_none()
+    if not opp:
+        raise HTTPException(404, "Opportunity not found")
+
+    alert = (await db.execute(
+        select(Alert)
+        .where(Alert.opportunity_id == opp_id)
+        .order_by(desc(Alert.sent_at))
+        .limit(1)
+    )).scalar_one_or_none()
+
+    return {
+        "opportunity_id": opp_id,
+        "message_text": alert.message_text if alert else None,
+        "sent_at": alert.sent_at.isoformat() if alert and alert.sent_at else None,
+        "alert_sent": opp.alert_sent,
+    }
+
+
 @router.get("/cities")
 async def admin_cities(_: str = Depends(require_admin), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(City).order_by(City.name))).scalars().all()
@@ -446,7 +473,6 @@ async def admin_city_create(
     if payload.get("reference_icao"):
         payload["reference_icao"] = payload["reference_icao"].strip().upper()
 
-    # Validate ICAO lengths before hitting the DB String(4) column constraint.
     if len(payload["primary_icao"]) > 4:
         raise HTTPException(
             400,
@@ -567,8 +593,6 @@ async def admin_set_settings(payload: SettingsIn, _: str = Depends(require_admin
     if payload.min_confidence_buy_far is not None:
         _validate_unit(payload.min_confidence_buy_far, "min_confidence_buy_far")
         settings.min_confidence_buy_far = payload.min_confidence_buy_far
-    # Soft check: buy >= alert (we don't 400 on this since the detector clamps,
-    # but warn in the log to make config drift visible).
     if settings.min_confidence_buy_near < settings.min_confidence_alert_near:
         logger.warning(
             f"min_confidence_buy_near ({settings.min_confidence_buy_near}) < "
@@ -601,8 +625,8 @@ async def admin_logs(
 
 
 class DataPruneRequest(BaseModel):
-    before_date: str          # ISO date string "YYYY-MM-DD"
-    tables: List[str]         # which tables to prune: "opportunities", "all"
+    before_date: str
+    tables: List[str]
 
 
 @router.delete("/data/prune")
@@ -611,11 +635,6 @@ async def admin_prune_data(
     _: str = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Permanently delete historical records created before a given date.
-
-    ``tables`` may contain ``"opportunities"``, ``"alerts"``, or ``"all"``
-    (which deletes both opportunities and alerts before the cutoff).
-    """
     try:
         cutoff = datetime.fromisoformat(req.before_date).replace(tzinfo=timezone.utc)
     except ValueError:
@@ -625,7 +644,6 @@ async def admin_prune_data(
     want_alerts = "alerts" in req.tables or "all" in req.tables
     deleted: dict = {}
 
-    # Delete alerts first (FK references opportunities)
     if want_alerts:
         result = await db.execute(
             delete(Alert).where(Alert.sent_at < cutoff)
