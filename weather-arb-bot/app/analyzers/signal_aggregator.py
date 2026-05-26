@@ -1,4 +1,5 @@
 import logging
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -11,6 +12,30 @@ from app.models.pirep import Pirep
 from app.models.market import MarketPrice, MarketOutcome
 
 logger = logging.getLogger(__name__)
+
+
+def _c_bucket_to_f_int_range(
+    bmin_c: Optional[int], bmax_c: Optional[int]
+) -> tuple[Optional[int], Optional[int]]:
+    """Return the integer-°F approximation of a Celsius bucket for display.
+
+    For "32°C" (covers [32, 33)°C = [89.6, 91.4)°F): the integer F readings
+    inside are {90, 91}. Returns (90, 91). Used by the formatter to render
+    a meaningful "32°C (= 90–91°F)" hint.
+    """
+    if bmin_c is None and bmax_c is None:
+        return None, None
+    if bmin_c is not None:
+        lo_exact = bmin_c * 9 / 5 + 32
+        f_lo = math.ceil(lo_exact)
+    else:
+        f_lo = None
+    if bmax_c is not None:
+        hi_exclusive = (bmax_c + 1) * 9 / 5 + 32
+        f_hi = math.ceil(hi_exclusive) - 1
+    else:
+        f_hi = None
+    return f_lo, f_hi
 
 
 class SignalAggregator:
@@ -37,10 +62,23 @@ class SignalAggregator:
         signals["pireps"] = await self._recent_pireps(db, primary_icao, hours=2)
         signals["market_price"] = await self._latest_price(db, outcome.id)
         signals["price_trend"] = await self._price_trend(db, outcome.id, minutes=60)
-        # Metadata for formatter / estimator
         signals["is_low_market"] = is_low_market
-        signals["_bucket_min"] = outcome.bucket_min
-        signals["_bucket_max"] = outcome.bucket_max
+
+        bucket_unit = (getattr(outcome, "bucket_unit", None) or "F").upper()
+        signals["_bucket_unit"] = bucket_unit
+        signals["_bucket_native_min"] = outcome.bucket_min
+        signals["_bucket_native_max"] = outcome.bucket_max
+
+        # `_bucket_min`/`_bucket_max` are the F-equivalent integer range, used
+        # by the formatter for legacy display logic ("well above 80-81°F").
+        if bucket_unit == "C":
+            f_lo, f_hi = _c_bucket_to_f_int_range(outcome.bucket_min, outcome.bucket_max)
+            signals["_bucket_min"] = f_lo
+            signals["_bucket_max"] = f_hi
+        else:
+            signals["_bucket_min"] = outcome.bucket_min
+            signals["_bucket_max"] = outcome.bucket_max
+
         signals["city_lat"] = city_lat
         signals["city_lon"] = city_lon
         return signals
@@ -111,9 +149,7 @@ class SignalAggregator:
                       "mean_high_f", "mean_low_f",
                       "p10_high_f", "p25_high_f", "p50_high_f", "p75_high_f", "p90_high_f",
                       "p10_low_f", "p25_low_f", "p50_low_f", "p75_low_f", "p90_low_f",
-                      # API-returned coordinates (for coordinate display in alerts)
                       "used_lat", "used_lon",
-                      # NWS grid identifiers
                       "grid_id", "grid_x", "grid_y"):
                 if k in row.raw_data:
                     out[k] = row.raw_data[k]

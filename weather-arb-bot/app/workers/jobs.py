@@ -50,7 +50,6 @@ pirep_col = PirepCollector()
 poly_col = PolymarketCollector()
 
 FORECAST_DAYS_AHEAD = 7
-# External rate-limited APIs only fetched 3 days ahead to conserve quota.
 EXTERNAL_FORECAST_DAYS = 3
 DISCOVERY_CONCURRENCY = 3
 
@@ -134,12 +133,29 @@ def _extract_icao_from_description(desc: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
-def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
+def _is_celsius_bucket(label: str) -> bool:
+    lo = label.lower()
+    if "°c" in lo or "celsius" in lo:
+        return True
+    if re.search(r"\d\s*c(?:\s|$|or\b|/)", lo):
+        return True
+    return False
+
+
+def _parse_temp_range_unit(text: str, is_c: bool) -> tuple[Optional[int], Optional[int]]:
+    """Parse a bucket label to (bmin, bmax) in NATIVE unit.
+
+    For Celsius: single-value labels like "32°C" return (32, 32) so the
+    resolution range [bmin, bmax+1) = [32, 33)°C is exactly 1 degree wide.
+    For Fahrenheit single-value labels we keep the legacy (v, v+1) behaviour
+    so existing F data — which was stored that way — continues to resolve
+    consistently.
+    """
     if not text:
         return None, None
     t = text.lower().replace("°", "").strip()
 
-    m = re.search(r"(\d+)\s*(?:-|to)\s*(\d+)\s*[fc]?", t)
+    m = re.search(r"(\d+)\s*(?:-|to|–)\s*(\d+)\s*[fc]?", t)
     if m:
         return int(m.group(1)), int(m.group(2))
 
@@ -166,32 +182,22 @@ def _parse_temp_range(text: str) -> tuple[Optional[int], Optional[int]]:
     nums = re.findall(r"\d+", t)
     if nums:
         v = int(nums[0])
+        if is_c:
+            return v, v
         return v, v + 1
 
     return None, None
 
 
-def _is_celsius_bucket(label: str) -> bool:
-    lo = label.lower()
-    if "°c" in lo:
-        return True
-    if re.search(r"\d\s*c(?:\s|$|or\b|/)", lo):
-        return True
-    return False
+def _parse_bucket(label: str) -> tuple[Optional[int], Optional[int], str]:
+    """Return (bucket_min, bucket_max, bucket_unit) in NATIVE units.
 
-
-def _c_to_f(celsius: Optional[int]) -> Optional[int]:
-    if celsius is None:
-        return None
-    return round(celsius * 9 / 5 + 32)
-
-
-def _parse_bucket(label: str) -> tuple[Optional[int], Optional[int]]:
-    bmin, bmax = _parse_temp_range(label)
-    if _is_celsius_bucket(label):
-        bmin = _c_to_f(bmin)
-        bmax = _c_to_f(bmax)
-    return bmin, bmax
+    bucket_unit is 'C' or 'F'. Native means no F↔C conversion is performed
+    — the values are integers expressed in whichever unit the label uses.
+    """
+    is_c = _is_celsius_bucket(label)
+    bmin, bmax = _parse_temp_range_unit(label, is_c)
+    return bmin, bmax, ("C" if is_c else "F")
 
 
 async def _refresh_outcome_bounds(db: AsyncSession, market: Market, raw_markets: list) -> int:
@@ -210,17 +216,23 @@ async def _refresh_outcome_bounds(db: AsyncSession, market: Market, raw_markets:
         if target is None:
             continue
 
-        bmin, bmax = _parse_bucket(gtitle)
+        bmin, bmax, unit = _parse_bucket(gtitle)
         if bmin is None and bmax is None:
-            bmin, bmax = _parse_bucket(question)
+            bmin, bmax, unit = _parse_bucket(question)
 
-        if target.bucket_min != bmin or target.bucket_max != bmax:
+        if (
+            target.bucket_min != bmin
+            or target.bucket_max != bmax
+            or (getattr(target, "bucket_unit", "F") or "F") != unit
+        ):
             logger.info(
                 f"REFRESH outcome id={target.id} label={bucket_label!r} "
-                f"({target.bucket_min},{target.bucket_max}) → ({bmin},{bmax})"
+                f"({target.bucket_min},{target.bucket_max},{getattr(target, 'bucket_unit', 'F')}) "
+                f"→ ({bmin},{bmax},{unit})"
             )
             target.bucket_min = bmin
             target.bucket_max = bmax
+            target.bucket_unit = unit
             updated += 1
 
     if updated:
@@ -278,9 +290,9 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> tuple[int,
         question = (m.get("question") or "").strip()
         bucket_label = gtitle or question[:50] or "unknown"
 
-        bucket_min, bucket_max = _parse_bucket(gtitle)
+        bucket_min, bucket_max, bucket_unit = _parse_bucket(gtitle)
         if bucket_min is None and bucket_max is None:
-            bucket_min, bucket_max = _parse_bucket(question)
+            bucket_min, bucket_max, bucket_unit = _parse_bucket(question)
 
         token_id: Optional[str] = None
         for token in m.get("tokens", []) or []:
@@ -301,6 +313,7 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> tuple[int,
             bucket_label=bucket_label[:100],
             bucket_min=bucket_min,
             bucket_max=bucket_max,
+            bucket_unit=bucket_unit,
             token_id=token_id,
         )
         db.add(outcome)
@@ -668,7 +681,8 @@ async def job_run_analyzer():
 
 
 async def _send_resolution_alert(
-    city: City, market: Market, actual_high_f: float, opps: list, winning_outcome_ids: set, db
+    city: City, market: Market, actual_high_f: float, opps: list, winning_outcome_ids: set, db,
+    outcomes: list,
 ) -> None:
     from app.models.alert import TelegramUser
     from telegram import Bot
@@ -689,10 +703,21 @@ async def _send_resolution_alert(
         header = "\U0001f91d *Resolution PUSH*"
 
     poly_url = f"https://polymarket.com/event/{market.external_id}"
+
+    # Show dual-unit actual high when this market has any Celsius outcomes.
+    has_c_bucket = any(
+        (getattr(o, "bucket_unit", "F") or "F").upper() == "C" for o in outcomes
+    )
+    if has_c_bucket:
+        actual_c = (actual_high_f - 32.0) * 5.0 / 9.0
+        actual_str = f"*{actual_high_f}°F / {actual_c:.1f}°C*"
+    else:
+        actual_str = f"*{actual_high_f}°F*"
+
     lines = [
         header,
         f"\U0001f4cd {city.name} (`{city.primary_icao}`) — {market.event_date.strftime('%b %d, %Y')}",
-        f"\U0001f321️ Actual high: *{actual_high_f}°F*",
+        f"\U0001f321️ Actual high: {actual_str}",
         f"[Polymarket]({poly_url})",
         "",
     ]
@@ -705,13 +730,6 @@ async def _send_resolution_alert(
         label = oc.bucket_label if oc else f"outcome #{opp.outcome_id}"
         emoji = "✅" if opp.outcome == "WIN" else "❌"
 
-        # ── Display the ACTUAL price paid for the bet side (BUG FIX) ──────────
-        # Opportunity.market_price stores the YES mid price. For a NO bet the
-        # entry cost is 1 - YES_price, NOT the YES price itself. The previous
-        # code displayed YES price for both sides, making NO bets appear to
-        # have been bought at 20-40¢ when they were actually bought at 60-80¢.
-        # Prefer the stored per-share virtual entry price when present (it's
-        # the real ASK we'd have paid); otherwise derive from market_price.
         if opp.virtual_entry_price is not None:
             entry_cents = round(float(opp.virtual_entry_price) * 100)
         else:
@@ -721,7 +739,6 @@ async def _send_resolution_alert(
 
         line = f"{emoji} {label[:35]} {opp.side} @ {entry_cents}¢ → {opp.outcome}"
 
-        # Append virtual P&L tail when this opportunity had a virtual position.
         if opp.virtual_pnl is not None and opp.virtual_shares:
             cost = float(opp.virtual_cost or 0.0)
             payout = float(opp.virtual_payout or 0.0)
@@ -790,6 +807,7 @@ async def job_check_resolutions():
             if actual_high_raw is None:
                 continue
             actual_high_f = float(actual_high_raw)
+            actual_high_c = (actual_high_f - 32.0) * 5.0 / 9.0
 
             outcomes_result = await db.execute(
                 select(MarketOutcome).where(MarketOutcome.market_id == market.id)
@@ -798,17 +816,16 @@ async def job_check_resolutions():
             winning_outcome_ids: set = set()
             for outcome in outcomes:
                 bn, bx = outcome.bucket_min, outcome.bucket_max
+                unit = (getattr(outcome, "bucket_unit", "F") or "F").upper()
+                actual_in_unit = actual_high_c if unit == "C" else actual_high_f
                 if bn is not None and bx is not None:
-                    # Polymarket resolves "80-81°F" as any reading in [80.0, 82.0°F).
-                    # The bucket label covers integers bn through bx inclusive, so
-                    # the upper exclusive bound is bx+1.
-                    if bn <= actual_high_f < bx + 1:
+                    if bn <= actual_in_unit < bx + 1:
                         winning_outcome_ids.add(outcome.id)
                 elif bn is not None and bx is None:
-                    if actual_high_f >= bn:
+                    if actual_in_unit >= bn:
                         winning_outcome_ids.add(outcome.id)
                 elif bn is None and bx is not None:
-                    if actual_high_f <= bx:
+                    if actual_in_unit <= bx:
                         winning_outcome_ids.add(outcome.id)
 
             market.resolved = True
@@ -833,7 +850,6 @@ async def job_check_resolutions():
                     opp.outcome = "WIN" if not bucket_won else "LOSS"
                 opp.closed_at = now
 
-                # Settle virtual position if one was opened at alert time.
                 if opp.virtual_status == "open" and opp.virtual_shares:
                     cost = float(opp.virtual_cost or 0.0)
                     if opp.outcome == "WIN":
@@ -849,6 +865,8 @@ async def job_check_resolutions():
 
             if opps:
                 try:
-                    await _send_resolution_alert(city, market, actual_high_f, opps, winning_outcome_ids, db)
+                    await _send_resolution_alert(
+                        city, market, actual_high_f, opps, winning_outcome_ids, db, outcomes
+                    )
                 except Exception as e:
                     logger.error(f"Failed to send resolution alert for {market.external_id}: {e}")
