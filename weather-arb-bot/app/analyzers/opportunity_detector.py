@@ -18,19 +18,12 @@ logger = logging.getLogger(__name__)
 aggregator = SignalAggregator()
 _poly_col = PolymarketCollector()
 
-# Liquidity gate: skip outcomes whose orderbook spread exceeds this. 10¢ = wide.
 MAX_BOOK_SPREAD = 0.10
 
-# Standard simulated buy size (per opportunity that clears the buy threshold).
 SHARES_PER_BUY = 5
 
 
 def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
-    """Return (alert_threshold, buy_threshold) in 0-1 range for the given lead.
-
-    near = days_ahead <= 1, far = days_ahead >= 2. If a split setting is
-    missing, falls back to ``min_confidence_for_alert / 100``.
-    """
     fallback = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
     if days_ahead is not None and days_ahead >= 2:
         alert_t = getattr(settings, "min_confidence_alert_far", None) or fallback
@@ -38,7 +31,6 @@ def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
     else:
         alert_t = getattr(settings, "min_confidence_alert_near", None) or fallback
         buy_t = getattr(settings, "min_confidence_buy_near", None) or fallback
-    # buy >= alert by definition (buy implies alert).
     buy_t = max(buy_t, alert_t)
     return alert_t, buy_t
 
@@ -53,12 +45,6 @@ def _should_skip_market(question: Optional[str]) -> bool:
 
 
 async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -> bool:
-    """True if we already created an opportunity for this outcome+side today.
-
-    Using a per-calendar-day window (not a permanent block) lets multi-day markets
-    be re-evaluated each morning as the forecast updates, while still preventing
-    duplicate alerts within the same day.
-    """
     today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
     q = await db.execute(
         select(Opportunity.id).where(
@@ -73,11 +59,6 @@ async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -
 async def _get_prior_opportunity(
     db: AsyncSession, outcome_id: int, side: str
 ) -> Optional[Opportunity]:
-    """Return the most recent prior Opportunity for this (outcome_id, side), if any.
-
-    Looks across all time (not just today) so UPDATE messages can reference
-    the previous alert even for markets detected on a prior day.
-    """
     result = await db.execute(
         select(Opportunity)
         .where(Opportunity.outcome_id == outcome_id)
@@ -102,7 +83,6 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
 
         days_ahead = (market.event_date - date.today()).days
         if days_ahead < 0:
-            # Already past; resolution job will mark it resolved.
             continue
         if days_ahead > settings.max_days_ahead_for_alert:
             continue
@@ -165,7 +145,6 @@ async def _analyze_outcome(
     if not price_info:
         return None
 
-    # ── Liquidity gate ──────────────────────────────────────────────────
     book = None
     if outcome.token_id:
         book = await _poly_col.get_book_summary(outcome.token_id)
@@ -188,9 +167,13 @@ async def _analyze_outcome(
     yes_entry_cost = yes_ask
     no_entry_cost = round(1.0 - yes_bid, 4)
 
-    # ── Probability + breakdown ──────────────────────────────────────────────────
+    bucket_unit = (getattr(outcome, "bucket_unit", None) or "F").upper()
     true_prob, breakdown = estimate_with_breakdown(
-        signals, outcome.bucket_min, outcome.bucket_max, days_ahead=days_ahead
+        signals,
+        outcome.bucket_min,
+        outcome.bucket_max,
+        days_ahead=days_ahead,
+        bucket_unit=bucket_unit,
     )
 
     if true_prob >= 0.5:
@@ -211,27 +194,16 @@ async def _analyze_outcome(
         return None
     create_virtual_buy = certainty >= buy_thresh
 
-    # ── Dedup: one opportunity per outcome+side per calendar day ──────────────────
-    # Multi-day markets are re-evaluated each morning so forecasts can shift
-    # the recommendation. Same-day markets alert at most once.
     if await _has_opportunity_today(db, outcome.id, side):
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} side={side} today")
         return None
 
-    # Look up any prior opportunity for this (outcome, side) so the formatter
-    # can generate an UPDATE message. We do this after dedup so we only reach
-    # here if there's no existing opportunity *today* — any match here is from
-    # a prior day.
     prior_opp = await _get_prior_opportunity(db, outcome.id, side)
-    # If prior_opp exists and was created today it would have been caught by
-    # _has_opportunity_today above, so any match here is genuinely from a prior period.
 
     signals["_book"] = book
     signals["_entry_cost"] = float(entry_cost)
     signals["_blend"] = breakdown
     signals["_prior_opportunity_id"] = prior_opp.id if prior_opp else None
-    # Surface threshold metadata for the formatter (so the alert can explain
-    # whether a virtual buy was made or not, and against which threshold).
     signals["_alert_threshold"] = float(alert_thresh)
     signals["_buy_threshold"] = float(buy_thresh)
     signals["_create_virtual_buy"] = bool(create_virtual_buy)
@@ -248,9 +220,6 @@ async def _analyze_outcome(
         alert_sent=False,
     )
     if create_virtual_buy:
-        # Per-share entry price is the actual ASK we'd pay for the bet side:
-        # YES → book["ask"]; NO → 1 - book["bid"] (i.e. the NO ask).
-        # entry_cost above is already computed with this convention.
         opp.virtual_shares = SHARES_PER_BUY
         opp.virtual_entry_price = float(entry_cost)
         opp.virtual_cost = float(SHARES_PER_BUY) * float(entry_cost)
