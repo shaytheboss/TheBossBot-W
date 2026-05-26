@@ -10,6 +10,7 @@ from app.models.metar import MetarObservation
 from app.models.forecast import Forecast
 from app.models.pirep import Pirep
 from app.models.market import MarketPrice, MarketOutcome
+from app.utils.units import resolve_bucket_unit
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,9 @@ class SignalAggregator:
         signals["price_trend"] = await self._price_trend(db, outcome.id, minutes=60)
         signals["is_low_market"] = is_low_market
 
-        bucket_unit = (getattr(outcome, "bucket_unit", None) or "F").upper()
+        # Defensive: fall back to label inspection when the persisted
+        # bucket_unit column hasn't been backfilled by migration 005 yet.
+        bucket_unit = resolve_bucket_unit(outcome)
         signals["_bucket_unit"] = bucket_unit
         signals["_bucket_native_min"] = outcome.bucket_min
         signals["_bucket_native_max"] = outcome.bucket_max
