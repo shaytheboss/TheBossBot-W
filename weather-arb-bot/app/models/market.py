@@ -34,7 +34,11 @@ class MarketOutcome(Base):
     bucket_label = Column(String(50), nullable=False)
     bucket_min = Column(Integer)
     bucket_max = Column(Integer)
-    token_id = Column(String(100))  # Polymarket CLOB YES-token ID for price fetching
+    # 'F' or 'C'. For 'C' buckets bucket_min/bucket_max are native Celsius
+    # integers (e.g. "32°C" → (32, 32)). For 'F' the legacy convention
+    # holds: range covered is [bucket_min, bucket_max + 1).
+    bucket_unit = Column(String(1), nullable=False, default="F")
+    token_id = Column(String(100))
 
     market = relationship("Market", back_populates="outcomes")
     prices = relationship("MarketPrice", back_populates="outcome")
