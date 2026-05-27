@@ -22,6 +22,11 @@
   th, td { text-align:left; padding:8px 10px; border-bottom: 1px solid var(--border); vertical-align:middle; }
   th { color: var(--mute); font-weight:500; font-size:11px; text-transform:uppercase; }
   tr:hover td { background: rgba(255,255,255,0.02); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--fg); }
+  th.sortable::after { content: ' ⇅'; opacity: 0.35; font-size:10px; }
+  th.sortable.sorted-asc::after { content: ' ▲'; opacity: 1; color: var(--accent); }
+  th.sortable.sorted-desc::after { content: ' ▼'; opacity: 1; color: var(--accent); }
   .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
   .pill.win { background: rgba(63,185,80,0.15); color: var(--win); }
   .pill.loss { background: rgba(248,81,73,0.15); color: var(--loss); }
@@ -130,12 +135,22 @@
         </label>
         <button class="btn primary" onclick="loadPositions()">Apply Filter</button>
         <button class="btn" onclick="resetPosFilter()">Reset</button>
+        <button class="btn primary" onclick="resolvePending(this)" title="Run resolution on past markets whose virtual positions never closed">🔄 Resolve pending</button>
+        <span id="resolveStatus" class="small"></span>
       </div>
-      <table>
+      <table id="positionsTable">
         <thead><tr>
-          <th>Detected</th><th>Event date</th><th>City</th><th>Bucket</th>
-          <th>Side</th><th>Shares</th><th>Entry</th><th>Cost</th>
-          <th>Payout</th><th>P&amp;L</th><th>Status</th>
+          <th data-sort-key="detected_at" data-sort-type="date">Detected</th>
+          <th data-sort-key="event_date" data-sort-type="date">Event date</th>
+          <th data-sort-key="city" data-sort-type="str">City</th>
+          <th data-sort-key="bucket" data-sort-type="str">Bucket</th>
+          <th data-sort-key="side" data-sort-type="str">Side</th>
+          <th data-sort-key="shares" data-sort-type="num">Shares</th>
+          <th data-sort-key="entry_price" data-sort-type="num">Entry</th>
+          <th data-sort-key="cost" data-sort-type="num">Cost</th>
+          <th data-sort-key="payout" data-sort-type="num">Payout</th>
+          <th data-sort-key="pnl" data-sort-type="num">P&amp;L</th>
+          <th data-sort-key="status" data-sort-type="str">Status</th>
         </tr></thead>
         <tbody id="positionsBody"></tbody>
       </table>
@@ -151,9 +166,22 @@
         </select>
         <button class="btn" onclick="loadOpps()">Refresh</button>
       </div>
-      <table>
-        <thead><tr><th>Detected</th><th>City</th><th>Date</th><th>Bucket</th><th>Side</th>
-          <th>Price</th><th>Est P(side)</th><th>Edge</th><th>Conf</th><th>Alert</th><th>Outcome</th><th>Link</th><th>Details</th></tr></thead>
+      <table id="oppsTable">
+        <thead><tr>
+          <th data-sort-key="detected_at" data-sort-type="date">Detected</th>
+          <th data-sort-key="city" data-sort-type="str">City</th>
+          <th data-sort-key="event_date" data-sort-type="date">Date</th>
+          <th data-sort-key="bucket" data-sort-type="str">Bucket</th>
+          <th data-sort-key="side" data-sort-type="str">Side</th>
+          <th data-sort-key="_display_price" data-sort-type="num">Price</th>
+          <th data-sort-key="_display_prob" data-sort-type="num">Est P(side)</th>
+          <th data-sort-key="edge" data-sort-type="num">Edge</th>
+          <th data-sort-key="confidence" data-sort-type="num">Conf</th>
+          <th data-sort-key="alert_sent" data-sort-type="num">Alert</th>
+          <th data-sort-key="outcome" data-sort-type="str">Outcome</th>
+          <th>Link</th>
+          <th>Details</th>
+        </tr></thead>
         <tbody id="oppsBody"></tbody>
       </table>
     </section>
@@ -259,6 +287,87 @@
 <script>
 const api = (path, opts={}) => fetch('/api/admin' + path, { credentials: 'same-origin', ...opts });
 let logsTimer = null;
+
+// --- Client-side table sorting -------------------------------------------------
+// Each sortable table is identified by its <tbody> id. We cache the rows array
+// from the last API fetch, register a render function, and re-render after sort.
+const _tableCache = {};
+const _tableRenderers = {};
+const _sortState = {};
+
+function setupSortableTable(tbodyId, defaultSort) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  const table = tbody.closest('table');
+  if (!table || table.dataset.sortInit === '1') {
+    if (!_sortState[tbodyId] && defaultSort) _sortState[tbodyId] = {...defaultSort};
+    return;
+  }
+  table.dataset.sortInit = '1';
+  if (!_sortState[tbodyId] && defaultSort) _sortState[tbodyId] = {...defaultSort};
+  const ths = table.querySelectorAll('thead th[data-sort-key]');
+  ths.forEach(th => {
+    th.classList.add('sortable');
+    th.addEventListener('click', () => {
+      const key = th.dataset.sortKey;
+      const type = th.dataset.sortType || 'str';
+      const cur = _sortState[tbodyId];
+      let dir = 'asc';
+      if (cur && cur.key === key && cur.dir === 'asc') dir = 'desc';
+      _sortState[tbodyId] = { key, dir, type };
+      _rerenderTable(tbodyId);
+    });
+  });
+}
+
+function _applySort(rows, state) {
+  if (!state) return rows;
+  const { key, dir, type } = state;
+  const factor = dir === 'asc' ? 1 : -1;
+  const cmp = (a, b) => {
+    let va = a[key]; let vb = b[key];
+    const aNull = va == null || va === '';
+    const bNull = vb == null || vb === '';
+    if (aNull && bNull) return 0;
+    if (aNull) return 1;       // nulls sorted last regardless of direction
+    if (bNull) return -1;
+    if (type === 'num') return (Number(va) - Number(vb)) * factor;
+    if (type === 'date') return (new Date(va) - new Date(vb)) * factor;
+    return String(va).localeCompare(String(vb)) * factor;
+  };
+  return [...rows].sort(cmp);
+}
+
+function _updateSortIndicators(tbodyId) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  const table = tbody.closest('table');
+  if (!table) return;
+  const state = _sortState[tbodyId];
+  table.querySelectorAll('thead th[data-sort-key]').forEach(th => {
+    th.classList.remove('sorted-asc', 'sorted-desc');
+    if (state && th.dataset.sortKey === state.key) {
+      th.classList.add(state.dir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+    }
+  });
+}
+
+function _rerenderTable(tbodyId) {
+  const renderer = _tableRenderers[tbodyId];
+  if (!renderer) return;
+  const rows = _tableCache[tbodyId] || [];
+  const sorted = _applySort(rows, _sortState[tbodyId]);
+  renderer(sorted);
+  _updateSortIndicators(tbodyId);
+}
+
+function _registerTable(tbodyId, rows, renderer, defaultSort) {
+  _tableCache[tbodyId] = rows;
+  _tableRenderers[tbodyId] = renderer;
+  setupSortableTable(tbodyId, defaultSort);
+  _rerenderTable(tbodyId);
+}
+// ------------------------------------------------------------------------------
 
 async function init() {
   const r = await api('/me');
@@ -393,18 +502,7 @@ function resetPosFilter() {
   loadPositions();
 }
 
-async function loadPositions() {
-  await ensureCitiesLoaded();
-  _initFilterDefaults('posFrom', 'posTo');
-  const p = new URLSearchParams();
-  const f = document.getElementById('posFrom').value;
-  const t = document.getElementById('posTo').value;
-  const c = document.getElementById('posCity').value;
-  if (f) p.set('from_date', f);
-  if (t) p.set('to_date', t);
-  if (c) p.set('city_id', c);
-  const r = await api('/positions?' + p); if (!r.ok) return;
-  const rows = await r.json();
+function _renderPositions(rows) {
   const fmtMoney = v => (v == null ? '—' : (v >= 0 ? '$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)));
   document.getElementById('positionsBody').innerHTML = rows.map(o => `
     <tr>
@@ -423,10 +521,71 @@ async function loadPositions() {
   `).join('');
 }
 
+async function loadPositions() {
+  await ensureCitiesLoaded();
+  _initFilterDefaults('posFrom', 'posTo');
+  const p = new URLSearchParams();
+  const f = document.getElementById('posFrom').value;
+  const t = document.getElementById('posTo').value;
+  const c = document.getElementById('posCity').value;
+  if (f) p.set('from_date', f);
+  if (t) p.set('to_date', t);
+  if (c) p.set('city_id', c);
+  const r = await api('/positions?' + p); if (!r.ok) return;
+  const rows = await r.json();
+  _registerTable('positionsBody', rows, _renderPositions, { key: 'detected_at', dir: 'desc', type: 'date' });
+}
+
+async function resolvePending(btn) {
+  const status = document.getElementById('resolveStatus');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Working…';
+  status.textContent = '';
+  try {
+    const r = await api('/resolve-pending', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const parts = [
+        `Resolved ${j.markets_resolved ?? 0} markets`,
+        `settled ${j.positions_settled ?? 0} positions`,
+      ];
+      if (j.markets_still_pending) parts.push(`${j.markets_still_pending} still pending (no METAR yet?)`);
+      status.textContent = parts.join(', ') + '.';
+      loadPositions();
+    } else {
+      status.textContent = 'Error: ' + (j.detail || r.status);
+    }
+  } catch (e) {
+    status.textContent = 'Error: ' + e;
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
 function pill(outcome) {
   if (outcome === 'WIN') return '<span class="pill win">WIN</span>';
   if (outcome === 'LOSS') return '<span class="pill loss">LOSS</span>';
   return '<span class="pill open">open</span>';
+}
+
+function _renderOpps(rows) {
+  document.getElementById('oppsBody').innerHTML = rows.map(o => `
+    <tr>
+      <td class="small">${o.detected_at ? o.detected_at.slice(0,16).replace('T',' ') : ''}</td>
+      <td>${o.city || ''}</td>
+      <td>${o.event_date || ''}</td>
+      <td>${o.bucket || ''}</td>
+      <td>${o.side}</td>
+      <td>${Math.round(o._display_price*100)}¢</td>
+      <td>${Math.round(o._display_prob*100)}%</td>
+      <td>${(o.edge*100).toFixed(0)}pp</td>
+      <td>${o.confidence}</td>
+      <td>${o.alert_sent ? '✓' : ''}</td>
+      <td>${pill(o.outcome)}</td>
+      <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
+      <td><button class="btn small" onclick="viewAlert(${o.id})">View</button></td>
+    </tr>
+  `).join('');
 }
 
 async function loadOpps() {
@@ -437,23 +596,12 @@ async function loadOpps() {
   if (outcome) params.set('outcome', outcome);
   const r = await api('/opportunities?' + params); if (!r.ok) return;
   const rows = await r.json();
-  document.getElementById('oppsBody').innerHTML = rows.map(o => `
-    <tr>
-      <td class="small">${o.detected_at ? o.detected_at.slice(0,16).replace('T',' ') : ''}</td>
-      <td>${o.city || ''}</td>
-      <td>${o.event_date || ''}</td>
-      <td>${o.bucket || ''}</td>
-      <td>${o.side}</td>
-      <td>${Math.round((o.side === 'NO' ? 1 - o.market_price : o.market_price)*100)}¢</td>
-      <td>${Math.round((o.side === 'NO' ? (1 - o.true_prob) : o.true_prob) * 100)}%</td>
-      <td>${(o.edge*100).toFixed(0)}pp</td>
-      <td>${o.confidence}</td>
-      <td>${o.alert_sent ? '✓' : ''}</td>
-      <td>${pill(o.outcome)}</td>
-      <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
-      <td><button class="btn small" onclick="viewAlert(${o.id})">View</button></td>
-    </tr>
-  `).join('');
+  // Precompute side-aware display values so column sorting matches what the user sees.
+  rows.forEach(o => {
+    o._display_price = (o.side === 'NO') ? (1 - o.market_price) : o.market_price;
+    o._display_prob = (o.side === 'NO') ? (1 - o.true_prob) : o.true_prob;
+  });
+  _registerTable('oppsBody', rows, _renderOpps, { key: 'detected_at', dir: 'desc', type: 'date' });
 }
 
 async function viewAlert(oppId) {
