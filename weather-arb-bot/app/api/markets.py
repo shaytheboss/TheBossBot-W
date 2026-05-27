@@ -87,7 +87,9 @@ async def market_analysis(market_id: int, db: AsyncSession = Depends(get_db)):
         true_prob = estimate_true_probability(
             signals, outcome.bucket_min, outcome.bucket_max, bucket_unit=bucket_unit
         )
-        confidence = compute_confidence(signals, outcome.bucket_min, outcome.bucket_max)
+        confidence = compute_confidence(
+            signals, outcome.bucket_min, outcome.bucket_max, bucket_unit=bucket_unit
+        )
         market_price = (signals.get("market_price") or {}).get("yes_price")
         edge = (true_prob - market_price) if market_price is not None else None
         analysis.append({
