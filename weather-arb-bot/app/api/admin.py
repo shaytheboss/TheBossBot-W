@@ -14,12 +14,14 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.city import City
 from app.models.market import Market, MarketOutcome
+from app.models.metar import MetarObservation
 from app.models.opportunity import Opportunity
 from app.models.alert import Alert, TelegramUser
 from app.utils.log_buffer import recent_logs
 from app.utils.polymarket_discovery import (
     GAMMA_API, build_all_candidates, fetch_event_by_slug, fetch_events_by_tag,
 )
+from app.utils.units import resolve_bucket_unit
 
 logger = logging.getLogger(__name__)
 
@@ -126,51 +128,147 @@ async def admin_discover(_: str = Depends(require_admin)):
     return {"ok": True, **stats}
 
 
+def _bucket_won(
+    bucket_min: Optional[int], bucket_max: Optional[int], actual_in_unit: float
+) -> bool:
+    if bucket_min is not None and bucket_max is not None:
+        return bucket_min <= actual_in_unit < bucket_max + 1
+    if bucket_min is not None:
+        return actual_in_unit >= bucket_min
+    if bucket_max is not None:
+        return actual_in_unit <= bucket_max
+    return False
+
+
 @router.post("/resolve-pending")
 async def admin_resolve_pending(_: str = Depends(require_admin)):
-    """Force-run resolution for past markets whose virtual positions were
-    never closed (e.g. because the scheduler isn't running this job).
+    """Force-run resolution for past markets and settle stuck virtual positions.
 
-    Returns counts of markets resolved and virtual positions settled.
+    Two phases:
+      1. Run job_check_resolutions() — handles unresolved markets the normal
+         way (marks resolved + settles opportunities with alert_sent=True).
+      2. Sweep stragglers: any virtual position still 'open' on a past market.
+         These are typically opps where alert_sent=False (e.g. because the
+         telegram bot token was missing when the opp was created, or
+         send_opportunity_alert errored). The scheduled job skips them
+         forever; this admin sweep settles them by checking the actual high.
     """
     from app.workers.jobs import job_check_resolutions
 
     today = date_cls.today()
+    now = datetime.now(timezone.utc)
 
-    async def _counts():
-        async with AsyncSessionLocal() as db:
-            pending_markets = (await db.execute(
-                select(func.count(Market.id)).where(
-                    Market.resolved == False, Market.event_date < today
-                )
-            )).scalar() or 0
-            open_positions = (await db.execute(
-                select(func.count(Opportunity.id))
-                .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
-                .join(Market, Market.id == MarketOutcome.market_id)
-                .where(
-                    Opportunity.virtual_status == "open",
-                    Market.event_date < today,
-                )
-            )).scalar() or 0
-        return int(pending_markets), int(open_positions)
-
-    pending_before, open_before = await _counts()
-
+    # Phase 1: normal resolution job
     try:
         await job_check_resolutions()
     except Exception as e:
-        logger.error(f"Admin resolve-pending failed: {e}", exc_info=True)
+        logger.error(f"Admin resolve-pending (job phase) failed: {e}", exc_info=True)
         raise HTTPException(500, f"Resolve failed: {e}")
 
-    pending_after, open_after = await _counts()
+    # Phase 2: sweep stuck open virtual positions on past markets
+    settled = 0
+    skipped_no_metar = 0
+    skipped_no_shares = 0
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(Opportunity, MarketOutcome, Market, City)
+            .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+            .join(Market, Market.id == MarketOutcome.market_id)
+            .join(City, City.id == Market.city_id)
+            .where(
+                Opportunity.virtual_status == "open",
+                Market.event_date < today,
+            )
+        )).all()
+
+        # Cache actual-high lookups per (icao, date) so we don't re-query
+        # the same METAR window for each opportunity in the same market.
+        highs_cache: dict = {}
+
+        for opp, oc, market, city in rows:
+            if not opp.virtual_shares:
+                skipped_no_shares += 1
+                continue
+
+            key = (city.primary_icao, market.event_date)
+            if key not in highs_cache:
+                day_start = datetime(
+                    market.event_date.year, market.event_date.month, market.event_date.day,
+                    tzinfo=timezone.utc,
+                )
+                day_end = day_start + timedelta(days=1)
+                actual_raw = (await db.execute(
+                    select(func.max(MetarObservation.temperature_f)).where(
+                        MetarObservation.icao == city.primary_icao,
+                        MetarObservation.observed_at >= day_start,
+                        MetarObservation.observed_at < day_end,
+                    )
+                )).scalar_one_or_none()
+                highs_cache[key] = float(actual_raw) if actual_raw is not None else None
+
+            actual_f = highs_cache[key]
+            if actual_f is None:
+                skipped_no_metar += 1
+                continue
+            actual_c = (actual_f - 32.0) * 5.0 / 9.0
+            unit = resolve_bucket_unit(oc)
+            actual_in_unit = actual_c if unit == "C" else actual_f
+
+            won = _bucket_won(oc.bucket_min, oc.bucket_max, actual_in_unit)
+            if opp.side == "YES":
+                opp.outcome = "WIN" if won else "LOSS"
+            else:
+                opp.outcome = "WIN" if not won else "LOSS"
+            opp.closed_at = now
+            cost = float(opp.virtual_cost or 0.0)
+            if opp.outcome == "WIN":
+                opp.virtual_payout = float(opp.virtual_shares) * 1.00
+                opp.virtual_status = "win"
+            else:
+                opp.virtual_payout = 0.0
+                opp.virtual_status = "loss"
+            opp.virtual_pnl = float(opp.virtual_payout) - cost
+            settled += 1
+
+            # If the market itself was still unresolved (shouldn't happen
+            # often after phase 1, but possible if phase 1 had no METAR for
+            # a different opp's city), mark it resolved now.
+            if not market.resolved:
+                market.resolved = True
+                market.resolution_value = f"{actual_f}°F"
+
+        if settled > 0:
+            await db.commit()
+
+    # Final counts for the UI
+    async with AsyncSessionLocal() as db:
+        markets_still_pending = (await db.execute(
+            select(func.count(Market.id)).where(
+                Market.resolved == False, Market.event_date < today
+            )
+        )).scalar() or 0
+        positions_still_open = (await db.execute(
+            select(func.count(Opportunity.id))
+            .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+            .join(Market, Market.id == MarketOutcome.market_id)
+            .where(
+                Opportunity.virtual_status == "open",
+                Market.event_date < today,
+            )
+        )).scalar() or 0
+
+    logger.info(
+        f"Admin resolve-pending: settled {settled} stuck positions, "
+        f"skipped {skipped_no_metar} (no METAR), {skipped_no_shares} (no shares); "
+        f"still pending: {markets_still_pending} markets, {positions_still_open} positions"
+    )
 
     return {
         "ok": True,
-        "markets_resolved": max(0, pending_before - pending_after),
-        "positions_settled": max(0, open_before - open_after),
-        "markets_still_pending": pending_after,
-        "positions_still_open_past_date": open_after,
+        "positions_settled": settled,
+        "positions_skipped_no_metar": skipped_no_metar,
+        "markets_still_pending": int(markets_still_pending),
+        "positions_still_open_past_date": int(positions_still_open),
     }
 
 
