@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     wunderground_fetch_interval: int = 1800
     analyzer_run_interval: int = 300      # 5 min
     external_forecast_fetch_interval: int = 14400  # 4h — rate-limited external APIs
+    # DWD ICON (via Open-Meteo). Written to forecasts table only — NOT yet
+    # mixed into the deterministic blend. Safe to enable/disable freely.
+    icon_enabled: bool = True
+    icon_fetch_interval: int = 3600       # 1h, matches GFS/ECMWF cadence
     # Minimum directional certainty (in %) required to alert.
     # certainty = max(true_prob, 1 - true_prob). 80 means we need to be
     # at least 80% sure the bucket will (YES) or will not (NO) be the answer.
@@ -29,7 +33,7 @@ class Settings(BaseSettings):
     min_confidence_for_alert: int = 80
     min_edge_for_alert: float = 0.15
 
-    # ── Split alert / virtual-buy thresholds (0.0–1.0) ──────────────────────────
+    # ── Split alert / virtual-buy thresholds (0.0–1.0) ──────────────────────
     # "near" = market resolves within 1 day (days_ahead <= 1)
     # "far"  = market resolves 2+ days out (days_ahead >= 2)
     # Alert thresholds control whether an opportunity becomes a Telegram alert.
