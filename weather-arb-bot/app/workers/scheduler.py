@@ -20,6 +20,7 @@ from app.workers.jobs import (
     job_fetch_polymarket,
     job_run_analyzer,
 )
+from app.workers.icon_job import job_fetch_icon
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +69,16 @@ def build_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         misfire_grace_time=600,
     )
+    if getattr(settings, "icon_enabled", True):
+        scheduler.add_job(
+            job_fetch_icon,
+            IntervalTrigger(seconds=getattr(settings, "icon_fetch_interval", 3600)),
+            id="icon",
+            name="Fetch DWD ICON forecasts (DB-only, not blended)",
+            next_run_time=now,
+            max_instances=1,
+            misfire_grace_time=600,
+        )
     scheduler.add_job(
         job_fetch_pireps,
         IntervalTrigger(seconds=900),
