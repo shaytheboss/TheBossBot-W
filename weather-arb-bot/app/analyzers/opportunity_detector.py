@@ -1,5 +1,5 @@
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,6 +57,33 @@ async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -
     return q.scalar_one_or_none() is not None
 
 
+async def _market_alert_cooldown_active(
+    db: AsyncSession, market_id: int, minutes: int
+) -> bool:
+    """True if any alert was sent for this market within the cooldown window.
+
+    Without this, the analyzer can flip its recommendation between outcomes
+    of the same market within minutes (e.g. alerting '84-85°F NO @ 86%' at
+    10:00 and '82-83°F YES @ 75%' at 10:05) because new price/forecast data
+    shifts which outcome wins the best-edge selection. Per-(outcome, side)
+    dedup doesn't catch this; only a market-level cooldown does.
+    """
+    if minutes <= 0:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    q = await db.execute(
+        select(Opportunity.id)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .where(
+            MarketOutcome.market_id == market_id,
+            Opportunity.alert_sent == True,
+            Opportunity.detected_at >= cutoff,
+        )
+        .limit(1)
+    )
+    return q.scalar_one_or_none() is not None
+
+
 async def _get_prior_opportunity(
     db: AsyncSession, outcome_id: int, side: str
 ) -> Optional[Opportunity]:
@@ -78,6 +105,8 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     )
     markets: List[Market] = result.scalars().all()
 
+    cooldown_minutes = int(getattr(settings, "alert_dedup_minutes", 0) or 0)
+
     for market in markets:
         if _should_skip_market(market.question):
             continue
@@ -86,6 +115,18 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         if days_ahead < 0:
             continue
         if days_ahead > settings.max_days_ahead_for_alert:
+            continue
+
+        # Market-level alert cooldown: if any alert was sent for any outcome
+        # in this market within the last `alert_dedup_minutes` minutes, skip
+        # the entire market to prevent flipping recommendations.
+        if cooldown_minutes > 0 and await _market_alert_cooldown_active(
+            db, market.id, cooldown_minutes
+        ):
+            logger.debug(
+                f"Market {market.id} ({market.external_id}) in alert cooldown "
+                f"({cooldown_minutes}min); skipping"
+            )
             continue
 
         city_result = await db.execute(select(City).where(City.id == market.city_id))
