@@ -126,6 +126,54 @@ async def admin_discover(_: str = Depends(require_admin)):
     return {"ok": True, **stats}
 
 
+@router.post("/resolve-pending")
+async def admin_resolve_pending(_: str = Depends(require_admin)):
+    """Force-run resolution for past markets whose virtual positions were
+    never closed (e.g. because the scheduler isn't running this job).
+
+    Returns counts of markets resolved and virtual positions settled.
+    """
+    from app.workers.jobs import job_check_resolutions
+
+    today = date_cls.today()
+
+    async def _counts():
+        async with AsyncSessionLocal() as db:
+            pending_markets = (await db.execute(
+                select(func.count(Market.id)).where(
+                    Market.resolved == False, Market.event_date < today
+                )
+            )).scalar() or 0
+            open_positions = (await db.execute(
+                select(func.count(Opportunity.id))
+                .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+                .join(Market, Market.id == MarketOutcome.market_id)
+                .where(
+                    Opportunity.virtual_status == "open",
+                    Market.event_date < today,
+                )
+            )).scalar() or 0
+        return int(pending_markets), int(open_positions)
+
+    pending_before, open_before = await _counts()
+
+    try:
+        await job_check_resolutions()
+    except Exception as e:
+        logger.error(f"Admin resolve-pending failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Resolve failed: {e}")
+
+    pending_after, open_after = await _counts()
+
+    return {
+        "ok": True,
+        "markets_resolved": max(0, pending_before - pending_after),
+        "positions_settled": max(0, open_before - open_after),
+        "markets_still_pending": pending_after,
+        "positions_still_open_past_date": open_after,
+    }
+
+
 @router.get("/diag/polymarket")
 async def admin_diag_polymarket(
     slug: str = Query(..., description="Exact Polymarket event slug to fetch"),
