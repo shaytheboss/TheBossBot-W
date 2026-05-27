@@ -1,7 +1,12 @@
 from typing import Optional
 
 
-def compute_confidence(signals: dict, bucket_min: Optional[int], bucket_max: Optional[int]) -> int:
+def compute_confidence(
+    signals: dict,
+    bucket_min: Optional[int],
+    bucket_max: Optional[int],
+    bucket_unit: str = "F",
+) -> int:
     score = 40
 
     gfs_high = (signals.get("gfs_forecast") or {}).get("predicted_high_f")
@@ -22,7 +27,15 @@ def compute_confidence(signals: dict, bucket_min: Optional[int], bucket_max: Opt
     rate = trend.get("temp_rate_per_hour", 0.0) or 0.0
     current_temp = trend.get("current_temp_f")
 
-    bucket_requires_warmth = bucket_min is not None and bucket_min >= 66
+    # Convert native Celsius bucket_min to Fahrenheit before the warmth check
+    # so that e.g. 29°C (=84°F) is correctly treated as a warm bucket (>=66°F),
+    # not cold (29 < 66).
+    if bucket_unit == "C" and bucket_min is not None:
+        bucket_min_f = int(bucket_min * 9 / 5 + 32)
+    else:
+        bucket_min_f = bucket_min
+
+    bucket_requires_warmth = bucket_min_f is not None and bucket_min_f >= 66
 
     if current_temp is not None:
         if (rate > 0.5 and bucket_requires_warmth) or (rate < -0.5 and not bucket_requires_warmth):
