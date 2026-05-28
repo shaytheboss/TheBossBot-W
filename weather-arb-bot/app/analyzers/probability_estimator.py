@@ -446,12 +446,52 @@ def estimate_with_breakdown(
                 p = 0.95 * p + 0.05 * pirep_p
         if abs(p - p_before) > 1e-6:
             breakdown["adjustments"].append({"name": "Low-altitude PIREP", "delta": float(p - p_before)})
+        p_before = p
 
-    # Sparse-source shrinkage: when fewer than _SPARSE_SOURCE_BASELINE deterministic
-    # sources contributed (e.g. non-CONUS cities where HRRR/NWS are absent), the
-    # remaining 2-4 models are less validated for tropical/coastal regimes and
-    # narrow sigma=1.5°F same-day is over-confident. Blend p toward 0.5 by
-    # _SPARSE_SOURCE_SHRINK_PER_MISSING per missing source (max ~10pp).
+        # Same-day METAR running max: the highest temperature recorded today
+        # is a hard constraint on probability.
+        #
+        # Case 1 — running max already ABOVE bucket ceiling: the temperature
+        # has already blown through the bucket; it cannot win. Collapse P(YES)
+        # to the clip floor.
+        #
+        # Case 2 — running max INSIDE bucket AND temperature falling/flat
+        # (rate < 0.5°F/hr, i.e. afternoon peak has likely passed): the
+        # bucket is a strong candidate. Boost P(YES) to at least 92%.
+        #
+        # Case 3 — running max inside bucket but temperature still rising:
+        # no override; forecasts may predict it keeps climbing through the top.
+        metar_today_max = signals.get("metar_today_max_f")
+        if metar_today_max is not None:
+            f_lo_b, f_hi_b = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
+            if f_hi_b is not None and metar_today_max >= f_hi_b:
+                p = _PROB_CLIP_LO
+                breakdown["adjustments"].append({
+                    "name": "METAR running max (above bucket)",
+                    "delta": float(p - p_before),
+                })
+            elif (
+                f_lo_b is not None
+                and f_hi_b is not None
+                and f_lo_b <= metar_today_max < f_hi_b
+                and rate < 0.5
+            ):
+                new_p = min(_PROB_CLIP_HI, max(p, 0.92))
+                if abs(new_p - p) > 1e-6:
+                    p = new_p
+                    breakdown["adjustments"].append({
+                        "name": "METAR running max (inside bucket, peak passed)",
+                        "delta": float(p - p_before),
+                    })
+            if abs(p - p_before) > 1e-6:
+                breakdown["metar_today_max_applied"] = {
+                    "running_max_f": float(metar_today_max),
+                    "trend_rate": float(rate),
+                }
+
+    # Sparse-source shrinkage: blend toward 50% when fewer than
+    # _SPARSE_SOURCE_BASELINE deterministic sources contributed
+    # (e.g. non-CONUS cities missing HRRR/NWS).
     if n_det < _SPARSE_SOURCE_BASELINE:
         shrink = (_SPARSE_SOURCE_BASELINE - n_det) * _SPARSE_SOURCE_SHRINK_PER_MISSING
         p_before = p

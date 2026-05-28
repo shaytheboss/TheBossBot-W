@@ -3,7 +3,7 @@ import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.metar import MetarObservation
@@ -52,6 +52,7 @@ class SignalAggregator:
         if reference_icao:
             signals["reference_metar"] = await self._latest_metar(db, reference_icao)
         signals["metar_trend"] = await self._metar_trend(db, primary_icao, hours=3)
+        signals["metar_today_max_f"] = await self._today_running_max(db, primary_icao)
         signals["wunderground_forecast"] = await self._latest_forecast(db, city_id, "wunderground", forecast_date)
         signals["gfs_forecast"] = await self._latest_forecast(db, city_id, "gfs", forecast_date)
         signals["ecmwf_forecast"] = await self._latest_forecast(db, city_id, "ecmwf", forecast_date)
@@ -131,6 +132,18 @@ class SignalAggregator:
             "oldest_temp_f": temps[0],
             "span_hours": round(hours_span, 2),
         }
+
+    async def _today_running_max(self, db: AsyncSession, icao: str) -> Optional[float]:
+        """Return the highest temperature_f recorded at this station since midnight UTC today."""
+        today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+        result = await db.execute(
+            select(func.max(MetarObservation.temperature_f)).where(
+                MetarObservation.icao == icao,
+                MetarObservation.observed_at >= today_start,
+            )
+        )
+        val = result.scalar_one_or_none()
+        return float(val) if val is not None else None
 
     async def _latest_forecast(self, db, city_id, source, forecast_date: Optional[date] = None):
         q = select(Forecast).where(Forecast.city_id == city_id, Forecast.source == source)
