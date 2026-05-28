@@ -26,6 +26,11 @@ ENSEMBLE_WEIGHT_BASE = 0.70
 
 STRADDLE_EXTRA_BLEND = 0.10
 
+# Sparse-source shrinkage: blend toward 50% when fewer than this many
+# deterministic sources contributed (e.g. non-CONUS cities missing HRRR/NWS).
+_SPARSE_SOURCE_BASELINE = 3
+_SPARSE_SOURCE_SHRINK_PER_MISSING = 0.05   # 5pp per missing source vs baseline
+
 
 def _parse_coord(val) -> Optional[float]:
     if val is None:
@@ -245,6 +250,7 @@ def estimate_with_breakdown(
             det_entry["used_lon"] = lon_val
         breakdown["deterministic"].append(det_entry)
     det_p = sum(det_probs) / len(det_probs) if det_probs else None
+    n_det = len(det_probs)
     breakdown["det_avg"] = float(det_p) if det_p is not None else None
 
     ensemble_fc = signals.get("gfs_ensemble") or {}
@@ -440,6 +446,25 @@ def estimate_with_breakdown(
                 p = 0.95 * p + 0.05 * pirep_p
         if abs(p - p_before) > 1e-6:
             breakdown["adjustments"].append({"name": "Low-altitude PIREP", "delta": float(p - p_before)})
+
+    # Sparse-source shrinkage: when fewer than _SPARSE_SOURCE_BASELINE deterministic
+    # sources contributed (e.g. non-CONUS cities where HRRR/NWS are absent), the
+    # remaining 2-4 models are less validated for tropical/coastal regimes and
+    # narrow sigma=1.5°F same-day is over-confident. Blend p toward 0.5 by
+    # _SPARSE_SOURCE_SHRINK_PER_MISSING per missing source (max ~10pp).
+    if n_det < _SPARSE_SOURCE_BASELINE:
+        shrink = (_SPARSE_SOURCE_BASELINE - n_det) * _SPARSE_SOURCE_SHRINK_PER_MISSING
+        p_before = p
+        p = p * (1.0 - shrink) + 0.5 * shrink
+        breakdown["adjustments"].append({
+            "name": "Sparse sources",
+            "delta": float(p - p_before),
+        })
+        breakdown["sparse_sources"] = {
+            "n_det": n_det,
+            "baseline": _SPARSE_SOURCE_BASELINE,
+            "shrink_applied": round(shrink, 3),
+        }
 
     final = _clip(p)
     breakdown["final"] = float(final)

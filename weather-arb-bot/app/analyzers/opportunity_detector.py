@@ -46,11 +46,17 @@ def _should_skip_market(question: Optional[str]) -> bool:
 
 
 async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -> bool:
+    """True if any opportunity (either side) was already created for this outcome today.
+
+    We block both sides — not just the same side — to prevent the detector
+    from flipping YES→NO (or NO→YES) on the same outcome within one day.
+    The `side` parameter is kept in the signature for call-site compatibility
+    but is intentionally not used in the query.
+    """
     today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
     q = await db.execute(
         select(Opportunity.id).where(
             Opportunity.outcome_id == outcome_id,
-            Opportunity.side == side,
             Opportunity.detected_at >= today_start,
         ).limit(1)
     )
@@ -239,10 +245,23 @@ async def _analyze_outcome(
         return None
     if edge < settings.min_edge_for_alert:
         return None
+
+    # Reject suspiciously large edge: when our estimate diverges from the
+    # market by more than max_edge_for_alert, the market is almost certainly
+    # pricing in information we lack (breaking news, ICAO mismatch, tropical
+    # regime, etc.). Treat extreme edge as a model-quality failure signal.
+    max_edge = float(getattr(settings, "max_edge_for_alert", 1.0))
+    if edge > max_edge:
+        logger.debug(
+            f"Skipping outcome {outcome.id} ({outcome.bucket_label}): "
+            f"edge {edge:.2f} > max_edge {max_edge:.2f} — market strongly disagrees"
+        )
+        return None
+
     create_virtual_buy = certainty >= buy_thresh
 
     if await _has_opportunity_today(db, outcome.id, side):
-        logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} side={side} today")
+        logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} today")
         return None
 
     prior_opp = await _get_prior_opportunity(db, outcome.id, side)
