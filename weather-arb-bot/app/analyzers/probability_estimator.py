@@ -31,6 +31,12 @@ STRADDLE_EXTRA_BLEND = 0.10
 _SPARSE_SOURCE_BASELINE = 3
 _SPARSE_SOURCE_SHRINK_PER_MISSING = 0.05   # 5pp per missing source vs baseline
 
+# B.5 Discretization: METAR observations and several forecast sources are
+# rounded to 1°F. The standard deviation of a uniform(-0.5, +0.5) noise is
+# 1/sqrt(12) ≈ 0.289°F. We combine it with the forecast sigma in quadrature
+# so the Gaussian bucket integral accounts for measurement quantisation.
+DISCRETIZATION_SIGMA_F = 0.289
+
 
 def _parse_coord(val) -> Optional[float]:
     if val is None:
@@ -202,13 +208,19 @@ def estimate_with_breakdown(
     ensemble_key = "ensemble_lows" if is_low_market else "ensemble_highs"
     p50_key = "p50_low_f" if is_low_market else "p50_high_f"
 
-    sigma = forecast_sigma_for_lead(days_ahead)
+    # Combine forecast sigma with the ±0.5°F observation/forecast discretisation
+    # noise in quadrature. This nudges P(in bucket) away from 0/100% for
+    # forecast values sitting exactly on a bucket integer boundary.
+    raw_sigma = forecast_sigma_for_lead(days_ahead)
+    sigma = math.sqrt(raw_sigma * raw_sigma + DISCRETIZATION_SIGMA_F * DISCRETIZATION_SIGMA_F)
     observation_skipped = days_ahead is not None and days_ahead >= 1
 
     breakdown: dict = {
         "is_low_market": bool(is_low_market),
         "days_ahead": int(days_ahead) if days_ahead is not None else None,
         "sigma_used": float(sigma),
+        "sigma_raw": float(raw_sigma),
+        "discretization_sigma": float(DISCRETIZATION_SIGMA_F),
         "observation_skipped": bool(observation_skipped),
         "bucket_unit": bucket_unit,
         "deterministic": [],
@@ -450,17 +462,6 @@ def estimate_with_breakdown(
 
         # Same-day METAR running max: the highest temperature recorded today
         # is a hard constraint on probability.
-        #
-        # Case 1 — running max already ABOVE bucket ceiling: the temperature
-        # has already blown through the bucket; it cannot win. Collapse P(YES)
-        # to the clip floor.
-        #
-        # Case 2 — running max INSIDE bucket AND temperature falling/flat
-        # (rate < 0.5°F/hr, i.e. afternoon peak has likely passed): the
-        # bucket is a strong candidate. Boost P(YES) to at least 92%.
-        #
-        # Case 3 — running max inside bucket but temperature still rising:
-        # no override; forecasts may predict it keeps climbing through the top.
         metar_today_max = signals.get("metar_today_max_f")
         if metar_today_max is not None:
             f_lo_b, f_hi_b = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
@@ -490,8 +491,7 @@ def estimate_with_breakdown(
                 }
 
     # Sparse-source shrinkage: blend toward 50% when fewer than
-    # _SPARSE_SOURCE_BASELINE deterministic sources contributed
-    # (e.g. non-CONUS cities missing HRRR/NWS).
+    # _SPARSE_SOURCE_BASELINE deterministic sources contributed.
     if n_det < _SPARSE_SOURCE_BASELINE:
         shrink = (_SPARSE_SOURCE_BASELINE - n_det) * _SPARSE_SOURCE_SHRINK_PER_MISSING
         p_before = p
@@ -505,6 +505,23 @@ def estimate_with_breakdown(
             "baseline": _SPARSE_SOURCE_BASELINE,
             "shrink_applied": round(shrink, 3),
         }
+
+    # F.2 Confidence interval: standard deviation across all model-level
+    # probability estimates (deterministic + ensemble + wunderground). This
+    # is a coarse ±1σ around our blended P, intended for user display only.
+    # When fewer than 2 estimates are available we omit it.
+    all_model_probs = list(det_probs)
+    if ens_p is not None:
+        all_model_probs.append(float(ens_p))
+    if wg_p is not None:
+        all_model_probs.append(float(wg_p))
+    if len(all_model_probs) >= 2:
+        mean_p = sum(all_model_probs) / len(all_model_probs)
+        var = sum((q - mean_p) * (q - mean_p) for q in all_model_probs) / len(all_model_probs)
+        std_pp = math.sqrt(var) * 100.0
+        breakdown["source_std_pp"] = round(std_pp, 1)
+    else:
+        breakdown["source_std_pp"] = None
 
     final = _clip(p)
     breakdown["final"] = float(final)
