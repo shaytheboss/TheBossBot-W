@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # NOTE: kept as backward-compat fallback. Prefer the 4 split thresholds below.
     min_confidence_for_alert: int = 80
     min_edge_for_alert: float = 0.15
+    # Upper bound on edge. Edge above this is treated as a model-error signal
+    # rather than a genuine opportunity (the market knows something we don't).
+    # 0.45 = 45pp; e.g. our P=80% vs market P=30% (edge=50pp) would be blocked.
+    max_edge_for_alert: float = 0.45
 
     # ── Split alert / virtual-buy thresholds (0.0–1.0) ──────────────────────
     # "near" = market resolves within 1 day (days_ahead <= 1)
