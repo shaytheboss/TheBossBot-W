@@ -514,6 +514,157 @@ async def admin_positions(
     return out
 
 
+def _stat_block(items: list[dict]) -> dict:
+    """Summarise a group of settled bets: win-rate, Brier, calibration gap, P&L.
+
+    Each item is {pred, won, pnl, entry}. `pred` is the model probability for
+    the side actually taken (0-1), `won` is 1/0, `pnl` is virtual P&L (may be
+    None), `entry` is the per-share entry price paid (0-1, the break-even
+    win-rate for that bet).
+    """
+    n = len(items)
+    if n == 0:
+        return {
+            "n": 0, "wins": 0, "win_rate": None, "avg_pred": None,
+            "brier": None, "calibration_gap": None, "net_pnl": 0.0,
+            "avg_entry": None, "breakeven_win_rate": None, "edge_real": None,
+        }
+    wins = sum(it["won"] for it in items)
+    win_rate = wins / n
+    avg_pred = sum(it["pred"] for it in items) / n
+    brier = sum((it["pred"] - it["won"]) ** 2 for it in items) / n
+    pnls = [it["pnl"] for it in items if it["pnl"] is not None]
+    net_pnl = sum(pnls) if pnls else 0.0
+    entries = [it["entry"] for it in items if it["entry"] is not None]
+    avg_entry = (sum(entries) / len(entries)) if entries else None
+    return {
+        "n": n,
+        "wins": wins,
+        "win_rate": round(win_rate * 100, 1),
+        "avg_pred": round(avg_pred * 100, 1),
+        # How far the model's stated confidence is above its real hit-rate.
+        # Positive = overconfident.
+        "calibration_gap": round((avg_pred - win_rate) * 100, 1),
+        "brier": round(brier, 4),
+        "net_pnl": round(net_pnl, 2),
+        "avg_entry": round(avg_entry * 100, 1) if avg_entry is not None else None,
+        # Break-even win-rate for these bets == average entry price.
+        "breakeven_win_rate": round(avg_entry * 100, 1) if avg_entry is not None else None,
+        # Real edge = actual win-rate minus what you had to pay (break-even).
+        # Negative = losing money on average even if win-rate looks high.
+        "edge_real": (
+            round((win_rate - avg_entry) * 100, 1) if avg_entry is not None else None
+        ),
+    }
+
+
+@router.get("/lessons")
+async def admin_lessons(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+    city_id: Optional[int] = Query(default=None),
+):
+    """Calibration / post-mortem report over settled opportunities.
+
+    Turns the accumulated WIN/LOSS history into actionable lessons: how
+    overconfident the model is, whether bets actually make money after the
+    break-even price, and where the errors concentrate (lead time, city,
+    side, entry-price band, open-ended buckets).
+    """
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+
+    q = (
+        select(Opportunity, MarketOutcome, Market, City)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+        .where(Opportunity.outcome.in_(["WIN", "LOSS"]))
+        .order_by(desc(Opportunity.detected_at))
+    )
+    if from_dt is not None:
+        q = q.where(Opportunity.detected_at >= from_dt)
+    if to_dt is not None:
+        q = q.where(Opportunity.detected_at < to_dt)
+    if city_id is not None:
+        q = q.where(Market.city_id == city_id)
+
+    rows = (await db.execute(q)).all()
+
+    items: list[dict] = []
+    by_lead: dict = {}
+    by_city: dict = {}
+    by_side: dict = {}
+    by_price_band: dict = {}
+    by_conf_band: dict = {}
+    open_ended: list[dict] = []
+    closed_bucket: list[dict] = []
+
+    def _band_label(p: float) -> str:
+        # 10pp confidence bands from 50% upward.
+        lo = int(p * 10) * 10
+        return f"{lo}-{lo + 10}%"
+
+    def _price_band_label(e: Optional[float]) -> str:
+        if e is None:
+            return "unknown"
+        if e < 0.50:
+            return "<50¢"
+        if e < 0.65:
+            return "50-64¢"
+        if e < 0.75:
+            return "65-74¢"
+        if e < 0.85:
+            return "75-84¢"
+        return "85¢+"
+
+    for opp, oc, market, city in rows:
+        true_prob = float(opp.estimated_true_prob)
+        pred = (1.0 - true_prob) if opp.side == "NO" else true_prob
+        won = 1 if opp.outcome == "WIN" else 0
+        pnl = float(opp.virtual_pnl) if opp.virtual_pnl is not None else None
+        entry = float(opp.virtual_entry_price) if opp.virtual_entry_price is not None else None
+
+        lead = None
+        if market.event_date and opp.detected_at:
+            lead = (market.event_date - opp.detected_at.date()).days
+
+        item = {"pred": pred, "won": won, "pnl": pnl, "entry": entry}
+        items.append(item)
+
+        lead_key = "same-day" if lead == 0 else (f"{lead}-day" if lead is not None else "unknown")
+        by_lead.setdefault(lead_key, []).append(item)
+        by_city.setdefault(city.name, []).append(item)
+        by_side.setdefault(opp.side, []).append(item)
+        by_price_band.setdefault(_price_band_label(entry), []).append(item)
+        by_conf_band.setdefault(_band_label(pred), []).append(item)
+
+        if oc.bucket_min is None or oc.bucket_max is None:
+            open_ended.append(item)
+        else:
+            closed_bucket.append(item)
+
+    def _map(d: dict) -> dict:
+        return {k: _stat_block(v) for k, v in d.items()}
+
+    return {
+        "filter": {"from_date": from_date, "to_date": to_date, "city_id": city_id},
+        "overall": _stat_block(items),
+        "by_confidence_band": _map(by_conf_band),
+        "by_lead_time": _map(by_lead),
+        "by_city": _map(by_city),
+        "by_side": _map(by_side),
+        "by_entry_price": _map(by_price_band),
+        "bucket_shape": {
+            "open_ended": _stat_block(open_ended),   # "X or higher" / "X or lower"
+            "closed_range": _stat_block(closed_bucket),
+        },
+    }
+
+
 @router.get("/opportunities")
 async def admin_opportunities(
     _: str = Depends(require_admin),
