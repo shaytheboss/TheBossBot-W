@@ -20,7 +20,6 @@ def _coord_str(lat: Optional[float], lon: Optional[float]) -> str:
 
 
 def _api_coord_tag(used_lat: Optional[float], used_lon: Optional[float]) -> str:
-    """Return a short coordinate tag for source lines, e.g. [\U0001f4cd 30.162°N, 97.664°W]."""
     if used_lat is None or used_lon is None:
         return ""
     ns = "N" if used_lat >= 0 else "S"
@@ -49,43 +48,91 @@ def _lead_label(days_ahead: Optional[int]) -> str:
 
 
 def _closes_in_text(market_date: date, city_tz_str: Optional[str]) -> str:
-    """Compute time-to-close using the city's local timezone.
-
-    Market resolves at end of market_date in local TZ (23:59:59).
-    Returns human-readable string like '~24h', '~45min', or 'closed'.
-    """
     tz_str = city_tz_str or "UTC"
     try:
         tz = pytz.timezone(tz_str)
     except Exception:
         tz = pytz.utc
-
     local_end = tz.localize(
         datetime(market_date.year, market_date.month, market_date.day, 23, 59, 59)
     )
     utc_now = datetime.now(timezone.utc)
     delta = local_end.astimezone(timezone.utc) - utc_now
     total_seconds = delta.total_seconds()
-
     if total_seconds < 0:
         return "closed"
     elif total_seconds < 3600:
         return f"~{int(total_seconds / 60)}min"
     else:
-        total_hours = total_seconds / 3600
-        return f"~{total_hours:.0f}h"
+        return f"~{total_seconds / 3600:.0f}h"
 
+
+# ---------------------------------------------------------------------------
+# Risk banner
+# ---------------------------------------------------------------------------
+
+def _risk_banner(blend: dict, ci_pp: Optional[float]) -> str:
+    """Return a one-line plain-language risk summary with a colour-coded level.
+
+    Thresholds:
+      RED    - spread > 6°F  OR  ci_pp > 20pp  OR  boundary dist < 0.5°F
+      YELLOW - spread > 3°F  OR  ci_pp > 10pp  OR  boundary dist < 1.5°F  OR straddle
+      GREEN  - everything else
+    """
+    reasons: list[str] = []
+    level = 0  # 0=green, 1=yellow, 2=red
+
+    # Source spread
+    model_dis = blend.get("model_disagreement") or {}
+    spread_f = float(model_dis.get("source_spread_f") or 0.0)
+    if spread_f > 6:
+        reasons.append(f"models sharply disagree (Δ{round(spread_f)}°F)")
+        level = max(level, 2)
+    elif spread_f > 3:
+        reasons.append(f"moderate model spread (Δ{round(spread_f)}°F)")
+        level = max(level, 1)
+
+    # CI width
+    if ci_pp is not None:
+        ci_val = float(ci_pp)
+        if ci_val > 20:
+            reasons.append(f"very wide uncertainty (±{round(ci_val)}pp)")
+            level = max(level, 2)
+        elif ci_val > 10:
+            reasons.append(f"moderate uncertainty (±{round(ci_val)}pp)")
+            level = max(level, 1)
+
+    # Boundary proximity
+    br = blend.get("boundary_risk") or {}
+    dist = br.get("closest_source_dist_f")
+    if dist is not None:
+        dist = float(dist)
+        if dist < 0.5:
+            reasons.append(f"forecast right on bucket edge ({dist:.1f}°F away)")
+            level = max(level, 2)
+        elif dist < 1.5:
+            reasons.append(f"near bucket edge ({dist:.1f}°F)")
+            level = max(level, 1)
+
+    # Straddle
+    straddle = blend.get("straddle_info") or {}
+    if straddle.get("straddles"):
+        n_in = len(straddle.get("inside_sources", []))
+        n_out = len(straddle.get("outside_sources", []))
+        reasons.append(f"sources split {n_in} inside / {n_out} outside bucket")
+        level = max(level, 1)
+
+    emoji = ["\U0001f7e2", "\U0001f7e1", "\U0001f534"][level]
+    label = ["LOW", "MODERATE", "HIGH"][level]
+
+    if not reasons:
+        return f"\U0001f6a6 Risk: {emoji} *{label}* — strong model agreement\n"
+    return f"\U0001f6a6 Risk: {emoji} *{label}* — {' · '.join(reasons)}\n"
+
+
+# ---------------------------------------------------------------------------
 
 def _why_now_line(prior_opp, current_blend: dict) -> str:
-    """F.3 — 'Why now?' summary comparing forecast values vs the previous alert.
-
-    Examines per-source deterministic forecast values stored in opportunity
-    signals (_blend.deterministic). Picks the source whose value moved the
-    most between the prior alert and now, and renders e.g.:
-        "   Why now: ECMWF dropped 2°F since last alert\n"
-    Returns an empty string when prior signals are missing or no source
-    moved by at least 1°F.
-    """
     if prior_opp is None:
         return ""
     prior_signals = getattr(prior_opp, "signals", None) or {}
@@ -94,9 +141,8 @@ def _why_now_line(prior_opp, current_blend: dict) -> str:
     current_det = current_blend.get("deterministic") or []
     if not prior_det or not current_det:
         return ""
-
     prior_by_src = {d.get("source"): d.get("value_f") for d in prior_det}
-    biggest = None  # (source, delta_f)
+    biggest = None
     for d in current_det:
         src = d.get("source")
         cur_val = d.get("value_f")
@@ -106,10 +152,8 @@ def _why_now_line(prior_opp, current_blend: dict) -> str:
         delta = float(cur_val) - float(prior_val)
         if biggest is None or abs(delta) > abs(biggest[1]):
             biggest = (src, delta)
-
     if biggest is None or abs(biggest[1]) < 1.0:
         return ""
-
     src, delta = biggest
     verb = "rose" if delta > 0 else "dropped"
     return f"   Why now: {src} {verb} {abs(round(delta))}°F since last alert\n"
@@ -118,14 +162,11 @@ def _why_now_line(prior_opp, current_blend: dict) -> str:
 def _bottom_line(
     blend: dict, bucket_min, bucket_max, side: str, is_c: bool
 ) -> Optional[str]:
-    """One- or two-sentence verbal verdict pulling from the breakdown."""
     det = blend.get("deterministic") or []
     ens = blend.get("ensemble")
     if not det and not ens:
         return None
-
     parts: list[str] = []
-
     if det:
         vals = [d["value_f"] for d in det]
         n = len(vals)
@@ -148,12 +189,9 @@ def _bottom_line(
                 f"Forecasts span {fmt_temp_dual(lo_f, is_c)}–"
                 f"{fmt_temp_dual(hi_f, is_c)} (large Δ{round(spread)}°F disagreement)."
             )
-
         if bucket_min is not None and bucket_max is not None:
             if lo_f > bucket_max + 2:
-                parts.append(
-                    f"That's well above the {bucket_min}–{bucket_max}°F bucket."
-                )
+                parts.append(f"That's well above the {bucket_min}–{bucket_max}°F bucket.")
             elif lo_f >= bucket_max:
                 parts.append(
                     f"Forecasts mostly above the {bucket_min}–{bucket_max}°F bucket "
@@ -165,9 +203,7 @@ def _bottom_line(
                     f"but source range starts at {round(lo_f)}°F (inside the bucket)."
                 )
             elif hi_f < bucket_min - 2:
-                parts.append(
-                    f"That's well below the {bucket_min}–{bucket_max}°F bucket."
-                )
+                parts.append(f"That's well below the {bucket_min}–{bucket_max}°F bucket.")
             elif hi_f <= bucket_min:
                 parts.append(
                     f"Forecasts mostly below the {bucket_min}–{bucket_max}°F bucket "
@@ -179,9 +215,7 @@ def _bottom_line(
                     f"but source range ends at {round(hi_f)}°F (inside the bucket)."
                 )
             else:
-                parts.append(
-                    f"That sits inside the {bucket_min}–{bucket_max}°F bucket."
-                )
+                parts.append(f"That sits inside the {bucket_min}–{bucket_max}°F bucket.")
         elif bucket_min is not None and bucket_max is None:
             if avg >= bucket_min + 2:
                 parts.append(f"That's well above the ≥{bucket_min}°F threshold.")
@@ -196,27 +230,17 @@ def _bottom_line(
                 parts.append(f"That sits just below the ≤{bucket_max}°F threshold.")
             else:
                 parts.append(f"That sits above the ≤{bucket_max}°F threshold.")
-
     if ens:
         hits = ens["hits"]
         n_ens = ens["n"]
         if hits == 0:
-            parts.append(
-                f"The ensemble fully agrees: all {n_ens} perturbed runs land outside."
-            )
+            parts.append(f"The ensemble fully agrees: all {n_ens} perturbed runs land outside.")
         elif hits == n_ens:
-            parts.append(
-                f"The ensemble fully agrees: all {n_ens} perturbed runs land inside."
-            )
+            parts.append(f"The ensemble fully agrees: all {n_ens} perturbed runs land inside.")
         elif hits / n_ens > 0.7:
-            parts.append(
-                f"Ensemble leans the same way ({hits}/{n_ens} inside the bucket)."
-            )
+            parts.append(f"Ensemble leans the same way ({hits}/{n_ens} inside the bucket).")
         else:
-            parts.append(
-                f"Ensemble is mixed ({hits}/{n_ens} inside the bucket)."
-            )
-
+            parts.append(f"Ensemble is mixed ({hits}/{n_ens} inside the bucket).")
     br = blend.get("boundary_risk")
     if br:
         closest_f = br.get("closest_source_f")
@@ -233,7 +257,6 @@ def _bottom_line(
                     f"⚠️ Forecast sits only {closest_dist:.1f}°F from a "
                     f"bucket edge — resolution-risk premium applied."
                 )
-
     parts.append(f"→ *{side}*.")
     return " ".join(parts)
 
@@ -255,60 +278,40 @@ def _ensemble_verdict(
             f"is almost certain to fall inside the bucket."
         )
     elif hits / n > 0.7:
-        base = (
-            f"Verdict: most runs ({hits}/{n}) agree on falling inside the bucket."
-        )
+        base = f"Verdict: most runs ({hits}/{n}) agree on falling inside the bucket."
     elif hits / n < 0.3:
-        base = (
-            f"Verdict: most runs ({n - hits}/{n}) agree on falling outside the bucket."
-        )
+        base = f"Verdict: most runs ({n - hits}/{n}) agree on falling outside the bucket."
     else:
-        base = (
-            f"Verdict: mixed signal ({hits}/{n} inside) — high uncertainty."
-        )
+        base = f"Verdict: mixed signal ({hits}/{n} inside) — high uncertainty."
     if med is not None and bucket_min is not None and bucket_max is not None:
         if med > bucket_max:
-            base += (
-                f" Median run is {round(med - bucket_max)}°F above the bucket top."
-            )
+            base += f" Median run is {round(med - bucket_max)}°F above the bucket top."
         elif med < bucket_min:
-            base += (
-                f" Median run is {round(bucket_min - med)}°F below the bucket bottom."
-            )
+            base += f" Median run is {round(bucket_min - med)}°F below the bucket bottom."
     return base
 
 
 def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
-    """Build the verbose uncertainty breakdown section for the alert."""
-    side = "NO" if is_no else "YES"
     lines: list[str] = []
-
     model_dis = blend.get("model_disagreement")
     br = blend.get("boundary_risk")
     straddle = blend.get("straddle_info")
-
     has_model_dis = model_dis and model_dis.get("source_spread_f", 0) > 3.0
     has_boundary = br and br.get("blend_weight", 0) > 0
     has_straddle = straddle and straddle.get("straddles", False)
-
     if not has_model_dis and not has_boundary and not has_straddle:
         return ""
-
     lines.append("⚗️ *Uncertainty breakdown:*")
-
     if has_model_dis:
         spread_f = model_dis["source_spread_f"]
         ew_used = model_dis["ensemble_weight_used"]
-        ew_base = 0.70
-        ew_pct_base = round(ew_base * 100)
+        ew_pct_base = 70
         ew_pct_used = round(ew_used * 100)
-
         det = blend.get("deterministic") or []
         wg = blend.get("wunderground")
         all_sources_named = [(d["source"], d["value_f"]) for d in det]
         if wg and wg.get("value_f") is not None:
             all_sources_named.append(("Wunderground", wg["value_f"]))
-
         spread_detail = ""
         if all_sources_named:
             lo_src = min(all_sources_named, key=lambda x: x[1])
@@ -318,15 +321,11 @@ def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
                     f" ({lo_src[0]}={round(lo_src[1])}°F, "
                     f"{hi_src[0]}={round(hi_src[1])}°F)"
                 )
-
         lines.append(
             f"• Model spread: Δ{round(spread_f)}°F{spread_detail} → "
             f"ensemble weight reduced {ew_pct_base}%→{ew_pct_used}%"
         )
-        lines.append(
-            "  ↳ High spread means GFS ensemble under-represents model disagreement"
-        )
-
+        lines.append("  ↳ High spread means GFS ensemble under-represents model disagreement")
     if has_boundary:
         avg_f = br.get("avg_forecast_f")
         closest_f = br.get("closest_source_f")
@@ -334,18 +333,15 @@ def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
         blend_w = br.get("blend_weight", 0)
         b_min = br.get("bucket_true_min")
         b_max = br.get("bucket_true_max")
-
         edge_desc = ""
         if b_min is not None and closest_f is not None:
             if abs(closest_f - b_min) <= abs(closest_f - (b_max or 1e9)):
                 edge_desc = f"bucket low edge ({closest_dist:.1f}°F from boundary)"
             else:
                 edge_desc = f"bucket high edge ({closest_dist:.1f}°F from boundary)"
-
         source_name = ""
         if closest_f is not None and closest_f != avg_f:
-            det = blend.get("deterministic") or []
-            for d in det:
+            for d in (blend.get("deterministic") or []):
                 if abs(d["value_f"] - closest_f) < 0.01:
                     source_name = d["source"]
                     break
@@ -358,14 +354,8 @@ def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
             src_str = f"avg forecast {avg_f:.1f}°F"
         else:
             src_str = "forecast"
-
-        lines.append(
-            f"• Boundary proximity: {src_str} at {edge_desc}"
-        )
-        lines.append(
-            f"  ↳ Blend toward 50% applied (weight={round(blend_w * 100)}%)"
-        )
-
+        lines.append(f"• Boundary proximity: {src_str} at {edge_desc}")
+        lines.append(f"  ↳ Blend toward 50% applied (weight={round(blend_w * 100)}%)")
     if has_straddle:
         inside = straddle.get("inside_sources", [])
         outside = straddle.get("outside_sources", [])
@@ -378,7 +368,6 @@ def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
             bucket_str = f" [{round(br_min)}–{br_max_display}°F]"
         elif br_min is not None:
             bucket_str = f" [≥{round(br_min)}°F]"
-
         n_inside = len(inside)
         n_outside = len(outside)
         fraction_inside = n_inside / (n_inside + n_outside) if (n_inside + n_outside) > 0 else 0
@@ -387,10 +376,7 @@ def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
             f"• ⚠️ Sources straddle bucket: {n_inside} source{'s' if n_inside != 1 else ''} "
             f"inside{bucket_str}, {n_outside} outside"
         )
-        lines.append(
-            f"  ↳ Additional {extra_blend_pct}% blend toward 50% applied"
-        )
-
+        lines.append(f"  ↳ Additional {extra_blend_pct}% blend toward 50% applied")
     return "\n".join(lines)
 
 
@@ -429,11 +415,10 @@ def fmt_opportunity(
     side_prob_pct = round((1 - true_prob if is_no else true_prob) * 100)
     edge_pct = round(edge * 100)
 
-    # F2: half-width CI in percentage points, derived from forecast std dev.
-    # ci_pp is computed in probability_estimator as abs(p_ci_hi - p_ci_lo) / 2 * 100.
-    ci_pp = blend.get("ci_pp")
-    if ci_pp is not None and float(ci_pp) >= 0.5:
-        ci_suffix = f" ± {round(float(ci_pp))}pp"
+    # F2: CI half-width in percentage points
+    ci_pp_val = blend.get("ci_pp")
+    if ci_pp_val is not None and float(ci_pp_val) >= 0.5:
+        ci_suffix = f" ± {round(float(ci_pp_val))}pp"
     else:
         ci_suffix = ""
 
@@ -446,47 +431,33 @@ def fmt_opportunity(
     else:
         date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
 
-    # ── UPDATE header (re-alert detection) ──────────────────────────────────
+    # ── UPDATE header ───────────────────────────────────────────────────────
     update_section = ""
     if prior_opportunity is not None:
         prior_dt = prior_opportunity.detected_at
-        if prior_dt:
-            prior_ts = prior_dt.strftime("%b %d %H:%M UTC")
-        else:
-            prior_ts = "unknown time"
+        prior_ts = prior_dt.strftime("%b %d %H:%M UTC") if prior_dt else "unknown time"
         prior_prob = float(prior_opportunity.estimated_true_prob)
         prior_side_prob = round((1 - prior_prob if is_no else prior_prob) * 100)
-        prior_edge = float(prior_opportunity.edge)
-        prior_edge_pp = round(prior_edge * 100)
+        prior_edge_pp = round(float(prior_opportunity.edge) * 100)
         prior_price = float(prior_opportunity.market_price)
-        if is_no:
-            prior_ask_c = round((1 - prior_price) * 100)
-        else:
-            prior_ask_c = round(prior_price * 100)
+        prior_ask_c = round((1 - prior_price if is_no else prior_price) * 100)
 
         current_side_prob = side_prob_pct
         prob_change = current_side_prob - prior_side_prob
         edge_change = edge_pct - prior_edge_pp
 
-        if prob_change >= 0:
-            conf_arrow = f"↑{abs(prob_change)}pp"
-        else:
-            conf_arrow = f"↓{abs(prob_change)}pp"
+        conf_arrow = f"↑{abs(prob_change)}pp" if prob_change >= 0 else f"↓{abs(prob_change)}pp"
 
         book = signals.get("_book") or {}
         entry_cost = signals.get("_entry_cost")
         if entry_cost is not None:
             current_ask_c = round(entry_cost * 100)
         elif book.get("ask") is not None:
-            if is_no:
-                current_ask_c = round((1 - book["ask"]) * 100)
-            else:
-                current_ask_c = round(book["ask"] * 100)
+            current_ask_c = round((1 - book["ask"] if is_no else book["ask"]) * 100)
         else:
             current_ask_c = round((1 - market_price if is_no else market_price) * 100)
 
         price_change = current_ask_c - prior_ask_c
-
         confidence_decreased = prob_change < 0
         warn_flag = " ⚠️" if confidence_decreased else ""
         update_section = (
@@ -501,11 +472,10 @@ def fmt_opportunity(
             price_arrow = f"↑{abs(price_change)}¢" if price_change > 0 else f"↓{abs(price_change)}¢"
             update_section += f", price {price_arrow}"
         update_section += "\n"
-        # F3: which forecast source moved the most since the previous alert
         update_section += _why_now_line(prior_opportunity, blend)
         update_section += "\n"
 
-    # ── Header / location ────────────────────────────────────────────
+    # ── Location header ─────────────────────────────────────────────────
     lat = signals.get("city_lat")
     lon = signals.get("city_lon")
     coord_str = _coord_str(lat, lon)
@@ -513,7 +483,7 @@ def fmt_opportunity(
     coord_part = f" | {coord_str}" if coord_str else ""
     loc_line = f"\U0001f4cd {city_name}{station_part}{coord_part} | {date_str}"
 
-    # ── Bucket display (dual unit when Celsius market) ──────────────────────────
+    # ── Bucket display ─────────────────────────────────────────────────────
     bucket_display = bucket_label
     f_range = fmt_bucket_range_f(bucket_min, bucket_max)
     if is_c and f_range:
@@ -521,7 +491,7 @@ def fmt_opportunity(
     elif (not is_c) and f_range and f_range.replace("–", "-") not in bucket_label.replace("–", "-"):
         bucket_display = f"{bucket_label} ({f_range})"
 
-    # ── Pricing line ─────────────────────────────────────────────────
+    # ── Pricing line ───────────────────────────────────────────────────
     book = signals.get("_book") or {}
     entry_cost = signals.get("_entry_cost")
     if entry_cost is not None and book.get("bid") is not None:
@@ -541,7 +511,7 @@ def fmt_opportunity(
         side_price_cents = round((1 - market_price if is_no else market_price) * 100)
         price_line = f"\U0001f4b0 Market {side} price: {side_price_cents}¢"
 
-    # ── Virtual buy section ────────────────────────────────────────────────
+    # ── Virtual buy ────────────────────────────────────────────────────────
     virtual_section = ""
     create_buy = signals.get("_create_virtual_buy")
     buy_thresh = signals.get("_buy_threshold")
@@ -550,12 +520,10 @@ def fmt_opportunity(
         entry_cents_v = round(float(entry_cost) * 100)
         cost_v = SHARES * float(entry_cost)
         if_win_pnl = SHARES * 1.00 - cost_v
-        if_loss_pnl = -cost_v
         virtual_section = (
             f"\n\n\U0001f6d2 *Virtual buy*: {SHARES} shares × {entry_cents_v}¢ "
             f"= ${cost_v:.2f} cost\n"
-            f"   If WIN: +${if_win_pnl:.2f} P&L  |  "
-            f"If LOSS: -${cost_v:.2f} P&L"
+            f"   If WIN: +${if_win_pnl:.2f} P&L  |  If LOSS: -${cost_v:.2f} P&L"
         )
     elif create_buy is False and buy_thresh is not None:
         virtual_section = (
@@ -563,11 +531,14 @@ def fmt_opportunity(
             f"buy threshold {round(float(buy_thresh) * 100)}%)"
         )
 
-    # ── Bottom-line verbal verdict ─────────────────────────────────────────────
+    # ── Bottom line ──────────────────────────────────────────────────────
     bottom_line = _bottom_line(blend, bucket_min, bucket_max, side, is_c)
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
 
-    # ── Per-source forecast breakdown ───────────────────────────────────────────
+    # ── Risk banner ─────────────────────────────────────────────────────────
+    risk_line = _risk_banner(blend, ci_pp_val)
+
+    # ── Per-source forecast breakdown ─────────────────────────────────────────
     sigma_hint = (
         f" · σ=±{sigma_used:.1f}°F ({_lead_label(days_ahead)})"
         if sigma_used is not None else ""
@@ -577,7 +548,6 @@ def fmt_opportunity(
         f"{fc_kind_lower} lands in the bucket. Narrow buckets give small "
         f"P(in bucket) even when the forecast is centred on them._"
     )
-
     det_rows = blend.get("deterministic") or []
     forecast_vals_f: list[float] = []
     breakdown_lines: list[str] = []
@@ -592,7 +562,6 @@ def fmt_opportunity(
             f"→ P(in bucket)={round(p_in * 100)}% ⇒ P({side})={round(side_p * 100)}%"
             f"{coord_tag}"
         )
-
     wg = blend.get("wunderground")
     if wg and wg.get("value_f") is not None:
         val_f = wg["value_f"]
@@ -605,26 +574,23 @@ def fmt_opportunity(
             f"→ P(in bucket)={round(p_in * 100)}% ⇒ P({side})={round(side_p * 100)}%"
             f"{coord_tag}"
         )
-
     if not breakdown_lines:
         breakdown_lines = ["• No forecast data available"]
-
     spread_line = ""
     if len(forecast_vals_f) >= 2:
         lo_f = min(forecast_vals_f)
         hi_f = max(forecast_vals_f)
-        spread_f = hi_f - lo_f
+        spread_f_val = hi_f - lo_f
         spread_line = (
             f"  ↳ Source range: {fmt_temp_dual(lo_f, is_c)}–"
             f"{fmt_temp_dual(hi_f, is_c)} "
-            f"(Δ{round(spread_f)}°F) — {_agreement_label(spread_f)}"
+            f"(Δ{round(spread_f_val)}°F) — {_agreement_label(spread_f_val)}"
         )
-
     breakdown_text = breakdown_intro + "\n" + "\n".join(breakdown_lines)
     if spread_line:
         breakdown_text += "\n" + spread_line
 
-    # ── Ensemble section ────────────────────────────────────────
+    # ── Ensemble section ────────────────────────────────────────────────
     ens = blend.get("ensemble")
     ens_section = ""
     if ens:
@@ -651,7 +617,7 @@ def fmt_opportunity(
             f"_{verdict}_"
         )
 
-    # ── Math walkthrough ───────────────────────────────────────────────────
+    # ── Math walkthrough ──────────────────────────────────────────────────
     det_avg = blend.get("det_avg")
     ens_p = blend.get("ens_p")
     wg_p = blend.get("wg_p")
@@ -701,15 +667,12 @@ def fmt_opportunity(
         math_lines.append(
             f"• Pre-adjustment P({side}) = {round(_to_side(blend_pre) * 100, 1)}%"
         )
-
-    # C: market normalization scale
     norm_scale = blend.get("normalization_scale")
     if norm_scale is not None and abs(float(norm_scale) - 1.0) > 0.02:
         math_lines.append(
             f"• Market normalisation: ×{float(norm_scale):.3f} "
             f"_(raw bucket probs renormalized to sum=1 across outcomes)_"
         )
-
     if obs_skipped:
         math_lines.append(
             "• _Observation-based adjustments (METAR trend, ref wind, PIREP) "
@@ -723,26 +686,22 @@ def fmt_opportunity(
         if name == "Boundary proximity" and boundary_risk:
             closest_f = boundary_risk.get("closest_source_f")
             closest_dist = boundary_risk.get("closest_source_dist_f")
-            avg_f = boundary_risk.get("avg_forecast_f")
+            avg_f_br = boundary_risk.get("avg_forecast_f")
             extra = ""
             if closest_dist is not None and closest_f is not None:
-                if closest_f != avg_f:
+                if closest_f != avg_f_br:
                     extra = (
                         f" _(closest source {closest_f:.1f}°F is {closest_dist:.1f}°F from a "
                         "bucket edge — pulls P toward 50% to price resolution risk)_"
                     )
                 else:
                     extra = (
-                        f" _(forecast {avg_f:.1f}°F is {closest_dist:.1f}°F from a "
+                        f" _(forecast {avg_f_br:.1f}°F is {closest_dist:.1f}°F from a "
                         "bucket edge — pulls P toward 50% to price resolution risk)_"
                     )
-            math_lines.append(
-                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp{extra}"
-            )
+            math_lines.append(f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp{extra}")
         elif name == "Boundary proximity":
-            math_lines.append(
-                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp"
-            )
+            math_lines.append(f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp")
         elif name == "Straddle blend":
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
@@ -750,18 +709,14 @@ def fmt_opportunity(
             )
         elif name == "Dew point convergence":
             dew_info = blend.get("dew_convergence") or {}
-            spread_note = ""
-            if dew_info.get("spread_f") is not None:
-                spread_note = f" (T−Td={dew_info['spread_f']}°F)"
+            spread_note = f" (T−Td={dew_info['spread_f']}°F)" if dew_info.get("spread_f") is not None else ""
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
                 f"_(near-saturated air{spread_note} suppresses daytime max)_"
             )
         elif name == "Station gradient (sea/lake-breeze proxy)":
             grad_info = blend.get("station_gradient") or {}
-            grad_note = ""
-            if grad_info.get("gradient_f") is not None:
-                grad_note = f" (+{grad_info['gradient_f']}°F primary vs ref)"
+            grad_note = f" (+{grad_info['gradient_f']}°F primary vs ref)" if grad_info.get("gradient_f") is not None else ""
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
                 f"_(onshore marine air likely{grad_note})_"
@@ -772,9 +727,7 @@ def fmt_opportunity(
                 f"_(based on today's METAR/PIREP — same-day only)_"
             )
     if not adjustments and not obs_skipped:
-        math_lines.append(
-            "• _No observation-based or boundary adjustments triggered._"
-        )
+        math_lines.append("• _No observation-based or boundary adjustments triggered._")
     if final_p is not None:
         math_lines.append(
             f"• *Final P({side}) = {round(_to_side(final_p) * 100, 1)}%* "
@@ -782,13 +735,11 @@ def fmt_opportunity(
         )
     math_section = "\n".join(math_lines)
 
-    # ── Uncertainty breakdown section ───────────────────────────────────────────
+    # ── Uncertainty breakdown ───────────────────────────────────────────────
     uncertainty_text = _build_uncertainty_section(blend, is_no)
-    uncertainty_section = (
-        f"\n\n{uncertainty_text}" if uncertainty_text else ""
-    )
+    uncertainty_section = f"\n\n{uncertainty_text}" if uncertainty_text else ""
 
-    # ── Atmospheric signals ─────────────────────────────────────────────────────
+    # ── Atmospheric signals ──────────────────────────────────────────────────
     atm_section = ""
     if obs_skipped:
         atm_section = (
@@ -810,9 +761,7 @@ def fmt_opportunity(
         if trend.get("dew_rate_per_hour") and abs(trend["dew_rate_per_hour"]) > 0.3:
             direction = "rising" if trend["dew_rate_per_hour"] > 0 else "falling"
             dp = primary.get("dew_point_f")
-            atm_lines.append(
-                f"• Dew point {direction} ({fmt_temp_dual(dp, is_c)})"
-            )
+            atm_lines.append(f"• Dew point {direction} ({fmt_temp_dual(dp, is_c)})")
         pireps = signals.get("pireps") or []
         low_pireps = [
             p for p in pireps
@@ -821,18 +770,14 @@ def fmt_opportunity(
         ]
         if low_pireps:
             avg_c = sum(p["temperature_c"] for p in low_pireps) / len(low_pireps)
-            avg_f = avg_c * 9 / 5 + 32
-            atm_lines.append(
-                f"• PIREP: {fmt_temp_dual(avg_f, is_c)} avg at low altitude"
-            )
-        # E2: Dew point convergence signal
+            avg_f_p = avg_c * 9 / 5 + 32
+            atm_lines.append(f"• PIREP: {fmt_temp_dual(avg_f_p, is_c)} avg at low altitude")
         dew_info = blend.get("dew_convergence")
         if dew_info:
             atm_lines.append(
                 f"• \U0001f4a7 Dew convergence: T−Td={dew_info.get('spread_f', '?')}°F "
                 f"— near-saturated air, daytime max suppressed (×0.92)"
             )
-        # E3: Station gradient signal
         grad_info = blend.get("station_gradient")
         if grad_info:
             atm_lines.append(
@@ -861,7 +806,6 @@ def fmt_opportunity(
             hours_left = f"\n⏰ Closes in ~{h}h"
 
     link_line = f"\n[Polymarket]({market_url})" if market_url else ""
-
     certainty_note = (
         f"\n⚠️ Certainty: {confidence}% "
         f"(directional confidence = max(P(YES), P(NO)) of our blend)"
@@ -875,7 +819,8 @@ def fmt_opportunity(
         f"\U0001f3e2 Bucket: {bucket_display} (*{side}*)\n\n"
         f"{price_line}\n"
         f"\U0001f9e0 Our P({side}) estimate: {side_prob_pct}%{ci_suffix}\n"
-        f"\U0001f4c8 Edge vs ask: +{edge_pct}pp"
+        f"\U0001f4c8 Edge vs ask: +{edge_pct}pp\n"
+        f"{risk_line}"
         f"{virtual_section}"
         f"{bottom_line_section}\n\n"
         f"\U0001f4d0 *Forecast breakdown* ({fc_kind}{sigma_hint})\n"
@@ -895,7 +840,6 @@ def fmt_status(city_signals: list) -> str:
     }
     if not city_signals:
         return "No cities currently being monitored."
-
     lines = ["\U0001f4e1 *Current Status*\n"]
     for cs in city_signals:
         temp = f"{cs['temp_f']}°F" if cs.get("temp_f") is not None else "--"
