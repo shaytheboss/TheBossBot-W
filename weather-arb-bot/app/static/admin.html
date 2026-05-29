@@ -101,6 +101,7 @@
       <button class="active" data-tab="stats">Stats</button>
       <button data-tab="opps">Opportunities</button>
       <button data-tab="positions">Positions</button>
+      <button data-tab="lessons">Lessons</button>
       <button data-tab="cities">Cities</button>
       <button data-tab="settings">Settings</button>
       <button data-tab="logs">Logs</button>
@@ -136,6 +137,7 @@
         <button class="btn primary" onclick="loadPositions()">Apply Filter</button>
         <button class="btn" onclick="resetPosFilter()">Reset</button>
         <button class="btn primary" onclick="resolvePending(this)" title="Run resolution on past markets whose virtual positions never closed">🔄 Resolve pending</button>
+        <button class="btn" onclick="exportCsv('positionsBody', 'positions')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
         <span id="resolveStatus" class="small"></span>
       </div>
       <table id="positionsTable">
@@ -161,6 +163,21 @@
       </table>
     </section>
 
+    <section id="tab-lessons" class="hidden">
+      <div class="toolbar">
+        <label class="row small">From <input type="date" id="lesFrom" /></label>
+        <label class="row small">To <input type="date" id="lesTo" /></label>
+        <label class="row small">City
+          <select id="lesCity"><option value="">All cities</option></select>
+        </label>
+        <button class="btn primary" onclick="loadLessons()">Apply Filter</button>
+        <button class="btn" onclick="resetLesFilter()">Reset</button>
+      </div>
+      <p class="small">Calibration post-mortem over <b>settled</b> bets (WIN/LOSS only). <b>Calibration gap</b> = stated confidence minus real win-rate (positive = overconfident). <b>Real edge</b> = win-rate minus break-even price (negative = losing money even when win-rate looks high).</p>
+      <div id="lessonsHeadline" class="grid"></div>
+      <div id="lessonsTables"></div>
+    </section>
+
     <section id="tab-opps" class="hidden">
       <div class="toolbar">
         <label class="row"><input type="checkbox" id="onlyAlerted" onchange="loadOpps()" /> only alerted</label>
@@ -170,6 +187,7 @@
           <option value="LOSS">LOSS</option>
         </select>
         <button class="btn" onclick="loadOpps()">Refresh</button>
+        <button class="btn" onclick="exportCsv('oppsBody', 'opportunities')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
       </div>
       <table id="oppsTable">
         <thead><tr>
@@ -411,6 +429,7 @@ function bindTabs() {
       if (tab === 'stats') loadStats();
       if (tab === 'opps') loadOpps();
       if (tab === 'positions') loadPositions();
+      if (tab === 'lessons') loadLessons();
       if (tab === 'cities') loadCities();
       if (tab === 'settings') loadSettings();
       if (tab === 'logs') loadLogs();
@@ -428,7 +447,7 @@ async function ensureCitiesLoaded() {
   if (!r.ok) return [];
   const rows = await r.json();
   window._citiesCache = rows;
-  ['statsCity','posCity'].forEach(id => {
+  ['statsCity','posCity','lesCity'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel || sel.dataset.populated === '1') return;
     rows.forEach(c => {
@@ -551,6 +570,122 @@ async function loadPositions() {
       : ((o.side === 'NO') ? (1 - o.true_prob) : o.true_prob);
   });
   _registerTable('positionsBody', rows, _renderPositions, { key: 'detected_at', dir: 'desc', type: 'date' });
+}
+
+// --- Lessons (calibration post-mortem) ---------------------------------------
+function resetLesFilter() {
+  document.getElementById('lesFrom').value = '';
+  document.getElementById('lesTo').value = '';
+  document.getElementById('lesCity').value = '';
+  loadLessons();
+}
+
+function _pnlColor(v) { return (v || 0) >= 0 ? 'var(--win)' : 'var(--loss)'; }
+
+function _lessonTable(title, mapObj) {
+  const entries = Object.entries(mapObj || {})
+    .filter(([, s]) => s && s.n > 0)
+    .sort((a, b) => b[1].n - a[1].n);
+  if (!entries.length) return '';
+  const rows = entries.map(([name, s]) => {
+    const gapColor = (s.calibration_gap || 0) > 15 ? 'var(--loss)'
+      : ((s.calibration_gap || 0) > 7 ? 'var(--warn)' : 'var(--fg)');
+    const edgeColor = (s.edge_real || 0) >= 0 ? 'var(--win)' : 'var(--loss)';
+    return `<tr>
+      <td>${escapeHtml(name)}</td>
+      <td>${s.n}</td>
+      <td>${s.win_rate != null ? s.win_rate + '%' : '—'}</td>
+      <td>${s.avg_pred != null ? s.avg_pred + '%' : '—'}</td>
+      <td style="color:${gapColor}">${s.calibration_gap != null ? '+' + s.calibration_gap : '—'}</td>
+      <td>${s.brier != null ? s.brier : '—'}</td>
+      <td>${s.avg_entry != null ? s.avg_entry + '¢' : '—'}</td>
+      <td style="color:${edgeColor}">${s.edge_real != null ? s.edge_real : '—'}</td>
+      <td style="color:${_pnlColor(s.net_pnl)}">${s.net_pnl != null ? '$' + s.net_pnl.toFixed(2) : '—'}</td>
+    </tr>`;
+  }).join('');
+  return `<h3 style="margin-top:24px;">${title}</h3>
+    <table><thead><tr>
+      <th>Group</th><th>Bets</th><th>Win%</th><th>Avg pred%</th>
+      <th>Calib gap</th><th>Brier</th><th>Avg entry</th><th>Real edge%</th><th>Net P&amp;L</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function loadLessons() {
+  await ensureCitiesLoaded();
+  _initFilterDefaults('lesFrom', 'lesTo');
+  const p = new URLSearchParams();
+  const f = document.getElementById('lesFrom').value;
+  const t = document.getElementById('lesTo').value;
+  const c = document.getElementById('lesCity').value;
+  if (f) p.set('from_date', f);
+  if (t) p.set('to_date', t);
+  if (c) p.set('city_id', c);
+  const r = await api('/lessons?' + p); if (!r.ok) return;
+  const j = await r.json();
+  const o = j.overall || {};
+  if (!o.n) {
+    document.getElementById('lessonsHeadline').innerHTML =
+      '<div class="card"><div class="label">Settled bets</div><div class="value">0</div></div>';
+    document.getElementById('lessonsTables').innerHTML =
+      '<p class="small">No settled (WIN/LOSS) bets in this range yet.</p>';
+    return;
+  }
+  const gapColor = (o.calibration_gap || 0) > 15 ? 'var(--loss)' : 'var(--warn)';
+  document.getElementById('lessonsHeadline').innerHTML =
+    card('Settled bets', o.n) +
+    card('Win rate', (o.win_rate ?? 0) + '%') +
+    `<div class="card"><div class="label">Calibration gap</div><div class="value" style="color:${gapColor}">+${o.calibration_gap ?? 0}pp</div></div>` +
+    card('Avg stated conf', (o.avg_pred ?? 0) + '%') +
+    card('Brier score', o.brier ?? '—') +
+    card('Avg entry', (o.avg_entry ?? 0) + '¢') +
+    `<div class="card"><div class="label">Real edge</div><div class="value" style="color:${(o.edge_real||0)>=0?'var(--win)':'var(--loss)'}">${o.edge_real ?? 0}pp</div></div>` +
+    `<div class="card"><div class="label">Net P&L</div><div class="value" style="color:${_pnlColor(o.net_pnl)}">$${(o.net_pnl ?? 0).toFixed(2)}</div></div>`;
+  document.getElementById('lessonsTables').innerHTML =
+    _lessonTable('By confidence band', j.by_confidence_band) +
+    _lessonTable('By bucket shape (open-ended “X or higher” vs closed range)', {
+      'Open-ended (X+ / X−)': (j.bucket_shape || {}).open_ended,
+      'Closed range': (j.bucket_shape || {}).closed_range,
+    }) +
+    _lessonTable('By side', j.by_side) +
+    _lessonTable('By lead time', j.by_lead_time) +
+    _lessonTable('By entry price', j.by_entry_price) +
+    _lessonTable('By city', j.by_city);
+}
+
+// --- Generic CSV export of what's currently rendered in a table --------------
+function exportCsv(tbodyId, filenameBase) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  const table = tbody.closest('table');
+  if (!table) return;
+  const headers = [...table.querySelectorAll('thead th')].map(th =>
+    th.textContent.replace(/[⇅▲▼]/g, '').trim()
+  );
+  const cellText = td => {
+    const a = td.querySelector('a');
+    if (a) return a.href;            // export the actual Polymarket URL
+    if (td.querySelector('button')) return '';  // skip action buttons (View)
+    return td.textContent.trim();
+  };
+  const lines = [headers];
+  tbody.querySelectorAll('tr').forEach(tr => {
+    lines.push([...tr.querySelectorAll('td')].map(cellText));
+  });
+  const esc = v => {
+    const s = String(v ?? '');
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const csv = '﻿' + lines.map(row => row.map(esc).join(',')).join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `${filenameBase}-${stamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 async function resolvePending(btn) {
