@@ -145,12 +145,17 @@
           <th data-sort-key="city" data-sort-type="str">City</th>
           <th data-sort-key="bucket" data-sort-type="str">Bucket</th>
           <th data-sort-key="side" data-sort-type="str">Side</th>
+          <th data-sort-key="_display_prob" data-sort-type="num">Est P(side)</th>
+          <th data-sort-key="edge" data-sort-type="num">Edge</th>
+          <th data-sort-key="confidence" data-sort-type="num">Conf</th>
           <th data-sort-key="shares" data-sort-type="num">Shares</th>
           <th data-sort-key="entry_price" data-sort-type="num">Entry</th>
           <th data-sort-key="cost" data-sort-type="num">Cost</th>
           <th data-sort-key="payout" data-sort-type="num">Payout</th>
           <th data-sort-key="pnl" data-sort-type="num">P&amp;L</th>
           <th data-sort-key="status" data-sort-type="str">Status</th>
+          <th>Link</th>
+          <th>Details</th>
         </tr></thead>
         <tbody id="positionsBody"></tbody>
       </table>
@@ -511,12 +516,17 @@ function _renderPositions(rows) {
       <td>${escapeHtml(o.city || '')}</td>
       <td>${escapeHtml(o.bucket || '')}</td>
       <td>${o.side}</td>
+      <td>${o._display_prob != null ? Math.round(o._display_prob*100) + '%' : ''}</td>
+      <td>${o.edge != null ? (o.edge*100).toFixed(0) + 'pp' : ''}</td>
+      <td>${o.confidence ?? ''}</td>
       <td>${o.shares ?? ''}</td>
       <td>${o.entry_price != null ? Math.round(o.entry_price*100) + '¢' : ''}</td>
       <td>${fmtMoney(o.cost)}</td>
       <td>${fmtMoney(o.payout)}</td>
       <td style="color:${(o.pnl||0) >= 0 ? 'var(--win)' : 'var(--loss)'}">${fmtMoney(o.pnl)}</td>
       <td>${escapeHtml(o.status || '')}</td>
+      <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
+      <td><button class="btn small" onclick="viewAlert(${o.id})">View</button></td>
     </tr>
   `).join('');
 }
@@ -533,6 +543,13 @@ async function loadPositions() {
   if (c) p.set('city_id', c);
   const r = await api('/positions?' + p); if (!r.ok) return;
   const rows = await r.json();
+  // Side-aware probability so the displayed P matches the chosen side (YES/NO),
+  // mirroring the Opportunities screen.
+  rows.forEach(o => {
+    o._display_prob = (o.true_prob == null)
+      ? null
+      : ((o.side === 'NO') ? (1 - o.true_prob) : o.true_prob);
+  });
   _registerTable('positionsBody', rows, _renderPositions, { key: 'detected_at', dir: 'desc', type: 'date' });
 }
 
