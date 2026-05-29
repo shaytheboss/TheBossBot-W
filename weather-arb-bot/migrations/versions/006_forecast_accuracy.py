@@ -1,13 +1,13 @@
 """Add forecast_accuracy table for learned model error statistics.
 
 Revision ID: 006_forecast_accuracy
-Revises: 005_add_bucket_unit
+Revises: 005
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "006_forecast_accuracy"
-down_revision = "005_add_bucket_unit"
+down_revision = "005"
 branch_labels = None
 depends_on = None
 
