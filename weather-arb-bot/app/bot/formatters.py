@@ -20,12 +20,12 @@ def _coord_str(lat: Optional[float], lon: Optional[float]) -> str:
 
 
 def _api_coord_tag(used_lat: Optional[float], used_lon: Optional[float]) -> str:
-    """Return a short coordinate tag for source lines, e.g. [📍 30.162°N, 97.664°W]."""
+    """Return a short coordinate tag for source lines, e.g. [\U0001f4cd 30.162°N, 97.664°W]."""
     if used_lat is None or used_lon is None:
         return ""
     ns = "N" if used_lat >= 0 else "S"
     ew = "E" if used_lon >= 0 else "W"
-    return f" [📍 {abs(used_lat):.3f}°{ns}, {abs(used_lon):.3f}°{ew}]"
+    return f" [\U0001f4cd {abs(used_lat):.3f}°{ns}, {abs(used_lon):.3f}°{ew}]"
 
 
 def _agreement_label(spread_f: float) -> str:
@@ -429,12 +429,11 @@ def fmt_opportunity(
     side_prob_pct = round((1 - true_prob if is_no else true_prob) * 100)
     edge_pct = round(edge * 100)
 
-    # F.2: confidence interval suffix shown next to P(side).
-    # source_std_pp is the population stdev across model-level probability
-    # estimates (det + ensemble + wg) in percentage points.
-    source_std_pp = blend.get("source_std_pp")
-    if source_std_pp is not None and source_std_pp >= 0.5:
-        ci_suffix = f" ± {round(float(source_std_pp))}pp"
+    # F2: half-width CI in percentage points, derived from forecast std dev.
+    # ci_pp is computed in probability_estimator as abs(p_ci_hi - p_ci_lo) / 2 * 100.
+    ci_pp = blend.get("ci_pp")
+    if ci_pp is not None and float(ci_pp) >= 0.5:
+        ci_suffix = f" ± {round(float(ci_pp))}pp"
     else:
         ci_suffix = ""
 
@@ -491,7 +490,7 @@ def fmt_opportunity(
         confidence_decreased = prob_change < 0
         warn_flag = " ⚠️" if confidence_decreased else ""
         update_section = (
-            f"🔁 *UPDATE{warn_flag}* (previously alerted {prior_ts})\n"
+            f"\U0001f501 *UPDATE{warn_flag}* (previously alerted {prior_ts})\n"
             f"   Was: P({side})={prior_side_prob}%, ask={prior_ask_c}¢ | Edge=+{prior_edge_pp}pp\n"
             f"   Now: P({side})={current_side_prob}%, ask={current_ask_c}¢ | Edge=+{edge_pct}pp\n"
             f"   Change: confidence {conf_arrow}"
@@ -502,8 +501,7 @@ def fmt_opportunity(
             price_arrow = f"↑{abs(price_change)}¢" if price_change > 0 else f"↓{abs(price_change)}¢"
             update_section += f", price {price_arrow}"
         update_section += "\n"
-        # F.3: "Why now?" — single line describing which forecast source moved
-        # the most since the previous alert.
+        # F3: which forecast source moved the most since the previous alert
         update_section += _why_now_line(prior_opportunity, blend)
         update_section += "\n"
 
@@ -704,6 +702,14 @@ def fmt_opportunity(
             f"• Pre-adjustment P({side}) = {round(_to_side(blend_pre) * 100, 1)}%"
         )
 
+    # C: market normalization scale
+    norm_scale = blend.get("normalization_scale")
+    if norm_scale is not None and abs(float(norm_scale) - 1.0) > 0.02:
+        math_lines.append(
+            f"• Market normalisation: ×{float(norm_scale):.3f} "
+            f"_(raw bucket probs renormalized to sum=1 across outcomes)_"
+        )
+
     if obs_skipped:
         math_lines.append(
             "• _Observation-based adjustments (METAR trend, ref wind, PIREP) "
@@ -741,6 +747,24 @@ def fmt_opportunity(
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
                 f"_(sources on both sides of bucket edge)_"
+            )
+        elif name == "Dew point convergence":
+            dew_info = blend.get("dew_convergence") or {}
+            spread_note = ""
+            if dew_info.get("spread_f") is not None:
+                spread_note = f" (T−Td={dew_info['spread_f']}°F)"
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"_(near-saturated air{spread_note} suppresses daytime max)_"
+            )
+        elif name == "Station gradient (sea/lake-breeze proxy)":
+            grad_info = blend.get("station_gradient") or {}
+            grad_note = ""
+            if grad_info.get("gradient_f") is not None:
+                grad_note = f" (+{grad_info['gradient_f']}°F primary vs ref)"
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"_(onshore marine air likely{grad_note})_"
             )
         else:
             math_lines.append(
@@ -800,6 +824,21 @@ def fmt_opportunity(
             avg_f = avg_c * 9 / 5 + 32
             atm_lines.append(
                 f"• PIREP: {fmt_temp_dual(avg_f, is_c)} avg at low altitude"
+            )
+        # E2: Dew point convergence signal
+        dew_info = blend.get("dew_convergence")
+        if dew_info:
+            atm_lines.append(
+                f"• \U0001f4a7 Dew convergence: T−Td={dew_info.get('spread_f', '?')}°F "
+                f"— near-saturated air, daytime max suppressed (×0.92)"
+            )
+        # E3: Station gradient signal
+        grad_info = blend.get("station_gradient")
+        if grad_info:
+            atm_lines.append(
+                f"• \U0001f30a Station gradient: primary {grad_info.get('primary_f', '?')}°F, "
+                f"ref {grad_info.get('reference_f', '?')}°F "
+                f"(+{grad_info.get('gradient_f', '?')}°F) — sea/lake-breeze likely (×0.91)"
             )
         if atm_lines:
             atm_section = (
