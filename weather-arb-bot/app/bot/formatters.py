@@ -71,16 +71,21 @@ def _closes_in_text(market_date: date, city_tz_str: Optional[str]) -> str:
 # Risk banner
 # ---------------------------------------------------------------------------
 
-def _risk_banner(blend: dict, ci_pp: Optional[float]) -> str:
+def _risk_banner(blend: dict, ci_pp: Optional[float], is_open_ended: bool = False) -> str:
     """Return a one-line plain-language risk summary with a colour-coded level.
 
     Thresholds:
-      RED    - spread > 6°F  OR  ci_pp > 20pp  OR  boundary dist < 0.5°F
+      RED    - spread > 6°F  OR  ci_pp > 20pp  OR  boundary dist < 0.5°F  OR open-ended
       YELLOW - spread > 3°F  OR  ci_pp > 10pp  OR  boundary dist < 1.5°F  OR straddle
       GREEN  - everything else
     """
     reasons: list[str] = []
     level = 0  # 0=green, 1=yellow, 2=red
+
+    # Open-ended buckets ("X or higher" / "X or lower") are inherently higher risk
+    if is_open_ended:
+        reasons.append("open-ended bucket (tail event — harder to forecast)")
+        level = max(level, 2)
 
     # Source spread
     model_dis = blend.get("model_disagreement") or {}
@@ -536,7 +541,7 @@ def fmt_opportunity(
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
 
     # ── Risk banner ─────────────────────────────────────────────────────────
-    risk_line = _risk_banner(blend, ci_pp_val)
+    risk_line = _risk_banner(blend, ci_pp_val, is_open_ended=blend.get("is_open_ended", False))
 
     # ── Per-source forecast breakdown ─────────────────────────────────────────
     sigma_hint = (
@@ -632,9 +637,14 @@ def fmt_opportunity(
             return None
         return 1 - p if is_no else p
 
+    is_open_ended_bucket = blend.get("is_open_ended", False)
+    open_ended_note = (
+        " _(open-ended bucket: 1.5× σ applied for tail-event uncertainty)_"
+        if is_open_ended_bucket else ""
+    )
     math_intro = (
-        f"_Forecast σ = ±{sigma_used:.1f}°F for a {_lead_label(days_ahead)}; "
-        f"this controls how confident a single point forecast can be._"
+        f"_Forecast σ = ±{sigma_used:.1f}°F for a {_lead_label(days_ahead)}"
+        f"{open_ended_note}; this controls how confident a single point forecast can be._"
         if sigma_used is not None else ""
     )
     math_lines = ["⚗️ *How we got to this estimate*"]
@@ -731,7 +741,7 @@ def fmt_opportunity(
     if final_p is not None:
         math_lines.append(
             f"• *Final P({side}) = {round(_to_side(final_p) * 100, 1)}%* "
-            f"(clipped to [3%, 97%])"
+            f"(clipped to [3%, 92%])"
         )
     math_section = "\n".join(math_lines)
 

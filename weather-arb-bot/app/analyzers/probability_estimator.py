@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _PROB_CLIP_LO = 0.03
-_PROB_CLIP_HI = 0.97
+_PROB_CLIP_HI = 0.92  # lowered from 0.97 — prevents any signal from claiming >92% confidence
 
 _STUDENT_T_DF = 6  # B4: heavier tails than Gaussian -> more conservative near bucket edges
 
@@ -52,9 +52,11 @@ def _parse_coord(val) -> Optional[float]:
 
 
 def forecast_sigma_for_lead(days_ahead: Optional[int]) -> float:
+    # Calibrated against real MAE data: NWP daily-high errors are ~2-3°F same-day,
+    # growing to ~5°F by day 5. Prior version (1.5 + 0.5*d) was far too optimistic.
     if days_ahead is None or days_ahead < 0:
-        return 3.0
-    return min(4.5, 1.5 + 0.5 * days_ahead)
+        return 4.0
+    return min(5.5, 2.5 + 0.5 * days_ahead)
 
 
 def _bucket_to_f_bounds(
@@ -296,10 +298,18 @@ def estimate_with_breakdown(
     sigma = forecast_sigma_for_lead(days_ahead)
     observation_skipped = days_ahead is not None and days_ahead >= 1
 
+    # Open-ended buckets ("X or higher" / "X or lower") represent tail events where
+    # forecast errors are systematically larger than for bounded ranges.
+    # Apply a 1.5x sigma multiplier so the model is appropriately less certain.
+    is_open_ended = (bucket_min is None) != (bucket_max is None)
+    if is_open_ended:
+        sigma = sigma * 1.5
+
     breakdown: dict = {
         "is_low_market": bool(is_low_market),
         "days_ahead": int(days_ahead) if days_ahead is not None else None,
         "sigma_used": float(sigma),
+        "is_open_ended": is_open_ended,
         "student_t_df": _STUDENT_T_DF,
         "observation_skipped": bool(observation_skipped),
         "bucket_unit": bucket_unit,
