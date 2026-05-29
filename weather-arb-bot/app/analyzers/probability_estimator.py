@@ -7,6 +7,8 @@ logger = logging.getLogger(__name__)
 _PROB_CLIP_LO = 0.03
 _PROB_CLIP_HI = 0.97
 
+_STUDENT_T_DF = 6  # B4: heavier tails than Gaussian -> more conservative near bucket edges
+
 _DET_SOURCES = (
     ("gfs_forecast", "GFS (global)"),
     ("ecmwf_forecast", "ECMWF"),
@@ -14,6 +16,7 @@ _DET_SOURCES = (
     ("nws_forecast", "NWS (official)"),
     ("tomorrowio_forecast", "Tomorrow.io"),
     ("meteosource_forecast", "Meteosource"),
+    ("icon_forecast", "ICON (DWD)"),   # A3: DWD ICON via Open-Meteo, wired into blend
 )
 
 BOUNDARY_WINDOW_F = 1.5
@@ -30,12 +33,6 @@ STRADDLE_EXTRA_BLEND = 0.10
 # deterministic sources contributed (e.g. non-CONUS cities missing HRRR/NWS).
 _SPARSE_SOURCE_BASELINE = 3
 _SPARSE_SOURCE_SHRINK_PER_MISSING = 0.05   # 5pp per missing source vs baseline
-
-# B.5 Discretization: METAR observations and several forecast sources are
-# rounded to 1°F. The standard deviation of a uniform(-0.5, +0.5) noise is
-# 1/sqrt(12) ≈ 0.289°F. We combine it with the forecast sigma in quadrature
-# so the Gaussian bucket integral accounts for measurement quantisation.
-DISCRETIZATION_SIGMA_F = 0.289
 
 
 def _parse_coord(val) -> Optional[float]:
@@ -68,13 +65,13 @@ def _bucket_to_f_bounds(
     """Convert (bucket_min, bucket_max) in native unit to exclusive Fahrenheit
     float bounds suitable for comparison against forecast values (always F).
 
-    For unit='F': applies the existing ±0.5°F half-bin so a forecast at a
+    For unit='F': applies the existing +/-0.5 deg F half-bin so a forecast at a
     bucket boundary contributes ~25-50%, not 0/100%. Range covered is
     [bmin - 0.5, bmax + 0.5).
 
-    For unit='C': exact conversion of the Celsius integer range. "32°C"
-    bucket (bmin=32, bmax=32) covers [32, 33)°C = [89.6, 91.4)°F. No
-    half-bin needed since the C→F conversion is already exact.
+    For unit='C': exact conversion of the Celsius integer range. "32 deg C"
+    bucket (bmin=32, bmax=32) covers [32, 33)C = [89.6, 91.4)F. No
+    half-bin needed since the C->F conversion is already exact.
     """
     if unit == "C":
         f_lo = (bucket_min * 9 / 5 + 32) if bucket_min is not None else None
@@ -136,12 +133,7 @@ def _bucket_contains(
     bucket_max: Optional[float],
     unit: str = "F",
 ) -> bool:
-    """True iff value_f (always in °F) falls inside the bucket.
-
-    For C buckets, value_f is converted to °C precisely before compare.
-    The bucket range covered is [bmin, bmax+1) in native unit, so we use
-    a strict < on the upper edge.
-    """
+    """True iff value_f (always in deg F) falls inside the bucket."""
     if bucket_min is None and bucket_max is None:
         return False
     if unit == "C":
@@ -169,12 +161,105 @@ def _gaussian_bucket_prob(
     sigma: float = 3.0,
     unit: str = "F",
 ) -> Optional[float]:
+    """Kept for ensemble sanity-checks; main deterministic path uses Student-t."""
     if forecast_val is None:
         return None
     f_lo, f_hi = _bucket_to_f_bounds(bucket_min, bucket_max, unit)
     lo = f_lo if f_lo is not None else -1e9
     hi = f_hi if f_hi is not None else 1e9
     return _norm_cdf((hi - forecast_val) / sigma) - _norm_cdf((lo - forecast_val) / sigma)
+
+
+# --- B4: Student-t heavy tails (pure Python, no scipy) -----------------------
+
+def _betacf(a: float, b: float, x: float) -> float:
+    """Lentz continued-fraction for regularized incomplete beta (Numerical Recipes 6.4)."""
+    MAXIT = 200
+    EPS = 3.0e-7
+    FPMIN = 1.0e-30
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, MAXIT + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < EPS:
+            break
+    return h
+
+
+def _betai(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta function I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbeta = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+    front = math.exp(math.log(x) * a + math.log(1.0 - x) * b - lbeta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    else:
+        return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def _student_t_cdf(t: float, df: float) -> float:
+    """CDF of Student's t(df) evaluated at t."""
+    x = df / (df + t * t)
+    ibeta = _betai(df / 2.0, 0.5, x)
+    return 0.5 * ibeta if t < 0 else 1.0 - 0.5 * ibeta
+
+
+def _student_t_bucket_prob(
+    forecast_val: Optional[float],
+    bucket_min: Optional[float],
+    bucket_max: Optional[float],
+    sigma: float = 3.0,
+    df: float = _STUDENT_T_DF,
+    unit: str = "F",
+) -> Optional[float]:
+    """P(actual in bucket) under Student-t(df) centred at forecast_val with scale sigma.
+
+    Heavier tails than Gaussian: when the forecast sits near a bucket edge,
+    more probability leaks across it -> more conservative estimates -> less
+    overconfidence near resolution boundaries.
+    """
+    if forecast_val is None:
+        return None
+    f_lo, f_hi = _bucket_to_f_bounds(bucket_min, bucket_max, unit)
+    lo = f_lo if f_lo is not None else -1e9
+    hi = f_hi if f_hi is not None else 1e9
+    t_lo = (lo - forecast_val) / sigma
+    t_hi = (hi - forecast_val) / sigma
+    cdf_hi = _student_t_cdf(t_hi, df) if hi < 1e8 else 1.0
+    cdf_lo = _student_t_cdf(t_lo, df) if lo > -1e8 else 0.0
+    return max(0.0, cdf_hi - cdf_lo)
+
+
+# -----------------------------------------------------------------------------
 
 
 def _ensemble_bucket_prob(
@@ -208,19 +293,14 @@ def estimate_with_breakdown(
     ensemble_key = "ensemble_lows" if is_low_market else "ensemble_highs"
     p50_key = "p50_low_f" if is_low_market else "p50_high_f"
 
-    # Combine forecast sigma with the ±0.5°F observation/forecast discretisation
-    # noise in quadrature. This nudges P(in bucket) away from 0/100% for
-    # forecast values sitting exactly on a bucket integer boundary.
-    raw_sigma = forecast_sigma_for_lead(days_ahead)
-    sigma = math.sqrt(raw_sigma * raw_sigma + DISCRETIZATION_SIGMA_F * DISCRETIZATION_SIGMA_F)
+    sigma = forecast_sigma_for_lead(days_ahead)
     observation_skipped = days_ahead is not None and days_ahead >= 1
 
     breakdown: dict = {
         "is_low_market": bool(is_low_market),
         "days_ahead": int(days_ahead) if days_ahead is not None else None,
         "sigma_used": float(sigma),
-        "sigma_raw": float(raw_sigma),
-        "discretization_sigma": float(DISCRETIZATION_SIGMA_F),
+        "student_t_df": _STUDENT_T_DF,
         "observation_skipped": bool(observation_skipped),
         "bucket_unit": bucket_unit,
         "deterministic": [],
@@ -234,6 +314,8 @@ def estimate_with_breakdown(
         "model_disagreement": None,
         "straddle_info": None,
         "adjustments": [],
+        "forecast_std_dev_f": None,
+        "ci_pp": None,
         "final": None,
     }
 
@@ -244,7 +326,7 @@ def estimate_with_breakdown(
         val = src_data.get(fc_key)
         if val is None:
             continue
-        p = _gaussian_bucket_prob(val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
+        p = _student_t_bucket_prob(val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
         if p is None:
             continue
         det_probs.append(p)
@@ -285,7 +367,7 @@ def estimate_with_breakdown(
 
     wg_src = signals.get("wunderground_forecast") or {}
     wg_val = wg_src.get(fc_key)
-    wg_p = _gaussian_bucket_prob(wg_val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
+    wg_p = _student_t_bucket_prob(wg_val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
     if wg_val is not None:
         wg_entry: dict = {
             "value_f": float(wg_val),
@@ -303,6 +385,20 @@ def estimate_with_breakdown(
     all_source_forecasts = list(det_vals)
     if wg_val is not None:
         all_source_forecasts.append(float(wg_val))
+
+    # F2: compute forecast std dev and confidence interval across sources
+    if len(all_source_forecasts) >= 2:
+        mean_f = sum(all_source_forecasts) / len(all_source_forecasts)
+        var_f = sum((f - mean_f) ** 2 for f in all_source_forecasts) / (len(all_source_forecasts) - 1)
+        std_dev_f = math.sqrt(var_f)
+        breakdown["forecast_std_dev_f"] = round(std_dev_f, 2)
+        p_ci_hi = _student_t_bucket_prob(
+            mean_f + std_dev_f, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit
+        ) or 0.0
+        p_ci_lo = _student_t_bucket_prob(
+            mean_f - std_dev_f, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit
+        ) or 0.0
+        breakdown["ci_pp"] = round(abs(p_ci_hi - p_ci_lo) / 2.0 * 100.0, 1)
 
     ensemble_weight = ENSEMBLE_WEIGHT_BASE
     det_weight = 1.0 - ensemble_weight
@@ -410,6 +506,10 @@ def estimate_with_breakdown(
             })
 
     if not observation_skipped:
+        # F-equivalent bucket floor for warm-bucket checks
+        f_lo_w, _ = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
+        bucket_requires_warmth = f_lo_w is not None and f_lo_w >= 66
+
         p_before = p
         trend = signals.get("metar_trend") or {}
         rate = trend.get("temp_rate_per_hour", 0.0) or 0.0
@@ -424,9 +524,6 @@ def estimate_with_breakdown(
             breakdown["adjustments"].append({"name": "METAR trend", "delta": float(p - p_before)})
         p_before = p
 
-        # 'Bucket requires warmth' heuristic still keyed on F-equivalent floor.
-        f_lo_w, _ = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
-        bucket_requires_warmth = f_lo_w is not None and f_lo_w >= 66
         ref = signals.get("reference_metar") or {}
         ref_wind_dir = ref.get("wind_direction")
         ref_wind_kt = ref.get("wind_speed_kt", 0) or 0
@@ -451,7 +548,7 @@ def estimate_with_breakdown(
         if low_pireps:
             avg_c = sum(r["temperature_c"] for r in low_pireps) / len(low_pireps)
             avg_f = avg_c * 9 / 5 + 32
-            pirep_p = _gaussian_bucket_prob(
+            pirep_p = _student_t_bucket_prob(
                 avg_f, bucket_min, bucket_max, sigma=4.0, unit=bucket_unit
             )
             if pirep_p is not None:
@@ -460,38 +557,53 @@ def estimate_with_breakdown(
             breakdown["adjustments"].append({"name": "Low-altitude PIREP", "delta": float(p - p_before)})
         p_before = p
 
-        # Same-day METAR running max: the highest temperature recorded today
-        # is a hard constraint on probability.
-        metar_today_max = signals.get("metar_today_max_f")
-        if metar_today_max is not None:
-            f_lo_b, f_hi_b = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
-            if f_hi_b is not None and metar_today_max >= f_hi_b:
-                p = _PROB_CLIP_LO
-                breakdown["adjustments"].append({
-                    "name": "METAR running max (above bucket)",
-                    "delta": float(p - p_before),
-                })
-            elif (
-                f_lo_b is not None
-                and f_hi_b is not None
-                and f_lo_b <= metar_today_max < f_hi_b
-                and rate < 0.5
-            ):
-                new_p = min(_PROB_CLIP_HI, max(p, 0.92))
-                if abs(new_p - p) > 1e-6:
-                    p = new_p
+        # E2: Dew point convergence -- near-saturated air suppresses daytime max
+        primary = signals.get("primary_metar") or {}
+        primary_temp_f = primary.get("temperature_f")
+        primary_dew_f = primary.get("dew_point_f")
+        if (
+            primary_temp_f is not None
+            and primary_dew_f is not None
+            and bucket_requires_warmth
+        ):
+            dew_spread_f = primary_temp_f - primary_dew_f
+            if dew_spread_f < 5.0:
+                p = max(_PROB_CLIP_LO, p * 0.92)
+                if abs(p - p_before) > 1e-6:
                     breakdown["adjustments"].append({
-                        "name": "METAR running max (inside bucket, peak passed)",
+                        "name": "Dew point convergence",
                         "delta": float(p - p_before),
                     })
-            if abs(p - p_before) > 1e-6:
-                breakdown["metar_today_max_applied"] = {
-                    "running_max_f": float(metar_today_max),
-                    "trend_rate": float(rate),
-                }
+                    breakdown["dew_convergence"] = {
+                        "spread_f": round(dew_spread_f, 1),
+                        "note": "near-saturated air suppresses daytime max",
+                    }
+                p_before = p
 
-    # Sparse-source shrinkage: blend toward 50% when fewer than
-    # _SPARSE_SOURCE_BASELINE deterministic sources contributed.
+        # E3: Station temperature gradient (sea/lake-breeze proxy)
+        # Reference station significantly cooler than primary -> onshore marine air likely
+        ref_temp_f = ref.get("temperature_f")
+        if (
+            primary_temp_f is not None
+            and ref_temp_f is not None
+            and bucket_requires_warmth
+        ):
+            gradient_f = primary_temp_f - ref_temp_f
+            if gradient_f > 8.0:
+                p = max(_PROB_CLIP_LO, p * 0.91)
+                if abs(p - p_before) > 1e-6:
+                    breakdown["adjustments"].append({
+                        "name": "Station gradient (sea/lake-breeze proxy)",
+                        "delta": float(p - p_before),
+                    })
+                    breakdown["station_gradient"] = {
+                        "primary_f": round(primary_temp_f, 1),
+                        "reference_f": round(ref_temp_f, 1),
+                        "gradient_f": round(gradient_f, 1),
+                    }
+                p_before = p
+
+    # Sparse-source shrinkage
     if n_det < _SPARSE_SOURCE_BASELINE:
         shrink = (_SPARSE_SOURCE_BASELINE - n_det) * _SPARSE_SOURCE_SHRINK_PER_MISSING
         p_before = p
@@ -505,23 +617,6 @@ def estimate_with_breakdown(
             "baseline": _SPARSE_SOURCE_BASELINE,
             "shrink_applied": round(shrink, 3),
         }
-
-    # F.2 Confidence interval: standard deviation across all model-level
-    # probability estimates (deterministic + ensemble + wunderground). This
-    # is a coarse ±1σ around our blended P, intended for user display only.
-    # When fewer than 2 estimates are available we omit it.
-    all_model_probs = list(det_probs)
-    if ens_p is not None:
-        all_model_probs.append(float(ens_p))
-    if wg_p is not None:
-        all_model_probs.append(float(wg_p))
-    if len(all_model_probs) >= 2:
-        mean_p = sum(all_model_probs) / len(all_model_probs)
-        var = sum((q - mean_p) * (q - mean_p) for q in all_model_probs) / len(all_model_probs)
-        std_pp = math.sqrt(var) * 100.0
-        breakdown["source_std_pp"] = round(std_pp, 1)
-    else:
-        breakdown["source_std_pp"] = None
 
     final = _clip(p)
     breakdown["final"] = float(final)
