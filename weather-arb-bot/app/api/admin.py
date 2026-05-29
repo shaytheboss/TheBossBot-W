@@ -498,6 +498,18 @@ async def admin_positions(
             "pnl": float(opp.virtual_pnl) if opp.virtual_pnl is not None else None,
             "status": opp.virtual_status,
             "outcome": opp.outcome,
+            # Mirror the data shown on the Opportunities screen so a position
+            # row carries its own probability estimate / edge / link, and the
+            # alert text stays reachable via /opportunities/{id}/alert using
+            # this same opp id (the existing "View" modal endpoint).
+            "true_prob": float(opp.estimated_true_prob) if opp.estimated_true_prob is not None else None,
+            "market_price": float(opp.market_price) if opp.market_price is not None else None,
+            "edge": float(opp.edge) if opp.edge is not None else None,
+            "confidence": opp.confidence_score,
+            "market_url": (
+                f"https://polymarket.com/event/{market.external_id}"
+                if market.external_id else None
+            ),
         })
     return out
 
