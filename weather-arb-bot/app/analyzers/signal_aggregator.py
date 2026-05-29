@@ -3,7 +3,7 @@ import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func as sqlfunc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.metar import MetarObservation
@@ -18,12 +18,7 @@ logger = logging.getLogger(__name__)
 def _c_bucket_to_f_int_range(
     bmin_c: Optional[int], bmax_c: Optional[int]
 ) -> tuple[Optional[int], Optional[int]]:
-    """Return the integer-°F approximation of a Celsius bucket for display.
-
-    For "32°C" (covers [32, 33)°C = [89.6, 91.4)°F): the integer F readings
-    inside are {90, 91}. Returns (90, 91). Used by the formatter to render
-    a meaningful "32°C (= 90–91°F)" hint.
-    """
+    """Return the integer-F approximation of a Celsius bucket for display."""
     if bmin_c is None and bmax_c is None:
         return None, None
     if bmin_c is not None:
@@ -52,6 +47,7 @@ class SignalAggregator:
         if reference_icao:
             signals["reference_metar"] = await self._latest_metar(db, reference_icao)
         signals["metar_trend"] = await self._metar_trend(db, primary_icao, hours=3)
+        signals["metar_today_max_f"] = await self._today_max_temp(db, primary_icao)
         signals["wunderground_forecast"] = await self._latest_forecast(db, city_id, "wunderground", forecast_date)
         signals["gfs_forecast"] = await self._latest_forecast(db, city_id, "gfs", forecast_date)
         signals["ecmwf_forecast"] = await self._latest_forecast(db, city_id, "ecmwf", forecast_date)
@@ -59,21 +55,18 @@ class SignalAggregator:
         signals["nws_forecast"] = await self._latest_forecast(db, city_id, "nws", forecast_date)
         signals["tomorrowio_forecast"] = await self._latest_forecast(db, city_id, "tomorrowio", forecast_date)
         signals["meteosource_forecast"] = await self._latest_forecast(db, city_id, "meteosource", forecast_date)
+        signals["icon_forecast"] = await self._latest_forecast(db, city_id, "icon", forecast_date)
         signals["gfs_ensemble"] = await self._latest_forecast(db, city_id, "gfs_ensemble", forecast_date)
         signals["pireps"] = await self._recent_pireps(db, primary_icao, hours=2)
         signals["market_price"] = await self._latest_price(db, outcome.id)
         signals["price_trend"] = await self._price_trend(db, outcome.id, minutes=60)
         signals["is_low_market"] = is_low_market
 
-        # Defensive: fall back to label inspection when the persisted
-        # bucket_unit column hasn't been backfilled by migration 005 yet.
         bucket_unit = resolve_bucket_unit(outcome)
         signals["_bucket_unit"] = bucket_unit
         signals["_bucket_native_min"] = outcome.bucket_min
         signals["_bucket_native_max"] = outcome.bucket_max
 
-        # `_bucket_min`/`_bucket_max` are the F-equivalent integer range, used
-        # by the formatter for legacy display logic ("well above 80-81°F").
         if bucket_unit == "C":
             f_lo, f_hi = _c_bucket_to_f_int_range(outcome.bucket_min, outcome.bucket_max)
             signals["_bucket_min"] = f_lo
@@ -131,6 +124,19 @@ class SignalAggregator:
             "oldest_temp_f": temps[0],
             "span_hours": round(hours_span, 2),
         }
+
+    async def _today_max_temp(self, db, icao) -> Optional[float]:
+        """Running maximum of today's METAR observations (UTC day)."""
+        today = date.today()
+        day_start = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        result = await db.execute(
+            select(sqlfunc.max(MetarObservation.temperature_f)).where(
+                MetarObservation.icao == icao,
+                MetarObservation.observed_at >= day_start,
+            )
+        )
+        val = result.scalar_one_or_none()
+        return float(val) if val is not None else None
 
     async def _latest_forecast(self, db, city_id, source, forecast_date: Optional[date] = None):
         q = select(Forecast).where(Forecast.city_id == city_id, Forecast.source == source)

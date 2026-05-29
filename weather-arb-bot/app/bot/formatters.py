@@ -20,12 +20,12 @@ def _coord_str(lat: Optional[float], lon: Optional[float]) -> str:
 
 
 def _api_coord_tag(used_lat: Optional[float], used_lon: Optional[float]) -> str:
-    """Return a short coordinate tag for source lines, e.g. [📍 30.162°N, 97.664°W]."""
+    """Return a short coordinate tag for source lines, e.g. [\U0001f4cd 30.162°N, 97.664°W]."""
     if used_lat is None or used_lon is None:
         return ""
     ns = "N" if used_lat >= 0 else "S"
     ew = "E" if used_lon >= 0 else "W"
-    return f" [📍 {abs(used_lat):.3f}°{ns}, {abs(used_lon):.3f}°{ew}]"
+    return f" [\U0001f4cd {abs(used_lat):.3f}°{ns}, {abs(used_lon):.3f}°{ew}]"
 
 
 def _agreement_label(spread_f: float) -> str:
@@ -76,6 +76,45 @@ def _closes_in_text(market_date: date, city_tz_str: Optional[str]) -> str:
         return f"~{total_hours:.0f}h"
 
 
+def _why_now_line(prior_opp, current_blend: dict) -> str:
+    """F.3 — 'Why now?' summary comparing forecast values vs the previous alert.
+
+    Examines per-source deterministic forecast values stored in opportunity
+    signals (_blend.deterministic). Picks the source whose value moved the
+    most between the prior alert and now, and renders e.g.:
+        "   Why now: ECMWF dropped 2°F since last alert\n"
+    Returns an empty string when prior signals are missing or no source
+    moved by at least 1°F.
+    """
+    if prior_opp is None:
+        return ""
+    prior_signals = getattr(prior_opp, "signals", None) or {}
+    prior_blend = prior_signals.get("_blend") or {}
+    prior_det = prior_blend.get("deterministic") or []
+    current_det = current_blend.get("deterministic") or []
+    if not prior_det or not current_det:
+        return ""
+
+    prior_by_src = {d.get("source"): d.get("value_f") for d in prior_det}
+    biggest = None  # (source, delta_f)
+    for d in current_det:
+        src = d.get("source")
+        cur_val = d.get("value_f")
+        prior_val = prior_by_src.get(src)
+        if cur_val is None or prior_val is None:
+            continue
+        delta = float(cur_val) - float(prior_val)
+        if biggest is None or abs(delta) > abs(biggest[1]):
+            biggest = (src, delta)
+
+    if biggest is None or abs(biggest[1]) < 1.0:
+        return ""
+
+    src, delta = biggest
+    verb = "rose" if delta > 0 else "dropped"
+    return f"   Why now: {src} {verb} {abs(round(delta))}°F since last alert\n"
+
+
 def _bottom_line(
     blend: dict, bucket_min, bucket_max, side: str, is_c: bool
 ) -> Optional[str]:
@@ -111,8 +150,6 @@ def _bottom_line(
             )
 
         if bucket_min is not None and bucket_max is not None:
-            # Use min/max of sources (not avg) so we don't say "well above"
-            # when the lowest source is right at the bucket top.
             if lo_f > bucket_max + 2:
                 parts.append(
                     f"That's well above the {bucket_min}–{bucket_max}°F bucket."
@@ -242,12 +279,7 @@ def _ensemble_verdict(
 
 
 def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
-    """Build the verbose uncertainty breakdown section for the alert.
-
-    Shows model disagreement weight reduction, boundary proximity using closest
-    source, and straddle detection when applicable.
-    Returns empty string when no uncertainty adjustments were applied.
-    """
+    """Build the verbose uncertainty breakdown section for the alert."""
     side = "NO" if is_no else "YES"
     lines: list[str] = []
 
@@ -271,7 +303,6 @@ def _build_uncertainty_section(blend: dict, is_no: bool) -> str:
         ew_pct_base = round(ew_base * 100)
         ew_pct_used = round(ew_used * 100)
 
-        # Find which sources contributed to the spread
         det = blend.get("deterministic") or []
         wg = blend.get("wunderground")
         all_sources_named = [(d["source"], d["value_f"]) for d in det]
@@ -398,6 +429,14 @@ def fmt_opportunity(
     side_prob_pct = round((1 - true_prob if is_no else true_prob) * 100)
     edge_pct = round(edge * 100)
 
+    # F2: half-width CI in percentage points, derived from forecast std dev.
+    # ci_pp is computed in probability_estimator as abs(p_ci_hi - p_ci_lo) / 2 * 100.
+    ci_pp = blend.get("ci_pp")
+    if ci_pp is not None and float(ci_pp) >= 0.5:
+        ci_suffix = f" ± {round(float(ci_pp))}pp"
+    else:
+        ci_suffix = ""
+
     if event_date:
         date_str = (
             event_date.strftime("%b %d, %Y")
@@ -407,7 +446,7 @@ def fmt_opportunity(
     else:
         date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
 
-    # ── UPDATE header (re-alert detection) ─────────────────────────────────────
+    # ── UPDATE header (re-alert detection) ──────────────────────────────────
     update_section = ""
     if prior_opportunity is not None:
         prior_dt = prior_opportunity.detected_at
@@ -434,7 +473,6 @@ def fmt_opportunity(
         else:
             conf_arrow = f"↓{abs(prob_change)}pp"
 
-        # Current ask price for comparison
         book = signals.get("_book") or {}
         entry_cost = signals.get("_entry_cost")
         if entry_cost is not None:
@@ -452,7 +490,7 @@ def fmt_opportunity(
         confidence_decreased = prob_change < 0
         warn_flag = " ⚠️" if confidence_decreased else ""
         update_section = (
-            f"🔁 *UPDATE{warn_flag}* (previously alerted {prior_ts})\n"
+            f"\U0001f501 *UPDATE{warn_flag}* (previously alerted {prior_ts})\n"
             f"   Was: P({side})={prior_side_prob}%, ask={prior_ask_c}¢ | Edge=+{prior_edge_pp}pp\n"
             f"   Now: P({side})={current_side_prob}%, ask={current_ask_c}¢ | Edge=+{edge_pct}pp\n"
             f"   Change: confidence {conf_arrow}"
@@ -462,9 +500,12 @@ def fmt_opportunity(
         if price_change != 0:
             price_arrow = f"↑{abs(price_change)}¢" if price_change > 0 else f"↓{abs(price_change)}¢"
             update_section += f", price {price_arrow}"
-        update_section += "\n\n"
+        update_section += "\n"
+        # F3: which forecast source moved the most since the previous alert
+        update_section += _why_now_line(prior_opportunity, blend)
+        update_section += "\n"
 
-    # ── Header / location ─────────────────────────────────────────────────────
+    # ── Header / location ────────────────────────────────────────────
     lat = signals.get("city_lat")
     lon = signals.get("city_lon")
     coord_str = _coord_str(lat, lon)
@@ -472,7 +513,7 @@ def fmt_opportunity(
     coord_part = f" | {coord_str}" if coord_str else ""
     loc_line = f"\U0001f4cd {city_name}{station_part}{coord_part} | {date_str}"
 
-    # ── Bucket display (dual unit when Celsius market) ──────────────────────────────
+    # ── Bucket display (dual unit when Celsius market) ──────────────────────────
     bucket_display = bucket_label
     f_range = fmt_bucket_range_f(bucket_min, bucket_max)
     if is_c and f_range:
@@ -480,7 +521,7 @@ def fmt_opportunity(
     elif (not is_c) and f_range and f_range.replace("–", "-") not in bucket_label.replace("–", "-"):
         bucket_display = f"{bucket_label} ({f_range})"
 
-    # ── Pricing line ────────────────────────────────────────────────────────────
+    # ── Pricing line ─────────────────────────────────────────────────
     book = signals.get("_book") or {}
     entry_cost = signals.get("_entry_cost")
     if entry_cost is not None and book.get("bid") is not None:
@@ -500,9 +541,7 @@ def fmt_opportunity(
         side_price_cents = round((1 - market_price if is_no else market_price) * 100)
         price_line = f"\U0001f4b0 Market {side} price: {side_price_cents}¢"
 
-    # ── Virtual buy section ─────────────────────────────────────────────────────
-    # Driven by the detector's `_create_virtual_buy` flag (truthful, since the
-    # actual Opportunity row may not yet be visible to the formatter caller).
+    # ── Virtual buy section ────────────────────────────────────────────────
     virtual_section = ""
     create_buy = signals.get("_create_virtual_buy")
     buy_thresh = signals.get("_buy_threshold")
@@ -524,11 +563,11 @@ def fmt_opportunity(
             f"buy threshold {round(float(buy_thresh) * 100)}%)"
         )
 
-    # ── Bottom-line verbal verdict ──────────────────────────────────────────────
+    # ── Bottom-line verbal verdict ─────────────────────────────────────────────
     bottom_line = _bottom_line(blend, bucket_min, bucket_max, side, is_c)
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
 
-    # ── Per-source forecast breakdown ────────────────────────────────────────────
+    # ── Per-source forecast breakdown ───────────────────────────────────────────
     sigma_hint = (
         f" · σ=±{sigma_used:.1f}°F ({_lead_label(days_ahead)})"
         if sigma_used is not None else ""
@@ -547,7 +586,6 @@ def fmt_opportunity(
         forecast_vals_f.append(val_f)
         p_in = det.get("p_in_bucket") or 0.0
         side_p = 1 - p_in if is_no else p_in
-        # Include API coordinates if available in the det entry
         coord_tag = _api_coord_tag(det.get("used_lat"), det.get("used_lon"))
         breakdown_lines.append(
             f"• {det['source']}: {fmt_temp_dual(val_f, is_c)} "
@@ -586,7 +624,7 @@ def fmt_opportunity(
     if spread_line:
         breakdown_text += "\n" + spread_line
 
-    # ── Ensemble section ──────────────────────────────────────────────────
+    # ── Ensemble section ────────────────────────────────────────
     ens = blend.get("ensemble")
     ens_section = ""
     if ens:
@@ -613,7 +651,7 @@ def fmt_opportunity(
             f"_{verdict}_"
         )
 
-    # ── Math walkthrough ────────────────────────────────────────────────────────────
+    # ── Math walkthrough ───────────────────────────────────────────────────
     det_avg = blend.get("det_avg")
     ens_p = blend.get("ens_p")
     wg_p = blend.get("wg_p")
@@ -664,6 +702,14 @@ def fmt_opportunity(
             f"• Pre-adjustment P({side}) = {round(_to_side(blend_pre) * 100, 1)}%"
         )
 
+    # C: market normalization scale
+    norm_scale = blend.get("normalization_scale")
+    if norm_scale is not None and abs(float(norm_scale) - 1.0) > 0.02:
+        math_lines.append(
+            f"• Market normalisation: ×{float(norm_scale):.3f} "
+            f"_(raw bucket probs renormalized to sum=1 across outcomes)_"
+        )
+
     if obs_skipped:
         math_lines.append(
             "• _Observation-based adjustments (METAR trend, ref wind, PIREP) "
@@ -702,6 +748,24 @@ def fmt_opportunity(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
                 f"_(sources on both sides of bucket edge)_"
             )
+        elif name == "Dew point convergence":
+            dew_info = blend.get("dew_convergence") or {}
+            spread_note = ""
+            if dew_info.get("spread_f") is not None:
+                spread_note = f" (T−Td={dew_info['spread_f']}°F)"
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"_(near-saturated air{spread_note} suppresses daytime max)_"
+            )
+        elif name == "Station gradient (sea/lake-breeze proxy)":
+            grad_info = blend.get("station_gradient") or {}
+            grad_note = ""
+            if grad_info.get("gradient_f") is not None:
+                grad_note = f" (+{grad_info['gradient_f']}°F primary vs ref)"
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"_(onshore marine air likely{grad_note})_"
+            )
         else:
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
@@ -718,13 +782,13 @@ def fmt_opportunity(
         )
     math_section = "\n".join(math_lines)
 
-    # ── Uncertainty breakdown section (Change 3) ─────────────────────────────────
+    # ── Uncertainty breakdown section ───────────────────────────────────────────
     uncertainty_text = _build_uncertainty_section(blend, is_no)
     uncertainty_section = (
         f"\n\n{uncertainty_text}" if uncertainty_text else ""
     )
 
-    # ── Atmospheric signals ──────────────────────────────────────────────────────
+    # ── Atmospheric signals ─────────────────────────────────────────────────────
     atm_section = ""
     if obs_skipped:
         atm_section = (
@@ -761,15 +825,29 @@ def fmt_opportunity(
             atm_lines.append(
                 f"• PIREP: {fmt_temp_dual(avg_f, is_c)} avg at low altitude"
             )
+        # E2: Dew point convergence signal
+        dew_info = blend.get("dew_convergence")
+        if dew_info:
+            atm_lines.append(
+                f"• \U0001f4a7 Dew convergence: T−Td={dew_info.get('spread_f', '?')}°F "
+                f"— near-saturated air, daytime max suppressed (×0.92)"
+            )
+        # E3: Station gradient signal
+        grad_info = blend.get("station_gradient")
+        if grad_info:
+            atm_lines.append(
+                f"• \U0001f30a Station gradient: primary {grad_info.get('primary_f', '?')}°F, "
+                f"ref {grad_info.get('reference_f', '?')}°F "
+                f"(+{grad_info.get('gradient_f', '?')}°F) — sea/lake-breeze likely (×0.91)"
+            )
         if atm_lines:
             atm_section = (
                 "\n\n\U0001f321️ *Atmospheric signals* (today's obs — used because "
                 "market resolves today)\n" + "\n".join(atm_lines)
             )
 
-    # ── Footer ───────────────────────────────────────────────────────────────────
+    # ── Footer ────────────────────────────────────────────────────────────
     hours_left = ""
-    # Change 2: timezone-correct closes-in calculation
     if event_date and isinstance(event_date, date):
         closes_txt = _closes_in_text(event_date, city_timezone)
         if closes_txt and closes_txt != "closed":
@@ -777,7 +855,6 @@ def fmt_opportunity(
         elif closes_txt == "closed":
             hours_left = "\n⏰ Market closed"
     elif resolution_time:
-        # Fallback: use raw resolution_time if no event_date
         delta = resolution_time - datetime.now(timezone.utc)
         h = int(delta.total_seconds() // 3600)
         if h > 0:
@@ -797,7 +874,7 @@ def fmt_opportunity(
         f"\U0001f4ca Market: {market_question}\n"
         f"\U0001f3e2 Bucket: {bucket_display} (*{side}*)\n\n"
         f"{price_line}\n"
-        f"\U0001f9e0 Our P({side}) estimate: {side_prob_pct}%\n"
+        f"\U0001f9e0 Our P({side}) estimate: {side_prob_pct}%{ci_suffix}\n"
         f"\U0001f4c8 Edge vs ask: +{edge_pct}pp"
         f"{virtual_section}"
         f"{bottom_line_section}\n\n"

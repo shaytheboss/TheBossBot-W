@@ -9,12 +9,20 @@ def compute_confidence(
 ) -> int:
     score = 40
 
-    gfs_high = (signals.get("gfs_forecast") or {}).get("predicted_high_f")
-    ecmwf_high = (signals.get("ecmwf_forecast") or {}).get("predicted_high_f")
-    wg_high = (signals.get("wunderground_forecast") or {}).get("predicted_high_f")
+    # Use all available deterministic sources + Wunderground for spread computation
+    all_highs = []
+    for src_key in (
+        "gfs_forecast", "ecmwf_forecast", "hrrr_forecast", "nws_forecast",
+        "tomorrowio_forecast", "meteosource_forecast", "icon_forecast",
+        "wunderground_forecast",
+    ):
+        val = (signals.get(src_key) or {}).get("predicted_high_f")
+        if val is not None:
+            all_highs.append(val)
 
-    all_highs = [h for h in [gfs_high, ecmwf_high, wg_high] if h is not None]
-    if len(all_highs) >= 2:
+    n_sources = len(all_highs)
+
+    if n_sources >= 2:
         spread = max(all_highs) - min(all_highs)
         if spread <= 2:
             score += 20
@@ -23,13 +31,15 @@ def compute_confidence(
         else:
             score -= 10
 
+    # Bonus when 4+ independent sources agree
+    if n_sources >= 4:
+        score += 10
+
     trend = signals.get("metar_trend") or {}
     rate = trend.get("temp_rate_per_hour", 0.0) or 0.0
     current_temp = trend.get("current_temp_f")
 
     # Convert native Celsius bucket_min to Fahrenheit before the warmth check
-    # so that e.g. 29°C (=84°F) is correctly treated as a warm bucket (>=66°F),
-    # not cold (29 < 66).
     if bucket_unit == "C" and bucket_min is not None:
         bucket_min_f = int(bucket_min * 9 / 5 + 32)
     else:
@@ -77,5 +87,24 @@ def compute_confidence(
     if yes_price is not None:
         if 0.05 <= yes_price <= 0.95:
             score += 10
+
+    # Anchor bonus: today's observed max is already in or past the bucket floor
+    metar_today_max = signals.get("metar_today_max_f")
+    if metar_today_max is not None and bucket_min is not None:
+        if bucket_unit == "C":
+            bucket_min_f_anchor = float(bucket_min) * 9 / 5 + 32
+            bucket_max_f_anchor = ((float(bucket_max) + 1) * 9 / 5 + 32) if bucket_max is not None else None
+        else:
+            bucket_min_f_anchor = float(bucket_min)
+            bucket_max_f_anchor = float(bucket_max) if bucket_max is not None else None
+
+        if bucket_max_f_anchor is not None:
+            if bucket_min_f_anchor <= metar_today_max <= bucket_max_f_anchor:
+                score += 20  # observed today's max is inside the bucket
+            elif metar_today_max >= bucket_min_f_anchor:
+                score += 10  # past bucket floor but above top
+        else:
+            if metar_today_max >= bucket_min_f_anchor:
+                score += 20  # at or above open-ended bucket floor
 
     return max(0, min(100, score))
