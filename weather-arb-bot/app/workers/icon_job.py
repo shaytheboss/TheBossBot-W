@@ -2,9 +2,9 @@
 
 Isolated from app/workers/jobs.py so that adding/disabling ICON cannot
 regress any of the existing forecast/analyzer jobs. Output is written
-to the `forecasts` table with source='icon'; it is NOT consumed by
-SignalAggregator or _DET_SOURCES yet, so the deterministic blend and
-alert pipeline behave exactly as before.
+to the `forecasts` table with source='icon' and IS consumed by
+SignalAggregator (signal key 'icon_forecast') as the 7th deterministic
+model in the blend. Disable via settings.icon_enabled=False.
 """
 import logging
 from datetime import date, timedelta

@@ -246,6 +246,28 @@ def _bottom_line(
             parts.append(f"Ensemble leans the same way ({hits}/{n_ens} inside the bucket).")
         else:
             parts.append(f"Ensemble is mixed ({hits}/{n_ens} inside the bucket).")
+    # Honesty check: deterministic models and the GFS ensemble can both point to
+    # the SAME side (e.g. NO) while disagreeing on direction — one sees a cooler
+    # day, the other a hotter one. Surface that instead of implying consensus.
+    if det and ens:
+        det_avg = sum(d["value_f"] for d in det) / len(det)
+        med = ens.get("median_f")
+        if (
+            med is not None
+            and bucket_min is not None
+            and bucket_max is not None
+        ):
+            det_below, det_above = det_avg < bucket_min, det_avg > bucket_max
+            med_below, med_above = med < bucket_min, med > bucket_max
+            if (det_below and med_above) or (det_above and med_below):
+                parts.append(
+                    f"⚠️ Direction split: models average "
+                    f"{fmt_temp_dual(det_avg, is_c)} ({'below' if det_below else 'above'} "
+                    f"the bucket) but the GFS ensemble median is "
+                    f"{fmt_temp_dual(med, is_c)} ({'above' if med_above else 'below'} it) "
+                    f"— both miss the bucket so {side} wins either way, but they "
+                    f"disagree on whether the day runs hot or cool."
+                )
     br = blend.get("boundary_risk")
     if br:
         closest_f = br.get("closest_source_f")
@@ -594,6 +616,14 @@ def fmt_opportunity(
     breakdown_text = breakdown_intro + "\n" + "\n".join(breakdown_lines)
     if spread_line:
         breakdown_text += "\n" + spread_line
+    # Surface models that did NOT report so a silently-absent source (e.g. the
+    # ICON/DWD model) is visible rather than invisibly dropped from the blend.
+    missing_sources = blend.get("missing_sources") or []
+    if missing_sources and det_rows:
+        breakdown_text += (
+            f"\n  ↳ ⚠️ Not reporting: {', '.join(missing_sources)} "
+            f"_(no forecast row for this city/date)_"
+        )
 
     # ── Ensemble section ────────────────────────────────────────────────
     ens = blend.get("ensemble")
@@ -627,7 +657,12 @@ def fmt_opportunity(
     ens_p = blend.get("ens_p")
     wg_p = blend.get("wg_p")
     blend_pre = blend.get("blend_before_adjustments")
-    final_p = blend.get("final")
+    # Prefer the post-normalization probability so this walkthrough's final
+    # number matches the headline estimate exactly (normalization runs after
+    # the per-bucket estimate, rescaling all outcomes to sum to 1).
+    final_p = blend.get("normalized_final")
+    if final_p is None:
+        final_p = blend.get("final")
     adjustments = blend.get("adjustments") or []
     boundary_risk = blend.get("boundary_risk")
     model_dis = blend.get("model_disagreement")
@@ -739,9 +774,13 @@ def fmt_opportunity(
     if not adjustments and not obs_skipped:
         math_lines.append("• _No observation-based or boundary adjustments triggered._")
     if final_p is not None:
+        clip_note = (
+            "after market normalisation" if blend.get("normalized_final") is not None
+            else "clipped to [3%, 92%]"
+        )
         math_lines.append(
             f"• *Final P({side}) = {round(_to_side(final_p) * 100, 1)}%* "
-            f"(clipped to [3%, 92%])"
+            f"({clip_note})"
         )
     math_section = "\n".join(math_lines)
 

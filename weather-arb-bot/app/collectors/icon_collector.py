@@ -15,10 +15,10 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 class IconCollector(BaseCollector):
     """DWD ICON forecast via Open-Meteo.
 
-    Stores forecasts with source='icon'. Intentionally NOT wired into the
-    deterministic blend (_DET_SOURCES) yet — the row is written to the
-    forecasts table for visibility and future calibration, so existing
-    blend math and alert behaviour are unchanged.
+    Stores forecasts with source='icon'. This source IS wired into the
+    deterministic blend as the 7th model (_DET_SOURCES in
+    probability_estimator). Rows are read back by SignalAggregator under the
+    'icon_forecast' signal key.
     """
 
     name = "icon"

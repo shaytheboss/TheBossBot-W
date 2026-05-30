@@ -180,13 +180,19 @@
 
     <section id="tab-opps" class="hidden">
       <div class="toolbar">
+        <label class="row small">From <input type="date" id="oppFrom" /></label>
+        <label class="row small">To <input type="date" id="oppTo" /></label>
+        <label class="row small">City
+          <select id="oppCity"><option value="">All cities</option></select>
+        </label>
         <label class="row"><input type="checkbox" id="onlyAlerted" onchange="loadOpps()" /> only alerted</label>
         <select id="oppOutcome" onchange="loadOpps()">
           <option value="">all outcomes</option>
           <option value="WIN">WIN</option>
           <option value="LOSS">LOSS</option>
         </select>
-        <button class="btn" onclick="loadOpps()">Refresh</button>
+        <button class="btn primary" onclick="loadOpps()">Apply Filter</button>
+        <button class="btn" onclick="resetOppFilter()">Reset</button>
         <button class="btn" onclick="exportCsv('oppsBody', 'opportunities')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
       </div>
       <table id="oppsTable">
@@ -447,7 +453,7 @@ async function ensureCitiesLoaded() {
   if (!r.ok) return [];
   const rows = await r.json();
   window._citiesCache = rows;
-  ['statsCity','posCity','lesCity'].forEach(id => {
+  ['statsCity','posCity','lesCity','oppCity'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel || sel.dataset.populated === '1') return;
     rows.forEach(c => {
@@ -740,12 +746,26 @@ function _renderOpps(rows) {
   `).join('');
 }
 
+function resetOppFilter() {
+  document.getElementById('oppFrom').value = '';
+  document.getElementById('oppTo').value = '';
+  document.getElementById('oppCity').value = '';
+  loadOpps();
+}
+
 async function loadOpps() {
+  await ensureCitiesLoaded();
   const onlyAlerted = document.getElementById('onlyAlerted').checked;
   const outcome = document.getElementById('oppOutcome').value;
   const params = new URLSearchParams();
   if (onlyAlerted) params.set('only_alerted', 'true');
   if (outcome) params.set('outcome', outcome);
+  const f = document.getElementById('oppFrom').value;
+  const t = document.getElementById('oppTo').value;
+  const c = document.getElementById('oppCity').value;
+  if (f) params.set('from_date', f);
+  if (t) params.set('to_date', t);
+  if (c) params.set('city_id', c);
   const r = await api('/opportunities?' + params); if (!r.ok) return;
   const rows = await r.json();
   // Precompute side-aware display values so column sorting matches what the user sees.

@@ -331,13 +331,16 @@ def estimate_with_breakdown(
 
     det_probs = []
     det_vals: list[float] = []
+    missing_sources: list[str] = []
     for key, label in _DET_SOURCES:
         src_data = signals.get(key) or {}
         val = src_data.get(fc_key)
         if val is None:
+            missing_sources.append(label)
             continue
         p = _student_t_bucket_prob(val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
         if p is None:
+            missing_sources.append(label)
             continue
         det_probs.append(p)
         det_vals.append(float(val))
@@ -356,6 +359,7 @@ def estimate_with_breakdown(
     det_p = sum(det_probs) / len(det_probs) if det_probs else None
     n_det = len(det_probs)
     breakdown["det_avg"] = float(det_p) if det_p is not None else None
+    breakdown["missing_sources"] = missing_sources
 
     ensemble_fc = signals.get("gfs_ensemble") or {}
     ensemble_vals = ensemble_fc.get(ensemble_key) or []
@@ -391,6 +395,12 @@ def estimate_with_breakdown(
             wg_entry["used_lon"] = lon_val
         breakdown["wunderground"] = wg_entry
     breakdown["wg_p"] = float(wg_p) if wg_p is not None else None
+
+    # Whether ANY real forecast source contributed. When False the blend falls
+    # back to a flat 0.25 prior, which must NOT be turned into a recommendation.
+    breakdown["has_forecast_data"] = bool(
+        det_p is not None or ens_p is not None or wg_p is not None
+    )
 
     all_source_forecasts = list(det_vals)
     if wg_val is not None:

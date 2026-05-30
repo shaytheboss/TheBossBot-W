@@ -672,12 +672,35 @@ async def admin_opportunities(
     limit: int = Query(default=100, le=500),
     only_alerted: bool = Query(default=False),
     outcome: Optional[str] = Query(default=None),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+    city_id: Optional[int] = Query(default=None),
 ):
-    q = select(Opportunity).order_by(desc(Opportunity.detected_at)).limit(limit)
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+
+    # Join through to Market only when a city filter is requested, so the
+    # default (unfiltered) query stays as cheap as before.
+    if city_id is not None:
+        q = (
+            select(Opportunity)
+            .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+            .join(Market, Market.id == MarketOutcome.market_id)
+            .where(Market.city_id == city_id)
+            .order_by(desc(Opportunity.detected_at))
+            .limit(limit)
+        )
+    else:
+        q = select(Opportunity).order_by(desc(Opportunity.detected_at)).limit(limit)
     if only_alerted:
         q = q.where(Opportunity.alert_sent == True)
     if outcome:
         q = q.where(Opportunity.outcome == outcome.upper())
+    if from_dt is not None:
+        q = q.where(Opportunity.detected_at >= from_dt)
+    if to_dt is not None:
+        q = q.where(Opportunity.detected_at < to_dt)
     rows = (await db.execute(q)).scalars().all()
 
     out = []
