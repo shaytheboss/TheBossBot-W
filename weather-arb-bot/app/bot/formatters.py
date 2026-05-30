@@ -71,12 +71,19 @@ def _closes_in_text(market_date: date, city_tz_str: Optional[str]) -> str:
 # Risk banner
 # ---------------------------------------------------------------------------
 
-def _risk_banner(blend: dict, ci_pp: Optional[float], is_open_ended: bool = False) -> str:
+def _risk_banner(
+    blend: dict,
+    ci_pp: Optional[float],
+    is_open_ended: bool = False,
+    entry_cost: Optional[float] = None,
+) -> str:
     """Return a one-line plain-language risk summary with a colour-coded level.
 
     Thresholds:
-      RED    - spread > 6°F  OR  ci_pp > 20pp  OR  boundary dist < 0.5°F  OR open-ended
-      YELLOW - spread > 3°F  OR  ci_pp > 10pp  OR  boundary dist < 1.5°F  OR straddle
+      RED    - spread > 6°F  OR  ci_pp > 20pp  OR  boundary dist < 0.5°F
+               OR open-ended bucket  OR entry cost ≥ 80¢ (4:1 adverse risk/reward)
+      YELLOW - spread > 3°F  OR  ci_pp > 10pp  OR  boundary dist < 1.5°F
+               OR straddle  OR entry cost ≥ 70¢
       GREEN  - everything else
     """
     reasons: list[str] = []
@@ -126,6 +133,20 @@ def _risk_banner(blend: dict, ci_pp: Optional[float], is_open_ended: bool = Fals
         n_out = len(straddle.get("outside_sources", []))
         reasons.append(f"sources split {n_in} inside / {n_out} outside bucket")
         level = max(level, 1)
+
+    # Payout asymmetry: paying 80¢ to win 20¢ requires 80% win rate to break even.
+    # A GREEN banner on such a bet is actively misleading.
+    if entry_cost is not None:
+        risk_c = round(entry_cost * 100)
+        win_c = round((1.0 - entry_cost) * 100)
+        if entry_cost >= 0.80:
+            reasons.append(
+                f"costs {risk_c}¢ to win {win_c}¢ — needs ≥{risk_c}% win rate to break even"
+            )
+            level = max(level, 2)
+        elif entry_cost >= 0.70:
+            reasons.append(f"costs {risk_c}¢ to win {win_c}¢ — asymmetric payout")
+            level = max(level, 1)
 
     emoji = ["\U0001f7e2", "\U0001f7e1", "\U0001f534"][level]
     label = ["LOW", "MODERATE", "HIGH"][level]
@@ -563,7 +584,12 @@ def fmt_opportunity(
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
 
     # ── Risk banner ─────────────────────────────────────────────────────────
-    risk_line = _risk_banner(blend, ci_pp_val, is_open_ended=blend.get("is_open_ended", False))
+    risk_line = _risk_banner(
+        blend,
+        ci_pp_val,
+        is_open_ended=blend.get("is_open_ended", False),
+        entry_cost=signals.get("_entry_cost"),
+    )
 
     # ── Per-source forecast breakdown ─────────────────────────────────────────
     sigma_hint = (
@@ -575,29 +601,50 @@ def fmt_opportunity(
         f"{fc_kind_lower} lands in the bucket. Narrow buckets give small "
         f"P(in bucket) even when the forecast is centred on them._"
     )
+    bias_info = blend.get("bias_correction") or {}
+    bias_f_val = float(bias_info.get("bias_f") or 0.0)
+    bias_is_default = bool(bias_info.get("is_default", True))
+    bias_samples = int(bias_info.get("samples") or 0)
+    bias_notes = str(bias_info.get("notes") or "")
+    show_bias = abs(bias_f_val) >= 0.1
+
     det_rows = blend.get("deterministic") or []
     forecast_vals_f: list[float] = []
     breakdown_lines: list[str] = []
     for det in det_rows:
-        val_f = det["value_f"]
+        val_f = det["value_f"]          # already bias-corrected
+        raw_f = det.get("raw_value_f")  # original model output
         forecast_vals_f.append(val_f)
         p_in = det.get("p_in_bucket") or 0.0
         side_p = 1 - p_in if is_no else p_in
         coord_tag = _api_coord_tag(det.get("used_lat"), det.get("used_lon"))
+        if show_bias and raw_f is not None and abs(val_f - raw_f) >= 0.1:
+            raw_str = fmt_temp_dual(raw_f, is_c)
+            corr_str = fmt_temp_dual(val_f, is_c)
+            val_display = f"{raw_str} → +{bias_f_val:.1f}°F bias = {corr_str}"
+        else:
+            val_display = fmt_temp_dual(val_f, is_c)
         breakdown_lines.append(
-            f"• {det['source']}: {fmt_temp_dual(val_f, is_c)} "
+            f"• {det['source']}: {val_display} "
             f"→ P(in bucket)={round(p_in * 100)}% ⇒ P({side})={round(side_p * 100)}%"
             f"{coord_tag}"
         )
     wg = blend.get("wunderground")
     if wg and wg.get("value_f") is not None:
         val_f = wg["value_f"]
+        raw_f = wg.get("raw_value_f")
         forecast_vals_f.append(val_f)
         p_in = wg.get("p_in_bucket") or 0.0
         side_p = 1 - p_in if is_no else p_in
         coord_tag = _api_coord_tag(wg.get("used_lat"), wg.get("used_lon"))
+        if show_bias and raw_f is not None and abs(val_f - raw_f) >= 0.1:
+            raw_str = fmt_temp_dual(raw_f, is_c)
+            corr_str = fmt_temp_dual(val_f, is_c)
+            val_display = f"{raw_str} → +{bias_f_val:.1f}°F bias = {corr_str}"
+        else:
+            val_display = fmt_temp_dual(val_f, is_c)
         breakdown_lines.append(
-            f"• Wunderground (soft): {fmt_temp_dual(val_f, is_c)} "
+            f"• Wunderground (soft): {val_display} "
             f"→ P(in bucket)={round(p_in * 100)}% ⇒ P({side})={round(side_p * 100)}%"
             f"{coord_tag}"
         )
@@ -616,6 +663,16 @@ def fmt_opportunity(
     breakdown_text = breakdown_intro + "\n" + "\n".join(breakdown_lines)
     if spread_line:
         breakdown_text += "\n" + spread_line
+    # Airport warm-bias correction transparency line
+    if show_bias:
+        if bias_is_default:
+            bias_desc = f"default prior (no historical data yet)"
+        else:
+            bias_desc = f"learned from {bias_samples} day(s): {bias_notes}"
+        breakdown_text += (
+            f"\n  ↳ 🌡️ Airport bias: +{bias_f_val:.1f}°F applied to all models "
+            f"({bias_desc})"
+        )
     # Surface models that did NOT report so a silently-absent source (e.g. the
     # ICON/DWD model) is visible rather than invisibly dropped from the blend.
     missing_sources = blend.get("missing_sources") or []
@@ -685,6 +742,15 @@ def fmt_opportunity(
     math_lines = ["⚗️ *How we got to this estimate*"]
     if math_intro:
         math_lines.append(math_intro)
+    if show_bias:
+        if bias_is_default:
+            bias_math_note = f"default prior, 0 samples"
+        else:
+            bias_math_note = f"{bias_samples} samples, {bias_notes}"
+        math_lines.append(
+            f"• Airport warm-bias correction: +{bias_f_val:.1f}°F added to every model "
+            f"_({bias_math_note})_ — METAR daily highs run warmer than gridded NWP"
+        )
     if det_avg is not None:
         math_lines.append(
             f"• Deterministic average P({side}) = "

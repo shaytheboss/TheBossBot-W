@@ -305,6 +305,14 @@ def estimate_with_breakdown(
     if is_open_ended:
         sigma = sigma * 1.5
 
+    # Airport warm-bias correction: actual METAR daily highs are systematically
+    # warmer than gridded NWP point forecasts (runway/urban heat island effect).
+    # We shift every model's point forecast UP by bias_f before computing P(in
+    # bucket), so the system doesn't overestimate the probability that the
+    # temperature stays below an upper bucket bound.
+    station_bias = signals.get("station_bias") or {}
+    bias_f = float(station_bias.get("bias_f") or 1.5)
+
     breakdown: dict = {
         "is_low_market": bool(is_low_market),
         "days_ahead": int(days_ahead) if days_ahead is not None else None,
@@ -327,6 +335,12 @@ def estimate_with_breakdown(
         "forecast_std_dev_f": None,
         "ci_pp": None,
         "final": None,
+        "bias_correction": {
+            "bias_f": bias_f,
+            "samples": int(station_bias.get("samples") or 0),
+            "notes": str(station_bias.get("notes") or ""),
+            "is_default": bool(station_bias.get("is_default", True)),
+        },
     }
 
     det_probs = []
@@ -338,15 +352,17 @@ def estimate_with_breakdown(
         if val is None:
             missing_sources.append(label)
             continue
-        p = _student_t_bucket_prob(val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
+        corrected_val = float(val) + bias_f
+        p = _student_t_bucket_prob(corrected_val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
         if p is None:
             missing_sources.append(label)
             continue
         det_probs.append(p)
-        det_vals.append(float(val))
+        det_vals.append(float(corrected_val))
         det_entry: dict = {
             "source": label,
-            "value_f": float(val),
+            "value_f": float(corrected_val),
+            "raw_value_f": float(val),
             "p_in_bucket": float(p),
         }
         lat_val = _parse_coord(src_data.get("used_lat"))
@@ -362,7 +378,12 @@ def estimate_with_breakdown(
     breakdown["missing_sources"] = missing_sources
 
     ensemble_fc = signals.get("gfs_ensemble") or {}
-    ensemble_vals = ensemble_fc.get(ensemble_key) or []
+    raw_ensemble_vals = ensemble_fc.get(ensemble_key) or []
+    # Shift all ensemble members by the same bias — they have the same systematic
+    # cold bias as the deterministic GFS run.
+    ensemble_vals = [v + bias_f for v in raw_ensemble_vals] if raw_ensemble_vals else []
+    raw_p50 = ensemble_fc.get(p50_key)
+    biased_p50 = (float(raw_p50) + bias_f) if raw_p50 is not None else None
     ens_p = _ensemble_bucket_prob(ensemble_vals, bucket_min, bucket_max, unit=bucket_unit)
     if ens_p is not None:
         hits = sum(
@@ -373,7 +394,7 @@ def estimate_with_breakdown(
         breakdown["ensemble"] = {
             "n": n,
             "hits": hits,
-            "median_f": ensemble_fc.get(p50_key),
+            "median_f": biased_p50,
             "raw_pct": round(100 * hits / n, 1) if n else None,
             "smoothed_pct": round(100 * ens_p, 1),
         }
@@ -381,10 +402,12 @@ def estimate_with_breakdown(
 
     wg_src = signals.get("wunderground_forecast") or {}
     wg_val = wg_src.get(fc_key)
-    wg_p = _student_t_bucket_prob(wg_val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
+    wg_corrected = (float(wg_val) + bias_f) if wg_val is not None else None
+    wg_p = _student_t_bucket_prob(wg_corrected, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
     if wg_val is not None:
         wg_entry: dict = {
-            "value_f": float(wg_val),
+            "value_f": float(wg_corrected),
+            "raw_value_f": float(wg_val),
             "p_in_bucket": float(wg_p) if wg_p is not None else None,
         }
         lat_val = _parse_coord(wg_src.get("used_lat"))
@@ -403,8 +426,8 @@ def estimate_with_breakdown(
     )
 
     all_source_forecasts = list(det_vals)
-    if wg_val is not None:
-        all_source_forecasts.append(float(wg_val))
+    if wg_corrected is not None:
+        all_source_forecasts.append(float(wg_corrected))
 
     # F2: compute forecast std dev and confidence interval across sources
     if len(all_source_forecasts) >= 2:
@@ -468,8 +491,8 @@ def estimate_with_breakdown(
     fc_for_boundary: Optional[float] = None
     if det_vals:
         fc_for_boundary = sum(det_vals) / len(det_vals)
-    elif wg_val is not None:
-        fc_for_boundary = float(wg_val)
+    elif wg_corrected is not None:
+        fc_for_boundary = float(wg_corrected)
 
     if fc_for_boundary is not None:
         blend_w, closest_source_f, closest_source_dist_f = boundary_uncertainty_blend(
