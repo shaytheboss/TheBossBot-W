@@ -175,6 +175,16 @@ async def _collect_outcome_data(
         bucket_unit=bucket_unit,
     )
 
+    # Never recommend on a fabricated prior: if no forecast source reported for
+    # this city/date, the estimate is just the flat 0.25 fallback. Skipping here
+    # also keeps these outcomes out of the market-normalization sum below.
+    if not breakdown.get("has_forecast_data"):
+        logger.info(
+            f"Skipping outcome {outcome.id} ({outcome.bucket_label}): "
+            f"no forecast sources reported (missing: {breakdown.get('missing_sources')})"
+        )
+        return None
+
     return {
         "outcome": outcome,
         "signals": signals,
@@ -346,6 +356,10 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
             for d in outcome_data:
                 d["normalized_prob"] = d["raw_prob"] * scale
                 d["breakdown"]["normalization_scale"] = round(scale, 4)
+        # Record the post-normalization probability so the alert's math
+        # walkthrough shows the same final number as the headline estimate.
+        for d in outcome_data:
+            d["breakdown"]["normalized_final"] = round(float(d["normalized_prob"]), 4)
 
         # Phase 3: evaluate each outcome, pick best edge
         best_opp: Optional[Opportunity] = None
