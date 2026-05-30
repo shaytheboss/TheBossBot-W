@@ -11,6 +11,7 @@ from app.models.forecast import Forecast
 from app.models.pirep import Pirep
 from app.models.market import MarketPrice, MarketOutcome
 from app.utils.units import resolve_bucket_unit
+from app.analyzers.bias_estimator import get_station_bias
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class SignalAggregator:
         signals["icon_forecast"] = await self._latest_forecast(db, city_id, "icon", forecast_date)
         signals["gfs_ensemble"] = await self._latest_forecast(db, city_id, "gfs_ensemble", forecast_date)
         signals["pireps"] = await self._recent_pireps(db, primary_icao, hours=2)
+        signals["station_bias"] = await get_station_bias(db, city_id, primary_icao)
         signals["market_price"] = await self._latest_price(db, outcome.id)
         signals["price_trend"] = await self._price_trend(db, outcome.id, minutes=60)
         signals["is_low_market"] = is_low_market
