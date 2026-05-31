@@ -1,3 +1,44 @@
+"""Weather arbitrage probability estimator.
+
+Core question: given today's NWP forecasts, what is the probability that the
+METAR daily high on the target date lands inside (or outside) a specific
+temperature bucket on Polymarket?
+
+## Architecture
+
+The estimator blends two independent probability streams:
+
+1. **Deterministic (30% weight by default)**
+   Up to 7 NWP sources (GFS, ECMWF, HRRR, NWS, Tomorrow.io, Meteosource, ICON/DWD).
+   Each source's point forecast is converted to P(in bucket) via a Student-t CDF
+   centred at the forecast value with scale σ. Heavier tails than Gaussian = more
+   probability leaks across bucket boundaries = less overconfidence.
+
+2. **GFS Ensemble (70% weight)**
+   30 perturbed GFS runs. Empirical fraction hitting the bucket (Laplace-smoothed)
+   is the ensemble probability. Directly captures multi-modal uncertainty that
+   σ-based math cannot.
+
+## Bias correction
+
+METAR daily highs at airports are systematically warmer than gridded NWP forecasts
+(tarmac + urban heat island). Every forecast value is shifted up by `bias_f`
+(learned from a 14-day rolling window of actual vs forecast errors, defaulting to
++1.5°F) before entering the CDF. This prevents the system from being overconfident
+that temperature will stay below an upper bucket threshold.
+
+## Calibration constants
+
+σ_base = 2.5°F same-day, grows +0.5°F/day → capped at 5.5°F (day 6+).
+Open-ended buckets ("≥X°F" / "≤X°F") use σ×1.5 — tail events are harder to forecast.
+Clip: final P clipped to [3%, 92%] — no single source can claim >92% confidence.
+
+## Sparse-source shrinkage
+
+When fewer than 5 globally-available sources report, confidence blends toward 50%.
+Each missing global source contributes 8pp of shrinkage. HRRR and NWS are
+CONUS-only and excluded from this count for international cities.
+"""
 import logging
 import math
 from typing import Optional, Tuple
@@ -9,14 +50,17 @@ _PROB_CLIP_HI = 0.92  # lowered from 0.97 — prevents any signal from claiming 
 
 _STUDENT_T_DF = 6  # B4: heavier tails than Gaussian -> more conservative near bucket edges
 
-_DET_SOURCES = (
-    ("gfs_forecast", "GFS (global)"),
-    ("ecmwf_forecast", "ECMWF"),
-    ("hrrr_forecast", "HRRR (3km CONUS)"),
-    ("nws_forecast", "NWS (official)"),
-    ("tomorrowio_forecast", "Tomorrow.io"),
-    ("meteosource_forecast", "Meteosource"),
-    ("icon_forecast", "ICON (DWD)"),   # A3: DWD ICON via Open-Meteo, wired into blend
+# Each entry: (signals_key, display_label, available_globally)
+# available_globally=False means CONUS-only — these sources will legitimately never
+# report for international cities and should NOT be counted as "missing data."
+_DET_SOURCES: tuple[tuple[str, str, bool], ...] = (
+    ("gfs_forecast",        "GFS (global)",     True),
+    ("ecmwf_forecast",      "ECMWF",            True),
+    ("hrrr_forecast",       "HRRR (3km CONUS)", False),  # CONUS only — 24-48h horizon
+    ("nws_forecast",        "NWS (official)",   False),  # CONUS only — US National WS
+    ("tomorrowio_forecast", "Tomorrow.io",       True),
+    ("meteosource_forecast","Meteosource",       True),
+    ("icon_forecast",       "ICON (DWD)",        True),  # via Open-Meteo, global
 )
 
 BOUNDARY_WINDOW_F = 1.5
@@ -29,10 +73,14 @@ ENSEMBLE_WEIGHT_BASE = 0.70
 
 STRADDLE_EXTRA_BLEND = 0.10
 
-# Sparse-source shrinkage: blend toward 50% when fewer than this many
-# deterministic sources contributed (e.g. non-CONUS cities missing HRRR/NWS).
-_SPARSE_SOURCE_BASELINE = 3
-_SPARSE_SOURCE_SHRINK_PER_MISSING = 0.05   # 5pp per missing source vs baseline
+# Sparse-source shrinkage: blend toward 50% when fewer globally-available sources
+# than the baseline report. Only global sources count (HRRR/NWS are CONUS-only
+# and are excluded from this count for international cities).
+# Baseline = 5 global sources expected (GFS, ECMWF, Tomorrow.io, Meteosource, ICON).
+# Each missing global source pulls the blended probability 8pp toward 50%.
+# Example: 3/5 reporting → 2 missing → 16% blend toward 50%.
+_SPARSE_SOURCE_BASELINE = 5
+_SPARSE_SOURCE_SHRINK_PER_MISSING = 0.08   # 8pp per missing global source
 
 
 def _parse_coord(val) -> Optional[float]:
@@ -343,20 +391,37 @@ def estimate_with_breakdown(
         },
     }
 
-    det_probs = []
+    # Which sources have no API key (passed in via signals from signal_aggregator)
+    unavailable_api: set[str] = set(signals.get("_unavailable_api") or [])
+
+    det_probs: list[float] = []
     det_vals: list[float] = []
-    missing_sources: list[str] = []
-    for key, label in _DET_SOURCES:
+    n_global_det = 0          # count of global (non-CONUS-only) sources with data
+    missing_sources: list[str] = []        # global sources with no data
+    missing_no_key: list[str] = []         # global sources whose API key is unconfigured
+    missing_conus_only: list[str] = []     # CONUS-only sources (legitimately absent for intl cities)
+
+    for key, label, is_global in _DET_SOURCES:
         src_data = signals.get(key) or {}
         val = src_data.get(fc_key)
         if val is None:
-            missing_sources.append(label)
+            if not is_global:
+                missing_conus_only.append(label)
+            elif key in unavailable_api:
+                missing_no_key.append(label)
+            else:
+                missing_sources.append(label)
             continue
         corrected_val = float(val) + bias_f
         p = _student_t_bucket_prob(corrected_val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
         if p is None:
-            missing_sources.append(label)
+            if not is_global:
+                missing_conus_only.append(label)
+            else:
+                missing_sources.append(label)
             continue
+        if is_global:
+            n_global_det += 1
         det_probs.append(p)
         det_vals.append(float(corrected_val))
         det_entry: dict = {
@@ -375,7 +440,9 @@ def estimate_with_breakdown(
     det_p = sum(det_probs) / len(det_probs) if det_probs else None
     n_det = len(det_probs)
     breakdown["det_avg"] = float(det_p) if det_p is not None else None
-    breakdown["missing_sources"] = missing_sources
+    breakdown["missing_sources"] = missing_sources          # global, no data
+    breakdown["missing_no_key"] = missing_no_key            # global, API key not configured
+    breakdown["missing_conus_only"] = missing_conus_only    # CONUS-only, N/A for intl cities
 
     ensemble_fc = signals.get("gfs_ensemble") or {}
     raw_ensemble_vals = ensemble_fc.get(ensemble_key) or []
@@ -646,9 +713,13 @@ def estimate_with_breakdown(
                     }
                 p_before = p
 
-    # Sparse-source shrinkage
-    if n_det < _SPARSE_SOURCE_BASELINE:
-        shrink = (_SPARSE_SOURCE_BASELINE - n_det) * _SPARSE_SOURCE_SHRINK_PER_MISSING
+    # Sparse-source shrinkage — only count globally-available sources.
+    # HRRR/NWS are CONUS-only; their absence for an international city is expected
+    # and should not penalise confidence. We only shrink when globally-available
+    # sources (GFS, ECMWF, Tomorrow.io, Meteosource, ICON) are missing.
+    n_global_missing = max(0, _SPARSE_SOURCE_BASELINE - n_global_det)
+    if n_global_missing > 0:
+        shrink = n_global_missing * _SPARSE_SOURCE_SHRINK_PER_MISSING
         p_before = p
         p = p * (1.0 - shrink) + 0.5 * shrink
         breakdown["adjustments"].append({
@@ -656,8 +727,10 @@ def estimate_with_breakdown(
             "delta": float(p - p_before),
         })
         breakdown["sparse_sources"] = {
+            "n_global_det": n_global_det,
             "n_det": n_det,
             "baseline": _SPARSE_SOURCE_BASELINE,
+            "n_global_missing": n_global_missing,
             "shrink_applied": round(shrink, 3),
         }
 

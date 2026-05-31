@@ -16,6 +16,7 @@ from app.workers.jobs import (
     job_fetch_wunderground,
     job_fetch_nws,
     job_fetch_models,
+    job_fetch_external_forecasts,
     job_fetch_pireps,
     job_fetch_polymarket,
     job_run_analyzer,
@@ -69,12 +70,22 @@ def build_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         misfire_grace_time=600,
     )
+    # Tomorrow.io and Meteosource — global APIs, rate-limited (default every 4h)
+    scheduler.add_job(
+        job_fetch_external_forecasts,
+        IntervalTrigger(seconds=getattr(settings, "external_forecast_fetch_interval", 14400)),
+        id="external_forecasts",
+        name="Fetch Tomorrow.io / Meteosource forecasts",
+        next_run_time=now,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
     if getattr(settings, "icon_enabled", True):
         scheduler.add_job(
             job_fetch_icon,
             IntervalTrigger(seconds=getattr(settings, "icon_fetch_interval", 3600)),
             id="icon",
-            name="Fetch DWD ICON forecasts (DB-only, not blended)",
+            name="Fetch DWD ICON forecasts (blended as 7th deterministic source)",
             next_run_time=now,
             max_instances=1,
             misfire_grace_time=600,
