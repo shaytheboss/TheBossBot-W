@@ -71,89 +71,196 @@ def _closes_in_text(market_date: date, city_tz_str: Optional[str]) -> str:
 # Risk banner
 # ---------------------------------------------------------------------------
 
-def _risk_banner(
+def _score_row(level: int, label: str, detail: str) -> str:
+    """Single row in the decision scorecard. level: 0=green, 1=yellow, 2=red, 3=grey."""
+    icons = ["\U0001f7e2", "\U0001f7e1", "\U0001f534", "⚪"]
+    return f"  {icons[level]} *{label}:* {detail}"
+
+
+def _risk_scorecard(
     blend: dict,
+    side: str,
+    true_prob: float,
+    days_ahead: Optional[int],
     ci_pp: Optional[float],
-    is_open_ended: bool = False,
-    entry_cost: Optional[float] = None,
+    is_open_ended: bool,
+    entry_cost: Optional[float],
+    alert_threshold: float,
+    buy_threshold: float,
 ) -> str:
-    """Return a one-line plain-language risk summary with a colour-coded level.
+    """Build the full decision scorecard that appears at the top of each alert.
 
-    Thresholds:
-      RED    - spread > 6°F  OR  ci_pp > 20pp  OR  boundary dist < 0.5°F
-               OR open-ended bucket  OR entry cost ≥ 80¢ (4:1 adverse risk/reward)
-      YELLOW - spread > 3°F  OR  ci_pp > 10pp  OR  boundary dist < 1.5°F
-               OR straddle  OR entry cost ≥ 70¢
-      GREEN  - everything else
+    Replaces the single-line risk banner with a per-parameter breakdown so the
+    user can see exactly which factors are concerning and make an informed call.
+
+    Each row is independently rated GREEN/YELLOW/RED/GREY and has a plain-language
+    explanation. The overall risk level at the top is the worst individual level.
+
+    Parameters
+    ----------
+    blend        : breakdown dict from probability_estimator
+    side         : "YES" or "NO"
+    true_prob    : post-normalization P(YES) for this bucket
+    days_ahead   : calendar days until market resolution
+    ci_pp        : ±half-width of confidence interval in percentage points
+    is_open_ended: True if bucket has only one bound (e.g. "90°F or higher")
+    entry_cost   : cost per share at entry (0.72 = 72¢)
+    alert_threshold : minimum directional certainty required for an alert
+    buy_threshold   : minimum certainty required for a virtual buy
     """
-    reasons: list[str] = []
-    level = 0  # 0=green, 1=yellow, 2=red
+    is_no = (side == "NO")
+    side_prob = (1 - true_prob) if is_no else true_prob
+    side_prob_pct = round(side_prob * 100)
 
-    # Open-ended buckets ("X or higher" / "X or lower") are inherently higher risk
-    if is_open_ended:
-        reasons.append("open-ended bucket (tail event — harder to forecast)")
-        level = max(level, 2)
+    rows: list[str] = []
+    top_level = 0  # overall worst level
 
-    # Source spread
+    def _track(level: int, label: str, detail: str) -> None:
+        nonlocal top_level
+        # level 3 = grey (N/A / no data) — does not affect overall risk rating
+        if level < 3:
+            top_level = max(top_level, level)
+        rows.append(_score_row(level, label, detail))
+
+    # ── 1. Confidence ───────────────────────────────────────────────────────
+    thresh_pct = round(alert_threshold * 100)
+    buy_pct = round(buy_threshold * 100)
+    margin_pp = side_prob_pct - thresh_pct
+    if side_prob_pct >= buy_pct:
+        conf_level = 0
+        conf_note = f"above buy threshold ({buy_pct}%) — virtual position opened"
+    elif side_prob_pct >= thresh_pct + 5:
+        conf_level = 0
+        conf_note = f"+{margin_pp}pp above alert threshold ({thresh_pct}%)"
+    elif side_prob_pct >= thresh_pct:
+        conf_level = 1
+        conf_note = f"barely above threshold ({thresh_pct}%) — slim margin"
+    else:
+        conf_level = 2
+        conf_note = f"below threshold — check normalization"
+    _track(conf_level, "Confidence", f"P({side})={side_prob_pct}% — {conf_note}")
+
+    # ── 2. Source coverage ──────────────────────────────────────────────────
+    sparse = blend.get("sparse_sources") or {}
+    n_global = int(sparse.get("n_global_det") or
+                   len(blend.get("deterministic") or []))  # fallback
+    baseline = int(sparse.get("baseline") or 5)
+    missing_global = blend.get("missing_sources") or []
+    missing_no_key = blend.get("missing_no_key") or []
+    missing_conus = blend.get("missing_conus_only") or []
+    n_missing_global = len(missing_global) + len(missing_no_key)
+
+    cov_parts = [f"{n_global}/{baseline} global models"]
+    if missing_no_key:
+        cov_parts.append(f"no API key: {', '.join(missing_no_key)}")
+    if missing_global:
+        cov_parts.append(f"no data: {', '.join(missing_global)}")
+    if missing_conus:
+        cov_parts.append(f"CONUS-only (N/A): {', '.join(missing_conus)}")
+
+    if n_missing_global >= 3:
+        cov_level = 2
+    elif n_missing_global >= 1:
+        cov_level = 1
+    else:
+        cov_level = 0
+    _track(cov_level, "Coverage", " — ".join(cov_parts))
+
+    # ── 3. Model agreement ──────────────────────────────────────────────────
     model_dis = blend.get("model_disagreement") or {}
     spread_f = float(model_dis.get("source_spread_f") or 0.0)
     if spread_f > 6:
-        reasons.append(f"models sharply disagree (Δ{round(spread_f)}°F)")
-        level = max(level, 2)
+        agree_level = 2
+        agree_note = f"Δ{round(spread_f)}°F — HIGH disagreement"
     elif spread_f > 3:
-        reasons.append(f"moderate model spread (Δ{round(spread_f)}°F)")
-        level = max(level, 1)
+        agree_level = 1
+        agree_note = f"Δ{round(spread_f)}°F — moderate spread"
+    elif spread_f > 0:
+        agree_level = 0
+        agree_note = f"Δ{round(spread_f)}°F — strong agreement"
+    else:
+        agree_level = 3
+        agree_note = "single source — no spread to measure"
+    _track(agree_level, "Agreement", agree_note)
 
-    # CI width
-    if ci_pp is not None:
-        ci_val = float(ci_pp)
-        if ci_val > 20:
-            reasons.append(f"very wide uncertainty (±{round(ci_val)}pp)")
-            level = max(level, 2)
-        elif ci_val > 10:
-            reasons.append(f"moderate uncertainty (±{round(ci_val)}pp)")
-            level = max(level, 1)
+    # ── 4. Entry cost / payout ──────────────────────────────────────────────
+    if entry_cost is not None:
+        risk_c = round(entry_cost * 100)
+        win_c = round((1.0 - entry_cost) * 100)
+        breakeven_pct = risk_c
+        rr_ratio = round(entry_cost / (1.0 - entry_cost), 1) if entry_cost < 1 else 99
+        if entry_cost >= 0.80:
+            ec_level = 2
+            ec_note = (
+                f"{risk_c}¢ to win {win_c}¢ — {rr_ratio}:1 adverse risk/reward "
+                f"(need ≥{breakeven_pct}% win rate to break even)"
+            )
+        elif entry_cost >= 0.70:
+            ec_level = 1
+            ec_note = f"{risk_c}¢ to win {win_c}¢ — {rr_ratio}:1 (need ≥{breakeven_pct}%)"
+        else:
+            ec_level = 0
+            ec_note = f"{risk_c}¢ to win {win_c}¢ — {rr_ratio}:1 (need ≥{breakeven_pct}%)"
+        _track(ec_level, "Entry cost", ec_note)
 
-    # Boundary proximity
+    # ── 5. Boundary proximity ───────────────────────────────────────────────
     br = blend.get("boundary_risk") or {}
     dist = br.get("closest_source_dist_f")
     if dist is not None:
         dist = float(dist)
         if dist < 0.5:
-            reasons.append(f"forecast right on bucket edge ({dist:.1f}°F away)")
-            level = max(level, 2)
+            bnd_level = 2
+            bnd_note = f"{dist:.1f}°F from bucket edge — right on the line, resolution is a coin flip"
         elif dist < 1.5:
-            reasons.append(f"near bucket edge ({dist:.1f}°F)")
-            level = max(level, 1)
+            bnd_level = 1
+            bnd_note = f"{dist:.1f}°F from bucket edge — resolution risk applied"
+        else:
+            bnd_level = 0
+            bnd_note = f"{dist:.1f}°F clearance from nearest edge"
+        _track(bnd_level, "Boundary", bnd_note)
+    else:
+        _track(3, "Boundary", "forecast well clear of all edges")
 
-    # Straddle
-    straddle = blend.get("straddle_info") or {}
-    if straddle.get("straddles"):
-        n_in = len(straddle.get("inside_sources", []))
-        n_out = len(straddle.get("outside_sources", []))
-        reasons.append(f"sources split {n_in} inside / {n_out} outside bucket")
-        level = max(level, 1)
+    # ── 6. Open-ended bucket ────────────────────────────────────────────────
+    if is_open_ended:
+        _track(2, "Bucket type", "open-ended (e.g. ≥90°F) — tail event, σ×1.5 applied")
+    else:
+        _track(0, "Bucket type", "bounded range — standard confidence")
 
-    # Payout asymmetry: paying 80¢ to win 20¢ requires 80% win rate to break even.
-    # A GREEN banner on such a bet is actively misleading.
-    if entry_cost is not None:
-        risk_c = round(entry_cost * 100)
-        win_c = round((1.0 - entry_cost) * 100)
-        if entry_cost >= 0.80:
-            reasons.append(
-                f"costs {risk_c}¢ to win {win_c}¢ — needs ≥{risk_c}% win rate to break even"
-            )
-            level = max(level, 2)
-        elif entry_cost >= 0.70:
-            reasons.append(f"costs {risk_c}¢ to win {win_c}¢ — asymmetric payout")
-            level = max(level, 1)
+    # ── 7. Ensemble signal ──────────────────────────────────────────────────
+    ens = blend.get("ensemble")
+    if ens:
+        hits = int(ens.get("hits") or 0)
+        n_ens = int(ens.get("n") or 30)
+        inside_pct = round(100 * hits / n_ens) if n_ens else 0
+        outside_pct = 100 - inside_pct
+        # For NO side: we want few hits (most runs outside = NO is correct)
+        # For YES side: we want many hits
+        relevant_pct = outside_pct if is_no else inside_pct
+        relevant_count = (n_ens - hits) if is_no else hits
+        if relevant_pct >= 80:
+            ens_level = 0
+            ens_strength = "strong"
+        elif relevant_pct >= 60:
+            ens_level = 1
+            ens_strength = "moderate"
+        else:
+            ens_level = 2
+            ens_strength = "weak — mixed signal"
+        _track(
+            ens_level, "Ensemble",
+            f"{relevant_count}/{n_ens} runs agree with {side} — {ens_strength}"
+        )
+    else:
+        _track(3, "Ensemble", "no ensemble data")
 
-    emoji = ["\U0001f7e2", "\U0001f7e1", "\U0001f534"][level]
-    label = ["LOW", "MODERATE", "HIGH"][level]
+    # ── Assemble scorecard ──────────────────────────────────────────────────
+    overall_emoji = ["\U0001f7e2", "\U0001f7e1", "\U0001f534"][min(top_level, 2)]
+    overall_label = ["LOW", "MODERATE", "HIGH"][min(top_level, 2)]
 
-    if not reasons:
-        return f"\U0001f6a6 Risk: {emoji} *{label}* — strong model agreement\n"
-    return f"\U0001f6a6 Risk: {emoji} *{label}* — {' · '.join(reasons)}\n"
+    header = f"\U0001f6a6 *Risk: {overall_emoji} {overall_label}*"
+    scorecard = "\n".join(rows)
+    return f"{header}\n{scorecard}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -583,12 +690,17 @@ def fmt_opportunity(
     bottom_line = _bottom_line(blend, bucket_min, bucket_max, side, is_c)
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
 
-    # ── Risk banner ─────────────────────────────────────────────────────────
-    risk_line = _risk_banner(
-        blend,
-        ci_pp_val,
+    # ── Risk scorecard ──────────────────────────────────────────────────────
+    risk_line = _risk_scorecard(
+        blend=blend,
+        side=side,
+        true_prob=true_prob,
+        days_ahead=days_ahead,
+        ci_pp=ci_pp_val,
         is_open_ended=blend.get("is_open_ended", False),
         entry_cost=signals.get("_entry_cost"),
+        alert_threshold=float(signals.get("_alert_threshold") or 0.75),
+        buy_threshold=float(signals.get("_buy_threshold") or 0.90),
     )
 
     # ── Per-source forecast breakdown ─────────────────────────────────────────
@@ -673,13 +785,22 @@ def fmt_opportunity(
             f"\n  ↳ 🌡️ Airport bias: +{bias_f_val:.1f}°F applied to all models "
             f"({bias_desc})"
         )
-    # Surface models that did NOT report so a silently-absent source (e.g. the
-    # ICON/DWD model) is visible rather than invisibly dropped from the blend.
-    missing_sources = blend.get("missing_sources") or []
-    if missing_sources and det_rows:
+    # Surface models that did NOT report, categorised by reason so the user
+    # knows whether to act (e.g. add an API key) or accept (CONUS-only).
+    missing_global = blend.get("missing_sources") or []
+    missing_key = blend.get("missing_no_key") or []
+    missing_conus = blend.get("missing_conus_only") or []
+    if missing_key:
         breakdown_text += (
-            f"\n  ↳ ⚠️ Not reporting: {', '.join(missing_sources)} "
-            f"_(no forecast row for this city/date)_"
+            f"\n  ↳ 🔑 API key not configured: {', '.join(missing_key)}"
+        )
+    if missing_global:
+        breakdown_text += (
+            f"\n  ↳ ⚠️ No data (check collector): {', '.join(missing_global)}"
+        )
+    if missing_conus:
+        breakdown_text += (
+            f"\n  ↳ ℹ️ CONUS-only, N/A here: {', '.join(missing_conus)}"
         )
 
     # ── Ensemble section ────────────────────────────────────────────────
@@ -831,6 +952,15 @@ def fmt_opportunity(
             math_lines.append(
                 f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
                 f"_(onshore marine air likely{grad_note})_"
+            )
+        elif name == "Sparse sources":
+            sparse_info = blend.get("sparse_sources") or {}
+            n_g = sparse_info.get("n_global_det", "?")
+            n_miss = sparse_info.get("n_global_missing", "?")
+            base = sparse_info.get("baseline", 5)
+            math_lines.append(
+                f"• {name}: {sign}{round(abs(delta_side) * 100, 1)}pp "
+                f"_({n_g}/{base} global models present, {n_miss} missing → blend toward 50%)_"
             )
         else:
             math_lines.append(

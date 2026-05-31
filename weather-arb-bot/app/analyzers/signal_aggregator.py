@@ -1,3 +1,22 @@
+"""Signal aggregator — collects all inputs for one city/market/outcome tuple.
+
+Called once per outcome in the opportunity detector. Assembles a `signals` dict
+that the probability estimator treats as a read-only snapshot of the world:
+
+  Primary METAR    — latest hourly observation at the airport (temperature, dew point, wind)
+  Reference METAR  — nearby secondary station (for sea/lake-breeze detection)
+  METAR trend      — 3-hour rolling rate of temperature and dew-point change
+  Forecasts        — one row per NWP source (GFS/ECMWF/HRRR/NWS/Tomorrow.io/Meteosource/ICON)
+  GFS Ensemble     — 30 perturbed members + percentiles
+  Station bias     — rolling 14-day airport-vs-NWP warm bias in °F
+  PIREPs           — low-level pilot weather reports near the airport
+  Market price     — latest Polymarket bid/ask for this outcome
+  Price trend      — 60-min price direction
+
+Keys prefixed with `_` (e.g. `_blend`, `_entry_cost`) are written BACK into the
+signals dict by the opportunity detector after analysis — they carry display info
+that the Telegram formatter reads when building the alert message.
+"""
 import logging
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -12,6 +31,7 @@ from app.models.pirep import Pirep
 from app.models.market import MarketPrice, MarketOutcome
 from app.utils.units import resolve_bucket_unit
 from app.analyzers.bias_estimator import get_station_bias
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +80,16 @@ class SignalAggregator:
         signals["gfs_ensemble"] = await self._latest_forecast(db, city_id, "gfs_ensemble", forecast_date)
         signals["pireps"] = await self._recent_pireps(db, primary_icao, hours=2)
         signals["station_bias"] = await get_station_bias(db, city_id, primary_icao)
+
+        # Tell the probability estimator which global sources have no API key configured.
+        # These are shown differently in alerts ("API key not configured") vs genuinely
+        # missing data rows (which suggest a collector or data-freshness problem).
+        unavailable_api: list[str] = []
+        if not getattr(settings, "tomorrowio_api_key", ""):
+            unavailable_api.append("tomorrowio_forecast")
+        if not getattr(settings, "meteosource_api_key", ""):
+            unavailable_api.append("meteosource_forecast")
+        signals["_unavailable_api"] = unavailable_api
         signals["market_price"] = await self._latest_price(db, outcome.id)
         signals["price_trend"] = await self._price_trend(db, outcome.id, minutes=60)
         signals["is_low_market"] = is_low_market
