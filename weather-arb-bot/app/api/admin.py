@@ -385,8 +385,17 @@ async def admin_stats(
         opp_q(select(func.count(Opportunity.id)))
         .where(Opportunity.virtual_shares != None)
     )).scalar() or 0
+    # Cost of CLOSED positions only (win + loss) — used together with total_payout
+    # and net_pnl so the three numbers are internally consistent:
+    #   net_pnl = total_payout - total_cost  (within closed positions)
     total_cost = (await db.execute(
         opp_q(select(func.coalesce(func.sum(Opportunity.virtual_cost), 0.0)))
+        .where(Opportunity.virtual_status.in_(["win", "loss"]))
+    )).scalar() or 0.0
+    # Cost of still-open positions = money at risk, not yet resolved
+    open_cost = (await db.execute(
+        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_cost), 0.0)))
+        .where(Opportunity.virtual_status == "open")
     )).scalar() or 0.0
     total_payout = (await db.execute(
         opp_q(select(func.coalesce(func.sum(Opportunity.virtual_payout), 0.0)))
@@ -405,7 +414,8 @@ async def admin_stats(
         .where(Opportunity.virtual_status == "loss")
     )).scalar() or 0
     pos_win_rate = round(pos_wins / max(pos_wins + pos_losses, 1) * 100, 1)
-    avg_cost = (float(total_cost) / positions_opened) if positions_opened else 0.0
+    # avg_cost across all opened positions (closed + open), so use total_cost + open_cost
+    avg_cost = (float(total_cost + open_cost) / positions_opened) if positions_opened else 0.0
     best_pnl = (await db.execute(
         opp_q(select(func.max(Opportunity.virtual_pnl)))
         .where(Opportunity.virtual_status.in_(["win", "loss"]))
@@ -431,7 +441,8 @@ async def admin_stats(
         },
         "positions": {
             "opened": positions_opened,
-            "total_cost": round(float(total_cost), 2),
+            "total_cost": round(float(total_cost), 2),        # closed positions only
+            "open_cost": round(float(open_cost), 2),          # still-open (at risk)
             "total_payout": round(float(total_payout), 2),
             "net_pnl": round(float(net_pnl), 2),
             "wins": pos_wins,
