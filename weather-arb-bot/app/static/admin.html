@@ -512,9 +512,10 @@ async function loadStats() {
   const fmt = v => (v == null ? '—' : (v >= 0 ? '$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)));
   document.getElementById('statsPositions').innerHTML =
     card('Opened', p.opened || 0) +
-    card('Total cost', '$' + (p.total_cost || 0).toFixed(2)) +
+    card('Cost (closed)', '$' + (p.total_cost || 0).toFixed(2)) +
+    card('At risk (open)', '$' + (p.open_cost || 0).toFixed(2)) +
     card('Total payout', '$' + (p.total_payout || 0).toFixed(2)) +
-    card('Net P&L', fmt(p.net_pnl)) +
+    card('Net P&L (closed)', fmt(p.net_pnl)) +
     card('Win rate', (p.win_rate_pct || 0) + '%') +
     card('Avg cost', '$' + (p.avg_cost || 0).toFixed(2)) +
     card('Best position', fmt(p.best_pnl)) +
