@@ -717,22 +717,48 @@ async def _fetch_polymarket_winning_outcomes(
         async with httpx.AsyncClient(
             headers={"User-Agent": "weather-arb-bot/1.0"}, timeout=20.0
         ) as client:
-            r = await client.get(
-                "https://gamma-api.polymarket.com/events",
-                params={"slug": event_slug, "limit": 1},
-                timeout=20.0,
-            )
-            if r.status_code != 200:
-                logger.warning(
-                    f"_fetch_polymarket_winning_outcomes: HTTP {r.status_code} for {event_slug}"
+            # Resolved/closed events are NOT returned by default from the Gamma
+            # API. Try several parameter combinations to find the event whether
+            # it is still open, recently closed, or fully resolved.
+            event: Optional[dict] = None
+            for extra in [
+                {"closed": "true"},   # resolved events
+                {"active": "false"},  # inactive (settled) events
+                {},                   # fallback: active-only (unlikely to be resolved, but kept)
+            ]:
+                try:
+                    r = await client.get(
+                        "https://gamma-api.polymarket.com/events",
+                        params={"slug": event_slug, "limit": 1, **extra},
+                        timeout=20.0,
+                    )
+                except Exception as _req_err:
+                    logger.debug(f"_fetch_polymarket_winning_outcomes request error ({extra}): {_req_err}")
+                    continue
+                if r.status_code == 429:
+                    await asyncio.sleep(3)
+                    continue
+                if r.status_code != 200:
+                    logger.debug(
+                        f"_fetch_polymarket_winning_outcomes: HTTP {r.status_code} for {event_slug} params={extra}"
+                    )
+                    continue
+                data = r.json()
+                candidate = (
+                    data[0] if isinstance(data, list) and data
+                    else (data if isinstance(data, dict) and data.get("slug") else None)
                 )
-                return frozenset(), False, None
-            data = r.json()
-            event = (
-                data[0] if isinstance(data, list) and data
-                else (data if isinstance(data, dict) and data.get("slug") else None)
-            )
+                if candidate and candidate.get("markets"):
+                    event = candidate
+                    logger.debug(
+                        f"_fetch_polymarket_winning_outcomes: found event {event_slug} with params={extra}"
+                    )
+                    break
+
             if not event:
+                logger.info(
+                    f"_fetch_polymarket_winning_outcomes: no event found for slug={event_slug}"
+                )
                 return frozenset(), False, None
 
             sub_markets = event.get("markets") or []
