@@ -135,6 +135,18 @@
         <label class="row small">City
           <select id="posCity"><option value="">All cities</option></select>
         </label>
+        <select id="posSide" onchange="applyPosClientFilter()" title="Filter by YES/NO side">
+          <option value="">All sides</option>
+          <option value="YES">YES</option>
+          <option value="NO">NO</option>
+        </select>
+        <select id="posStatus" onchange="applyPosClientFilter()" title="Filter by status">
+          <option value="">All statuses</option>
+          <option value="win">WIN</option>
+          <option value="loss">LOSS</option>
+          <option value="open">Open</option>
+        </select>
+        <label class="row small" title="Minimum model confidence (0-100)">Min conf <input type="number" id="posMinConf" min="0" max="100" step="1" style="width:46px;" oninput="applyPosClientFilter()" /></label>
         <button class="btn primary" onclick="loadPositions()">Apply Filter</button>
         <button class="btn" onclick="resetPosFilter()">Reset</button>
         <button class="btn primary" onclick="resolvePending(this)" title="Run resolution on past markets whose virtual positions never closed">🔄 Resolve pending</button>
@@ -193,6 +205,13 @@
           <option value="WIN">WIN</option>
           <option value="LOSS">LOSS</option>
         </select>
+        <select id="oppSide" onchange="applyOppClientFilter()" title="Filter by YES/NO side">
+          <option value="">All sides</option>
+          <option value="YES">YES</option>
+          <option value="NO">NO</option>
+        </select>
+        <label class="row small" title="Minimum model confidence (0-100)">Min conf <input type="number" id="oppMinConf" min="0" max="100" step="1" style="width:46px;" oninput="applyOppClientFilter()" /></label>
+        <label class="row small" title="Minimum edge pp">Min edge <input type="number" id="oppMinEdge" min="0" max="100" step="1" style="width:46px;" oninput="applyOppClientFilter()" /></label>
         <button class="btn primary" onclick="loadOpps()">Apply Filter</button>
         <button class="btn" onclick="resetOppFilter()">Reset</button>
         <button class="btn" onclick="exportCsv('oppsBody', 'opportunities')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
@@ -309,6 +328,7 @@
     <div class="modal-box" onclick="event.stopPropagation()">
       <div class="modal-head">
         <h3 id="alertModalTitle">Alert details</h3>
+        <button class="btn small" id="copyAlertBtn" onclick="copyAlertText()" title="Copy text to clipboard">📋 Copy</button>
         <button class="btn small" onclick="closeAlertModal()">Close</button>
       </div>
       <div class="modal-body" id="alertModalBody">Loading…</div>
@@ -384,10 +404,14 @@ function _updateSortIndicators(tbodyId) {
   });
 }
 
+const _clientFilters = {};
+
 function _rerenderTable(tbodyId) {
   const renderer = _tableRenderers[tbodyId];
   if (!renderer) return;
-  const rows = _tableCache[tbodyId] || [];
+  let rows = _tableCache[tbodyId] || [];
+  const fn = _clientFilters[tbodyId];
+  if (fn) rows = rows.filter(fn);
   const sorted = _applySort(rows, _sortState[tbodyId]);
   renderer(sorted);
   _updateSortIndicators(tbodyId);
@@ -533,6 +557,10 @@ function resetPosFilter() {
   document.getElementById('posFrom').value = '';
   document.getElementById('posTo').value = '';
   document.getElementById('posCity').value = '';
+  document.getElementById('posSide').value = '';
+  document.getElementById('posStatus').value = '';
+  document.getElementById('posMinConf').value = '';
+  _clientFilters['positionsBody'] = null;
   loadPositions();
 }
 
@@ -724,31 +752,124 @@ async function resolvePending(btn) {
   }
 }
 
+let _retroFixBtn = null;
+let _retroPollTimer = null;
+
 async function retroactiveFix(btn) {
   const status = document.getElementById('resolveStatus');
-  const orig = btn.textContent;
-  btn.disabled = true; btn.textContent = 'Checking Polymarket…';
+  _retroFixBtn = btn;
+  btn.disabled = true; btn.textContent = 'Starting…';
   status.textContent = '';
   try {
     const r = await api('/retroactive-resolution-fix', { method: 'POST' });
     const j = await r.json().catch(() => ({}));
-    if (r.ok) {
-      const parts = [
-        `Checked ${j.markets_with_token ?? 0} markets`,
-        `corrected ${j.opportunities_corrected ?? 0} positions`,
-      ];
-      if (j.markets_skipped_no_poly) parts.push(`${j.markets_skipped_no_poly} not yet resolved on Poly`);
-      if (j.markets_skipped_no_token) parts.push(`${j.markets_skipped_no_token} without token IDs`);
-      status.textContent = parts.join(', ') + '.';
-      if (j.opportunities_corrected > 0) loadPositions();
-    } else {
+    if (!r.ok) {
       status.textContent = 'Error: ' + (j.detail || r.status);
+      btn.disabled = false; btn.textContent = '🔁 Retroactive Poly fix';
+      return;
     }
+    if (j.already_running) {
+      status.textContent = 'Already running — polling for status…';
+    } else {
+      status.textContent = 'Running in background…';
+    }
+    btn.textContent = '⏳ Running…';
+    _startRetroFixPoll();
   } catch (e) {
     status.textContent = 'Error: ' + e;
-  } finally {
-    btn.disabled = false; btn.textContent = orig;
+    btn.disabled = false; btn.textContent = '🔁 Retroactive Poly fix';
   }
+}
+
+function _startRetroFixPoll() {
+  if (_retroPollTimer) clearInterval(_retroPollTimer);
+  _retroPollTimer = setInterval(_pollRetroFixStatus, 3000);
+  _pollRetroFixStatus();
+}
+
+async function _pollRetroFixStatus() {
+  const status = document.getElementById('resolveStatus');
+  try {
+    const r = await api('/retroactive-resolution-fix/status');
+    if (!r.ok) return;
+    const j = await r.json();
+    const checked = j.markets_checked ?? 0;
+    const total = j.markets_total ?? '?';
+    const corrected = j.opportunities_corrected ?? 0;
+    if (j.status === 'running') {
+      status.textContent = `Running… checked ${checked}/${total} markets, corrected ${corrected} positions`;
+      return;
+    }
+    // done or error
+    clearInterval(_retroPollTimer);
+    _retroPollTimer = null;
+    if (_retroFixBtn) {
+      _retroFixBtn.disabled = false;
+      _retroFixBtn.textContent = '🔁 Retroactive Poly fix';
+    }
+    if (j.status === 'error') {
+      status.textContent = 'Error: ' + (j.error || 'unknown');
+      return;
+    }
+    const parts = [
+      `Checked ${checked} markets`,
+      `corrected ${corrected} positions`,
+    ];
+    if (j.markets_skipped_no_poly) parts.push(`${j.markets_skipped_no_poly} not yet on Poly`);
+    if (j.markets_skipped_no_token) parts.push(`${j.markets_skipped_no_token} without token IDs`);
+    status.textContent = parts.join(', ') + '.';
+    if (corrected > 0) loadPositions();
+  } catch (e) {
+    // ignore transient poll errors
+  }
+}
+
+// --- Client-side filters for Positions and Opportunities ---
+
+function applyPosClientFilter() {
+  const side = document.getElementById('posSide').value;
+  const minConf = parseFloat(document.getElementById('posMinConf').value) || 0;
+  const posStatus = document.getElementById('posStatus').value;
+  _clientFilters['positionsBody'] = (side || minConf > 0 || posStatus) ? (o => {
+    if (side && o.side !== side) return false;
+    if (posStatus && (o.status || '') !== posStatus) return false;
+    if (minConf > 0 && (o.confidence || 0) < minConf) return false;
+    return true;
+  }) : null;
+  _rerenderTable('positionsBody');
+}
+
+function applyOppClientFilter() {
+  const side = document.getElementById('oppSide').value;
+  const minConf = parseFloat(document.getElementById('oppMinConf').value) || 0;
+  const minEdge = parseFloat(document.getElementById('oppMinEdge').value) || 0;
+  _clientFilters['oppsBody'] = (side || minConf > 0 || minEdge > 0) ? (o => {
+    if (side && o.side !== side) return false;
+    if (minConf > 0 && (o.confidence || 0) < minConf) return false;
+    if (minEdge > 0 && Math.abs((o.edge || 0) * 100) < minEdge) return false;
+    return true;
+  }) : null;
+  _rerenderTable('oppsBody');
+}
+
+// --- Alert modal copy ---
+
+function copyAlertText() {
+  const body = document.getElementById('alertModalBody');
+  const btn = document.getElementById('copyAlertBtn');
+  if (!body || !body.textContent) return;
+  navigator.clipboard.writeText(body.textContent).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = '✓ Copied';
+    setTimeout(() => { btn.textContent = orig; }, 1800);
+  }).catch(() => {
+    // Fallback for older browsers / http
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(body);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
 }
 
 function pill(outcome) {
@@ -781,6 +902,10 @@ function resetOppFilter() {
   document.getElementById('oppFrom').value = '';
   document.getElementById('oppTo').value = '';
   document.getElementById('oppCity').value = '';
+  document.getElementById('oppSide').value = '';
+  document.getElementById('oppMinConf').value = '';
+  document.getElementById('oppMinEdge').value = '';
+  _clientFilters['oppsBody'] = null;
   loadOpps();
 }
 

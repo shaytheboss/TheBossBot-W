@@ -99,6 +99,19 @@ LAST_DISCOVERY: dict = {
     "errors": [],
 }
 
+LAST_RETRO_FIX: dict = {
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "markets_total": 0,
+    "markets_checked": 0,
+    "markets_skipped_no_poly": 0,
+    "markets_skipped_no_token": 0,
+    "opportunities_corrected": 0,
+    "corrections": [],
+    "error": None,
+}
+
 
 def _is_skippable_market(text: str) -> bool:
     if not text:
@@ -723,6 +736,18 @@ async def _fetch_polymarket_winning_outcomes(
                 return frozenset(), False, None
 
             sub_markets = event.get("markets") or []
+
+            # Polymarket Gamma API quirk: outcomePrices and clobTokenIds are
+            # JSON-encoded strings, not native arrays.  e.g. "[\"1\", \"0\"]".
+            # Must json.loads() before indexing, or outcome_prices[0] gives "[".
+            def _decode_prices(raw) -> list:
+                if isinstance(raw, str):
+                    try:
+                        return json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        return []
+                return list(raw) if raw else []
+
             any_resolved = any(m.get("resolved") for m in sub_markets)
             if not any_resolved:
                 return frozenset(), False, None
@@ -735,8 +760,10 @@ async def _fetch_polymarket_winning_outcomes(
                     continue
 
                 # Determine if YES won for this bucket.
+                # Check multiple signals: winner field, outcomePrices[0],
+                # tokens[].winner boolean — any one suffices.
                 winner = str(m.get("winner") or "").strip().lower()
-                outcome_prices = m.get("outcomePrices") or []
+                outcome_prices = _decode_prices(m.get("outcomePrices"))
                 yes_won = False
                 if winner in ("yes", "1", "true"):
                     yes_won = True
@@ -745,6 +772,13 @@ async def _fetch_polymarket_winning_outcomes(
                         yes_won = float(outcome_prices[0]) >= 0.99
                     except (ValueError, TypeError):
                         pass
+                # Fallback: check tokens[].winner bool
+                if not yes_won:
+                    for tok in (m.get("tokens") or []):
+                        if str(tok.get("outcome", "")).lower() == "yes":
+                            if tok.get("winner") is True:
+                                yes_won = True
+                            break
 
                 bucket_label = (
                     m.get("groupItemTitle") or m.get("question") or "?"
@@ -757,16 +791,14 @@ async def _fetch_polymarket_winning_outcomes(
                 yes_token: Optional[str] = None
                 for tok in (m.get("tokens") or []):
                     if str(tok.get("outcome", "")).lower() == "yes":
-                        yes_token = tok.get("tokenId") or tok.get("token_id")
+                        yes_token = (
+                            tok.get("tokenId") or tok.get("token_id")
+                            or tok.get("id")
+                        )
                         break
                 if not yes_token:
-                    ids = m.get("clobTokenIds") or []
-                    if isinstance(ids, str):
-                        try:
-                            ids = json.loads(ids)
-                        except json.JSONDecodeError:
-                            ids = []
-                    yes_token = ids[0] if ids else None
+                    ids = _decode_prices(m.get("clobTokenIds"))
+                    yes_token = str(ids[0]) if ids else None
 
                 matched_id: Optional[int] = None
                 if yes_token and yes_token in token_id_to_outcome_id:
@@ -1023,136 +1055,162 @@ async def job_check_resolutions():
 async def job_retroactive_resolution_fix() -> dict:
     """Re-resolve already-settled markets using Polymarket's authoritative data.
 
-    Iterates all markets marked resolved=True, fetches the actual winning bucket
-    from the Polymarket Gamma API, and corrects any opportunity outcomes that
-    differ. Returns a summary dict with correction counts.
-
-    This fixes the class of bugs where our METAR-computed bucket winner differs
-    from what Polymarket actually resolved (rounding differences, different
-    temperature sources, etc.).
+    Updates the global LAST_RETRO_FIX dict with live progress so callers
+    can poll for status without waiting for the full run to complete.
+    Safe to run multiple times — only changes records that differ from Polymarket.
     """
-    today = date.today()
-    corrected = 0
-    skipped_no_poly = 0
-    skipped_no_token = 0
-    markets_checked = 0
-    corrections: list[dict] = []
+    now_str = datetime.now(timezone.utc).isoformat()
+    LAST_RETRO_FIX.update({
+        "status": "running",
+        "started_at": now_str,
+        "finished_at": None,
+        "markets_total": 0,
+        "markets_checked": 0,
+        "markets_skipped_no_poly": 0,
+        "markets_skipped_no_token": 0,
+        "opportunities_corrected": 0,
+        "corrections": [],
+        "error": None,
+    })
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Market)
-            .where(Market.resolved == True)
-            .order_by(Market.event_date.desc())
-        )
-        markets = result.scalars().all()
+    try:
+        corrected = 0
+        skipped_no_poly = 0
+        skipped_no_token = 0
+        markets_checked = 0
+        corrections: list[dict] = []
 
-        logger.info(f"job_retroactive_resolution_fix: checking {len(markets)} resolved markets")
-
-        for market in markets:
-            outcomes_result = await db.execute(
-                select(MarketOutcome).where(MarketOutcome.market_id == market.id)
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Market)
+                .where(Market.resolved == True)
+                .order_by(Market.event_date.desc())
             )
-            outcomes = outcomes_result.scalars().all()
-            if not outcomes:
-                continue
+            markets = result.scalars().all()
+            LAST_RETRO_FIX["markets_total"] = len(markets)
+            logger.info(f"job_retroactive_resolution_fix: checking {len(markets)} resolved markets")
 
-            has_token = any(o.token_id for o in outcomes)
-            if not has_token:
-                skipped_no_token += 1
-                continue
-
-            markets_checked += 1
-            poly_winning, poly_resolved, poly_note = (
-                await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
-            )
-
-            if not poly_resolved:
-                skipped_no_poly += 1
-                logger.debug(
-                    f"retroactive_fix: {market.external_id} not yet resolved on Polymarket"
+            for market in markets:
+                outcomes_result = await db.execute(
+                    select(MarketOutcome).where(MarketOutcome.market_id == market.id)
                 )
-                continue
-
-            # Fetch all opps on this market (alert_sent or not — we correct all settled ones).
-            opps_result = await db.execute(
-                select(Opportunity)
-                .join(MarketOutcome)
-                .where(
-                    MarketOutcome.market_id == market.id,
-                    Opportunity.outcome.in_(["WIN", "LOSS"]),
-                )
-            )
-            opps = opps_result.scalars().all()
-
-            market_corrected = 0
-            for opp in opps:
-                bucket_won = opp.outcome_id in poly_winning
-                if opp.side == "YES":
-                    correct_outcome = "WIN" if bucket_won else "LOSS"
-                else:
-                    correct_outcome = "WIN" if not bucket_won else "LOSS"
-
-                if opp.outcome == correct_outcome:
+                outcomes = outcomes_result.scalars().all()
+                if not outcomes:
                     continue
 
-                # Outcome is wrong — correct it.
-                old_outcome = opp.outcome
-                opp.outcome = correct_outcome
+                has_token = any(o.token_id for o in outcomes)
+                if not has_token:
+                    skipped_no_token += 1
+                    LAST_RETRO_FIX["markets_skipped_no_token"] = skipped_no_token
+                    continue
 
-                if opp.virtual_shares:
-                    cost = float(opp.virtual_cost or 0.0)
-                    if correct_outcome == "WIN":
-                        payout = float(opp.virtual_shares) * 1.00
-                        opp.virtual_payout = payout
-                        opp.virtual_status = "win"
+                markets_checked += 1
+                LAST_RETRO_FIX["markets_checked"] = markets_checked
+                poly_winning, poly_resolved, poly_note = (
+                    await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
+                )
+
+                if not poly_resolved:
+                    skipped_no_poly += 1
+                    LAST_RETRO_FIX["markets_skipped_no_poly"] = skipped_no_poly
+                    logger.debug(
+                        f"retroactive_fix: {market.external_id} not yet resolved on Polymarket"
+                    )
+                    continue
+
+                # Fetch all settled opps on this market.
+                opps_result = await db.execute(
+                    select(Opportunity)
+                    .join(MarketOutcome)
+                    .where(
+                        MarketOutcome.market_id == market.id,
+                        Opportunity.outcome.in_(["WIN", "LOSS"]),
+                    )
+                )
+                opps = opps_result.scalars().all()
+
+                market_corrected = 0
+                for opp in opps:
+                    bucket_won = opp.outcome_id in poly_winning
+                    if opp.side == "YES":
+                        correct_outcome = "WIN" if bucket_won else "LOSS"
                     else:
-                        payout = 0.0
-                        opp.virtual_payout = payout
-                        opp.virtual_status = "loss"
-                    opp.virtual_pnl = payout - cost
+                        correct_outcome = "WIN" if not bucket_won else "LOSS"
 
-                corrected += 1
-                market_corrected += 1
+                    if opp.outcome == correct_outcome:
+                        continue
 
-                # Fetch outcome label for the log.
-                oc_r = await db.execute(
-                    select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id)
-                )
-                oc = oc_r.scalar_one_or_none()
-                bucket_label = oc.bucket_label if oc else f"#{opp.outcome_id}"
-                corrections.append({
-                    "market": market.external_id,
-                    "opp_id": opp.id,
-                    "bucket": bucket_label,
-                    "side": opp.side,
-                    "was": old_outcome,
-                    "now": correct_outcome,
-                })
-                logger.info(
-                    f"retroactive_fix: corrected opp #{opp.id} market={market.external_id} "
-                    f"bucket={bucket_label!r} side={opp.side} {old_outcome} → {correct_outcome}"
-                )
+                    old_outcome = opp.outcome
+                    opp.outcome = correct_outcome
 
-            if market_corrected > 0:
-                # Update market resolution_value to note Polymarket source.
-                if market.resolution_value and "(Polymarket)" not in market.resolution_value:
-                    market.resolution_value = market.resolution_value.rstrip() + " (Polymarket)"
-                elif not market.resolution_value:
-                    market.resolution_value = f"Polymarket: {poly_note}"
+                    if opp.virtual_shares:
+                        cost = float(opp.virtual_cost or 0.0)
+                        if correct_outcome == "WIN":
+                            payout = float(opp.virtual_shares) * 1.00
+                            opp.virtual_payout = payout
+                            opp.virtual_status = "win"
+                        else:
+                            payout = 0.0
+                            opp.virtual_payout = payout
+                            opp.virtual_status = "loss"
+                        opp.virtual_pnl = payout - cost
+
+                    corrected += 1
+                    market_corrected += 1
+
+                    oc_r = await db.execute(
+                        select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id)
+                    )
+                    oc = oc_r.scalar_one_or_none()
+                    bucket_label = oc.bucket_label if oc else f"#{opp.outcome_id}"
+                    entry = {
+                        "market": market.external_id,
+                        "opp_id": opp.id,
+                        "bucket": bucket_label,
+                        "side": opp.side,
+                        "was": old_outcome,
+                        "now": correct_outcome,
+                    }
+                    corrections.append(entry)
+                    LAST_RETRO_FIX["opportunities_corrected"] = corrected
+                    LAST_RETRO_FIX["corrections"] = corrections
+                    logger.info(
+                        f"retroactive_fix: corrected opp #{opp.id} market={market.external_id} "
+                        f"bucket={bucket_label!r} side={opp.side} {old_outcome} → {correct_outcome}"
+                    )
+
+                if market_corrected > 0:
+                    if market.resolution_value and "(Polymarket)" not in market.resolution_value:
+                        market.resolution_value = market.resolution_value.rstrip() + " (Polymarket)"
+                    elif not market.resolution_value:
+                        market.resolution_value = f"Polymarket: {poly_note}"
+                    await db.commit()
+
+            if corrected == 0 and markets_checked > 0:
                 await db.commit()
 
-        if corrected == 0 and markets_checked > 0:
-            await db.commit()
+        result_summary = {
+            "status": "done",
+            "started_at": now_str,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "markets_total": LAST_RETRO_FIX["markets_total"],
+            "markets_checked": markets_checked,
+            "markets_skipped_no_poly": skipped_no_poly,
+            "markets_skipped_no_token": skipped_no_token,
+            "opportunities_corrected": corrected,
+            "corrections": corrections,
+            "error": None,
+        }
+        LAST_RETRO_FIX.update(result_summary)
+        logger.info(
+            f"job_retroactive_resolution_fix complete: checked={markets_checked} "
+            f"corrected={corrected} no_poly={skipped_no_poly} no_token={skipped_no_token}"
+        )
+        return result_summary
 
-    result_summary = {
-        "markets_with_token": markets_checked,
-        "markets_skipped_no_poly": skipped_no_poly,
-        "markets_skipped_no_token": skipped_no_token,
-        "opportunities_corrected": corrected,
-        "corrections": corrections,
-    }
-    logger.info(
-        f"job_retroactive_resolution_fix complete: checked={markets_checked} "
-        f"corrected={corrected} no_poly={skipped_no_poly} no_token={skipped_no_token}"
-    )
-    return result_summary
+    except Exception as e:
+        LAST_RETRO_FIX["status"] = "error"
+        LAST_RETRO_FIX["error"] = str(e)
+        LAST_RETRO_FIX["finished_at"] = datetime.now(timezone.utc).isoformat()
+        logger.error(f"job_retroactive_resolution_fix failed: {e}", exc_info=True)
+        raise
