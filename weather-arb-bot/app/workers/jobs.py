@@ -737,47 +737,86 @@ async def _fetch_polymarket_winning_outcomes(
 
             sub_markets = event.get("markets") or []
 
-            # Polymarket Gamma API quirk: outcomePrices and clobTokenIds are
-            # JSON-encoded strings, not native arrays.  e.g. "[\"1\", \"0\"]".
-            # Must json.loads() before indexing, or outcome_prices[0] gives "[".
-            def _decode_prices(raw) -> list:
+            # Polymarket Gamma API quirk: outcomes, outcomePrices and
+            # clobTokenIds all arrive as JSON-encoded strings, not native
+            # arrays — e.g. outcomePrices = "[\"1\", \"0\"]". Must json.loads()
+            # before indexing, or indexing the raw string yields a character.
+            def _decode_json_field(raw) -> list:
                 if isinstance(raw, str):
                     try:
-                        return json.loads(raw)
+                        v = json.loads(raw)
+                        return v if isinstance(v, list) else []
                     except (json.JSONDecodeError, ValueError):
                         return []
-                return list(raw) if raw else []
+                if isinstance(raw, (list, tuple)):
+                    return list(raw)
+                return []
 
-            any_resolved = any(m.get("resolved") for m in sub_markets)
+            # A sub-market is resolved if Polymarket says so, OR (defensively)
+            # if it's closed and its prices are a definitive 1/0 split.
+            def _is_resolved(m: dict, prices: list) -> bool:
+                if m.get("resolved") is True:
+                    return True
+                if m.get("closed") is True and prices:
+                    try:
+                        vals = sorted(float(p) for p in prices)
+                        return vals[0] <= 0.01 and vals[-1] >= 0.99
+                    except (ValueError, TypeError):
+                        return False
+                return False
+
+            # Locate the "Yes" index from the per-market outcomes labels.
+            # CRITICAL: never assume index 0 == Yes. Polymarket orders
+            # outcomePrices / clobTokenIds to match the outcomes array, which
+            # may be ["No", "Yes"]. Indexing [0] blindly mis-reads the Yes
+            # price for those markets and flips the winner.
+            def _yes_index(outcomes_arr: list) -> int:
+                for i, lbl in enumerate(outcomes_arr):
+                    if str(lbl).strip().lower() == "yes":
+                        return i
+                return 0  # fall back to first outcome (Polymarket default order)
+
+            any_resolved = False
+            resolved_flags: list = []
+            for m in sub_markets:
+                prices_chk = _decode_json_field(m.get("outcomePrices"))
+                rflag = _is_resolved(m, prices_chk)
+                resolved_flags.append(rflag)
+                if rflag:
+                    any_resolved = True
             if not any_resolved:
                 return frozenset(), False, None
 
             winning_outcome_ids: set[int] = set()
             notes: list[str] = []
 
-            for m in sub_markets:
-                if not m.get("resolved"):
+            for m, is_res in zip(sub_markets, resolved_flags):
+                if not is_res:
                     continue
 
-                # Determine if YES won for this bucket.
-                # Check multiple signals: winner field, outcomePrices[0],
-                # tokens[].winner boolean — any one suffices.
-                winner = str(m.get("winner") or "").strip().lower()
-                outcome_prices = _decode_prices(m.get("outcomePrices"))
+                outcomes_arr = _decode_json_field(m.get("outcomes"))
+                prices_arr = _decode_json_field(m.get("outcomePrices"))
+                tokens_arr = _decode_json_field(m.get("clobTokenIds"))
+                yes_idx = _yes_index(outcomes_arr)
+
+                # Determine if YES won using the correctly-located Yes price.
                 yes_won = False
-                if winner in ("yes", "1", "true"):
-                    yes_won = True
-                elif outcome_prices:
+                if yes_idx < len(prices_arr):
                     try:
-                        yes_won = float(outcome_prices[0]) >= 0.99
+                        yes_won = float(prices_arr[yes_idx]) >= 0.99
                     except (ValueError, TypeError):
                         pass
-                # Fallback: check tokens[].winner bool
+                # CLOB-shaped fallback: tokens[] with explicit winner / price.
                 if not yes_won:
                     for tok in (m.get("tokens") or []):
                         if str(tok.get("outcome", "")).lower() == "yes":
                             if tok.get("winner") is True:
                                 yes_won = True
+                            else:
+                                try:
+                                    yes_won = float(tok.get("price")) >= 0.99
+                                except (ValueError, TypeError):
+                                    pass
                             break
 
                 bucket_label = (
@@ -787,18 +826,20 @@ async def _fetch_polymarket_winning_outcomes(
                 if not yes_won:
                     continue
 
-                # Strategy 1: match by YES token_id.
+                # Match the winning bucket back to our MarketOutcome record.
+                # Strategy 1: YES token_id (located via the same yes_idx).
                 yes_token: Optional[str] = None
-                for tok in (m.get("tokens") or []):
-                    if str(tok.get("outcome", "")).lower() == "yes":
-                        yes_token = (
-                            tok.get("tokenId") or tok.get("token_id")
-                            or tok.get("id")
-                        )
-                        break
+                if yes_idx < len(tokens_arr) and tokens_arr[yes_idx]:
+                    yes_token = str(tokens_arr[yes_idx])
                 if not yes_token:
-                    ids = _decode_prices(m.get("clobTokenIds"))
-                    yes_token = str(ids[0]) if ids else None
+                    for tok in (m.get("tokens") or []):
+                        if str(tok.get("outcome", "")).lower() == "yes":
+                            yes_token = (
+                                tok.get("tokenId") or tok.get("token_id")
+                                or tok.get("id")
+                            )
+                            yes_token = str(yes_token) if yes_token else None
+                            break
 
                 matched_id: Optional[int] = None
                 if yes_token and yes_token in token_id_to_outcome_id:
