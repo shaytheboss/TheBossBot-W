@@ -265,6 +265,25 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
     }
 
 
+@router.post("/retroactive-resolution-fix")
+async def admin_retroactive_resolution_fix(_: str = Depends(require_admin)):
+    """Re-resolve already-settled markets using Polymarket's authoritative data.
+
+    Queries Polymarket's Gamma API for each resolved market to find which bucket
+    actually won, then corrects any opportunity outcomes (WIN/LOSS) that were
+    recorded incorrectly based on METAR temperature rounding differences.
+
+    Safe to run multiple times — only changes records that differ from Polymarket.
+    """
+    from app.workers.jobs import job_retroactive_resolution_fix
+    try:
+        summary = await job_retroactive_resolution_fix()
+        return {"ok": True, **summary}
+    except Exception as e:
+        logger.error(f"Admin retroactive-resolution-fix failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Retroactive fix failed: {e}")
+
+
 @router.get("/diag/polymarket")
 async def admin_diag_polymarket(
     slug: str = Query(..., description="Exact Polymarket event slug to fetch"),

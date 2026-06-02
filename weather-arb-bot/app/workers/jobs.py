@@ -681,9 +681,126 @@ async def job_run_analyzer():
             logger.error(f"Analyzer job failed: {e}", exc_info=True)
 
 
-async def _send_resolution_alert(
-    city: City, market: Market, actual_high_f: float, opps: list, winning_outcome_ids: set, db,
+async def _fetch_polymarket_winning_outcomes(
+    event_slug: str,
     outcomes: list,
+) -> tuple[frozenset, bool, Optional[str]]:
+    """Query Polymarket Gamma API to find which bucket's YES actually resolved.
+
+    Returns (winning_outcome_ids, poly_resolved, note_str).
+    winning_outcome_ids is the set of MarketOutcome.id records that Polymarket
+    says won (i.e. their YES token resolved to 1.0). poly_resolved=True means
+    Polymarket has marked at least one sub-market as resolved; False means the
+    event hasn't settled on their side yet (fall back to METAR).
+    """
+    token_id_to_outcome_id: dict[str, int] = {
+        o.token_id: o.id for o in outcomes if o.token_id
+    }
+    label_to_outcome_id: dict[str, int] = {
+        o.bucket_label.strip().lower(): o.id for o in outcomes
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "weather-arb-bot/1.0"}, timeout=20.0
+        ) as client:
+            r = await client.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"slug": event_slug, "limit": 1},
+                timeout=20.0,
+            )
+            if r.status_code != 200:
+                logger.warning(
+                    f"_fetch_polymarket_winning_outcomes: HTTP {r.status_code} for {event_slug}"
+                )
+                return frozenset(), False, None
+            data = r.json()
+            event = (
+                data[0] if isinstance(data, list) and data
+                else (data if isinstance(data, dict) and data.get("slug") else None)
+            )
+            if not event:
+                return frozenset(), False, None
+
+            sub_markets = event.get("markets") or []
+            any_resolved = any(m.get("resolved") for m in sub_markets)
+            if not any_resolved:
+                return frozenset(), False, None
+
+            winning_outcome_ids: set[int] = set()
+            notes: list[str] = []
+
+            for m in sub_markets:
+                if not m.get("resolved"):
+                    continue
+
+                # Determine if YES won for this bucket.
+                winner = str(m.get("winner") or "").strip().lower()
+                outcome_prices = m.get("outcomePrices") or []
+                yes_won = False
+                if winner in ("yes", "1", "true"):
+                    yes_won = True
+                elif outcome_prices:
+                    try:
+                        yes_won = float(outcome_prices[0]) >= 0.99
+                    except (ValueError, TypeError):
+                        pass
+
+                bucket_label = (
+                    m.get("groupItemTitle") or m.get("question") or "?"
+                ).strip()
+
+                if not yes_won:
+                    continue
+
+                # Strategy 1: match by YES token_id.
+                yes_token: Optional[str] = None
+                for tok in (m.get("tokens") or []):
+                    if str(tok.get("outcome", "")).lower() == "yes":
+                        yes_token = tok.get("tokenId") or tok.get("token_id")
+                        break
+                if not yes_token:
+                    ids = m.get("clobTokenIds") or []
+                    if isinstance(ids, str):
+                        try:
+                            ids = json.loads(ids)
+                        except json.JSONDecodeError:
+                            ids = []
+                    yes_token = ids[0] if ids else None
+
+                matched_id: Optional[int] = None
+                if yes_token and yes_token in token_id_to_outcome_id:
+                    matched_id = token_id_to_outcome_id[yes_token]
+
+                # Strategy 2: match by bucket label (case-insensitive).
+                if matched_id is None:
+                    matched_id = label_to_outcome_id.get(bucket_label.lower())
+
+                if matched_id is not None:
+                    winning_outcome_ids.add(matched_id)
+                    notes.append(f"{bucket_label} YES=1.0")
+                    logger.info(
+                        f"Polymarket winner: event={event_slug} bucket={bucket_label!r} "
+                        f"outcome_id={matched_id} token={yes_token}"
+                    )
+                else:
+                    logger.warning(
+                        f"Polymarket winner found but no DB match: event={event_slug} "
+                        f"bucket={bucket_label!r} token={yes_token}"
+                    )
+                    notes.append(f"{bucket_label} YES=1.0 (unmatched)")
+
+            note = "Polymarket: " + (", ".join(notes) if notes else "resolved (no match)")
+            return frozenset(winning_outcome_ids), True, note
+
+    except Exception as e:
+        logger.warning(f"_fetch_polymarket_winning_outcomes({event_slug}): {e}")
+        return frozenset(), False, None
+
+
+async def _send_resolution_alert(
+    city: City, market: Market, actual_high_f: Optional[float], opps: list,
+    winning_outcome_ids: set, db, outcomes: list, resolution_source: str = "METAR",
 ) -> None:
     from app.models.alert import TelegramUser
     from telegram import Bot
@@ -705,11 +822,10 @@ async def _send_resolution_alert(
 
     poly_url = f"https://polymarket.com/event/{market.external_id}"
 
-    # Show dual-unit actual high when this market has any Celsius outcomes.
-    # Use label-based fallback so we still flag dual-unit if the column hasn't
-    # been backfilled by migration 005.
     has_c_bucket = any(resolve_bucket_unit(o) == "C" for o in outcomes)
-    if has_c_bucket:
+    if actual_high_f is None:
+        actual_str = "*N/A (METAR unavailable)*"
+    elif has_c_bucket:
         actual_c = (actual_high_f - 32.0) * 5.0 / 9.0
         actual_str = f"*{actual_high_f}°F / {actual_c:.1f}°C*"
     else:
@@ -719,6 +835,7 @@ async def _send_resolution_alert(
         header,
         f"\U0001f4cd {city.name} (`{city.primary_icao}`) — {market.event_date.strftime('%b %d, %Y')}",
         f"\U0001f321️ Actual high: {actual_str}",
+        f"\U0001f4ca Resolved via: {resolution_source}",
         f"[Polymarket]({poly_url})",
         "",
     ]
@@ -792,6 +909,8 @@ async def job_check_resolutions():
             if not city:
                 continue
 
+            # Always try to fetch METAR high (needed for alert display even when
+            # resolution source is Polymarket).
             day_start = datetime(
                 market.event_date.year, market.event_date.month, market.event_date.day,
                 tzinfo=timezone.utc,
@@ -805,27 +924,59 @@ async def job_check_resolutions():
                 )
             )
             actual_high_raw = temp_result.scalar_one_or_none()
-            if actual_high_raw is None:
-                continue
-            actual_high_f = float(actual_high_raw)
-            actual_high_c = (actual_high_f - 32.0) * 5.0 / 9.0
+            actual_high_f: Optional[float] = float(actual_high_raw) if actual_high_raw is not None else None
+            actual_high_c: Optional[float] = (
+                (actual_high_f - 32.0) * 5.0 / 9.0 if actual_high_f is not None else None
+            )
 
             outcomes_result = await db.execute(
                 select(MarketOutcome).where(MarketOutcome.market_id == market.id)
             )
             outcomes = outcomes_result.scalars().all()
-            winning_outcome_ids: set = set()
-            for outcome in outcomes:
-                bn, bx = outcome.bucket_min, outcome.bucket_max
-                # Use label-based fallback so we resolve in the correct unit
-                # even when migration 005 hasn't run on this DB yet.
-                unit = resolve_bucket_unit(outcome)
-                actual_in_unit = actual_high_c if unit == "C" else actual_high_f
-                if temp_in_bucket(bn, bx, actual_in_unit):
-                    winning_outcome_ids.add(outcome.id)
+
+            # --- Resolution source: Polymarket first, METAR fallback ---
+            poly_winning, poly_resolved, poly_note = (
+                await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
+            )
+
+            winning_outcome_ids: set[int]
+            resolution_source: str
+
+            if poly_resolved:
+                winning_outcome_ids = set(poly_winning)
+                resolution_source = "Polymarket"
+                res_val = (
+                    f"{actual_high_f}°F (Polymarket)" if actual_high_f is not None
+                    else f"Polymarket: {poly_note}"
+                )
+                logger.info(
+                    f"job_check_resolutions: {market.external_id} → Polymarket: {poly_note}"
+                )
+            elif actual_high_f is not None:
+                # METAR fallback: compute bucket winner from temperature.
+                winning_outcome_ids = set()
+                for outcome in outcomes:
+                    bn, bx = outcome.bucket_min, outcome.bucket_max
+                    unit = resolve_bucket_unit(outcome)
+                    actual_in_unit = actual_high_c if unit == "C" else actual_high_f
+                    if temp_in_bucket(bn, bx, actual_in_unit):
+                        winning_outcome_ids.add(outcome.id)
+                resolution_source = "METAR"
+                res_val = f"{actual_high_f}°F"
+                logger.info(
+                    f"job_check_resolutions: {market.external_id} → METAR fallback: {actual_high_f}°F "
+                    f"(Polymarket not yet resolved)"
+                )
+            else:
+                # Neither Polymarket nor METAR available — skip for now.
+                logger.debug(
+                    f"job_check_resolutions: {market.external_id} skipped "
+                    f"(no Polymarket resolution, no METAR data)"
+                )
+                continue
 
             market.resolved = True
-            market.resolution_value = f"{actual_high_f}°F"
+            market.resolution_value = res_val
 
             opps_result = await db.execute(
                 select(Opportunity)
@@ -862,7 +1013,146 @@ async def job_check_resolutions():
             if opps:
                 try:
                     await _send_resolution_alert(
-                        city, market, actual_high_f, opps, winning_outcome_ids, db, outcomes
+                        city, market, actual_high_f, opps, winning_outcome_ids,
+                        db, outcomes, resolution_source,
                     )
                 except Exception as e:
                     logger.error(f"Failed to send resolution alert for {market.external_id}: {e}")
+
+
+async def job_retroactive_resolution_fix() -> dict:
+    """Re-resolve already-settled markets using Polymarket's authoritative data.
+
+    Iterates all markets marked resolved=True, fetches the actual winning bucket
+    from the Polymarket Gamma API, and corrects any opportunity outcomes that
+    differ. Returns a summary dict with correction counts.
+
+    This fixes the class of bugs where our METAR-computed bucket winner differs
+    from what Polymarket actually resolved (rounding differences, different
+    temperature sources, etc.).
+    """
+    today = date.today()
+    corrected = 0
+    skipped_no_poly = 0
+    skipped_no_token = 0
+    markets_checked = 0
+    corrections: list[dict] = []
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Market)
+            .where(Market.resolved == True)
+            .order_by(Market.event_date.desc())
+        )
+        markets = result.scalars().all()
+
+        logger.info(f"job_retroactive_resolution_fix: checking {len(markets)} resolved markets")
+
+        for market in markets:
+            outcomes_result = await db.execute(
+                select(MarketOutcome).where(MarketOutcome.market_id == market.id)
+            )
+            outcomes = outcomes_result.scalars().all()
+            if not outcomes:
+                continue
+
+            has_token = any(o.token_id for o in outcomes)
+            if not has_token:
+                skipped_no_token += 1
+                continue
+
+            markets_checked += 1
+            poly_winning, poly_resolved, poly_note = (
+                await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
+            )
+
+            if not poly_resolved:
+                skipped_no_poly += 1
+                logger.debug(
+                    f"retroactive_fix: {market.external_id} not yet resolved on Polymarket"
+                )
+                continue
+
+            # Fetch all opps on this market (alert_sent or not — we correct all settled ones).
+            opps_result = await db.execute(
+                select(Opportunity)
+                .join(MarketOutcome)
+                .where(
+                    MarketOutcome.market_id == market.id,
+                    Opportunity.outcome.in_(["WIN", "LOSS"]),
+                )
+            )
+            opps = opps_result.scalars().all()
+
+            market_corrected = 0
+            for opp in opps:
+                bucket_won = opp.outcome_id in poly_winning
+                if opp.side == "YES":
+                    correct_outcome = "WIN" if bucket_won else "LOSS"
+                else:
+                    correct_outcome = "WIN" if not bucket_won else "LOSS"
+
+                if opp.outcome == correct_outcome:
+                    continue
+
+                # Outcome is wrong — correct it.
+                old_outcome = opp.outcome
+                opp.outcome = correct_outcome
+
+                if opp.virtual_shares:
+                    cost = float(opp.virtual_cost or 0.0)
+                    if correct_outcome == "WIN":
+                        payout = float(opp.virtual_shares) * 1.00
+                        opp.virtual_payout = payout
+                        opp.virtual_status = "win"
+                    else:
+                        payout = 0.0
+                        opp.virtual_payout = payout
+                        opp.virtual_status = "loss"
+                    opp.virtual_pnl = payout - cost
+
+                corrected += 1
+                market_corrected += 1
+
+                # Fetch outcome label for the log.
+                oc_r = await db.execute(
+                    select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id)
+                )
+                oc = oc_r.scalar_one_or_none()
+                bucket_label = oc.bucket_label if oc else f"#{opp.outcome_id}"
+                corrections.append({
+                    "market": market.external_id,
+                    "opp_id": opp.id,
+                    "bucket": bucket_label,
+                    "side": opp.side,
+                    "was": old_outcome,
+                    "now": correct_outcome,
+                })
+                logger.info(
+                    f"retroactive_fix: corrected opp #{opp.id} market={market.external_id} "
+                    f"bucket={bucket_label!r} side={opp.side} {old_outcome} → {correct_outcome}"
+                )
+
+            if market_corrected > 0:
+                # Update market resolution_value to note Polymarket source.
+                if market.resolution_value and "(Polymarket)" not in market.resolution_value:
+                    market.resolution_value = market.resolution_value.rstrip() + " (Polymarket)"
+                elif not market.resolution_value:
+                    market.resolution_value = f"Polymarket: {poly_note}"
+                await db.commit()
+
+        if corrected == 0 and markets_checked > 0:
+            await db.commit()
+
+    result_summary = {
+        "markets_with_token": markets_checked,
+        "markets_skipped_no_poly": skipped_no_poly,
+        "markets_skipped_no_token": skipped_no_token,
+        "opportunities_corrected": corrected,
+        "corrections": corrections,
+    }
+    logger.info(
+        f"job_retroactive_resolution_fix complete: checked={markets_checked} "
+        f"corrected={corrected} no_poly={skipped_no_poly} no_token={skipped_no_token}"
+    )
+    return result_summary
