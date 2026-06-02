@@ -38,6 +38,7 @@
   button.btn:hover { background: var(--border); }
   button.btn.primary { background: var(--accent); border-color: var(--accent); color:white; }
   button.btn.danger { background: var(--loss); border-color: var(--loss); color:white; }
+  button.btn.warning { background: #e67e22; border-color: #c0392b; color:white; }
   button.btn.small { padding:3px 8px; font-size:12px; }
   button.btn:disabled { opacity: 0.5; cursor: default; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -137,6 +138,7 @@
         <button class="btn primary" onclick="loadPositions()">Apply Filter</button>
         <button class="btn" onclick="resetPosFilter()">Reset</button>
         <button class="btn primary" onclick="resolvePending(this)" title="Run resolution on past markets whose virtual positions never closed">🔄 Resolve pending</button>
+        <button class="btn warning" onclick="retroactiveFix(this)" title="Re-check all resolved markets against Polymarket's official result and correct any mis-recorded WIN/LOSS">🔁 Retroactive Poly fix</button>
         <button class="btn" onclick="exportCsv('positionsBody', 'positions')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
         <span id="resolveStatus" class="small"></span>
       </div>
@@ -712,6 +714,33 @@ async function resolvePending(btn) {
       if (j.markets_still_pending) parts.push(`${j.markets_still_pending} still pending (no METAR yet?)`);
       status.textContent = parts.join(', ') + '.';
       loadPositions();
+    } else {
+      status.textContent = 'Error: ' + (j.detail || r.status);
+    }
+  } catch (e) {
+    status.textContent = 'Error: ' + e;
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+async function retroactiveFix(btn) {
+  const status = document.getElementById('resolveStatus');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Checking Polymarket…';
+  status.textContent = '';
+  try {
+    const r = await api('/retroactive-resolution-fix', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const parts = [
+        `Checked ${j.markets_with_token ?? 0} markets`,
+        `corrected ${j.opportunities_corrected ?? 0} positions`,
+      ];
+      if (j.markets_skipped_no_poly) parts.push(`${j.markets_skipped_no_poly} not yet resolved on Poly`);
+      if (j.markets_skipped_no_token) parts.push(`${j.markets_skipped_no_token} without token IDs`);
+      status.textContent = parts.join(', ') + '.';
+      if (j.opportunities_corrected > 0) loadPositions();
     } else {
       status.textContent = 'Error: ' + (j.detail || r.status);
     }
