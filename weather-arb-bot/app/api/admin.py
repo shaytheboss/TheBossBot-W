@@ -314,6 +314,117 @@ async def admin_diag_polymarket(
         }
 
 
+@router.get("/diag/resolution")
+async def admin_diag_resolution(
+    slug: str = Query(..., description="Polymarket event slug (= market external_id)"),
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Show exactly how a market would resolve from Polymarket's own data.
+
+    For every sub-market (bucket) it prints the raw `outcomes`, `outcomePrices`,
+    `resolved`/`closed` flags, and which side we conclude won — plus how that
+    maps to our stored MarketOutcome records. Use this to verify the bot's
+    reading matches the Polymarket UI, byte-for-byte, before trusting WIN/LOSS.
+    """
+    import json as _json
+
+    async with httpx.AsyncClient(headers={"User-Agent": "weather-arb-bot/1.0"}) as client:
+        try:
+            r = await client.get(
+                f"{GAMMA_API}/events",
+                params={"slug": slug, "limit": 1},
+                timeout=20.0,
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Upstream error: {e}")
+        if r.status_code != 200:
+            raise HTTPException(502, f"Gamma returned HTTP {r.status_code}")
+        data = r.json()
+
+    event = (
+        data[0] if isinstance(data, list) and data
+        else (data if isinstance(data, dict) and data.get("slug") else None)
+    )
+    if not event:
+        return {"slug": slug, "found": False, "buckets": []}
+
+    def _decode(raw):
+        if isinstance(raw, str):
+            try:
+                v = _json.loads(raw)
+                return v if isinstance(v, list) else []
+            except (ValueError, TypeError):
+                return []
+        return list(raw) if isinstance(raw, (list, tuple)) else []
+
+    # Our stored outcomes for this market (for the mapping column).
+    market = (await db.execute(
+        select(Market).where(Market.external_id == slug)
+    )).scalar_one_or_none()
+    db_outcomes = []
+    if market:
+        db_outcomes = (await db.execute(
+            select(MarketOutcome).where(MarketOutcome.market_id == market.id)
+        )).scalars().all()
+    token_to_label = {o.token_id: o.bucket_label for o in db_outcomes if o.token_id}
+    label_set = {o.bucket_label.strip().lower() for o in db_outcomes}
+
+    buckets = []
+    for m in event.get("markets") or []:
+        outcomes_arr = _decode(m.get("outcomes"))
+        prices_arr = _decode(m.get("outcomePrices"))
+        tokens_arr = _decode(m.get("clobTokenIds"))
+        yes_idx = next(
+            (i for i, l in enumerate(outcomes_arr) if str(l).strip().lower() == "yes"),
+            0,
+        )
+        yes_price = None
+        if yes_idx < len(prices_arr):
+            try:
+                yes_price = float(prices_arr[yes_idx])
+            except (ValueError, TypeError):
+                yes_price = None
+        yes_token = str(tokens_arr[yes_idx]) if yes_idx < len(tokens_arr) else None
+        label = (m.get("groupItemTitle") or m.get("question") or "?").strip()
+        buckets.append({
+            "bucket": label,
+            "resolved": m.get("resolved"),
+            "closed": m.get("closed"),
+            "outcomes": outcomes_arr,
+            "outcomePrices": prices_arr,
+            "yes_index": yes_idx,
+            "yes_price": yes_price,
+            "yes_won": (yes_price is not None and yes_price >= 0.99),
+            "yes_token": yes_token,
+            "matches_db_token": (yes_token in token_to_label) if yes_token else False,
+            "matches_db_label": label.lower() in label_set,
+        })
+
+    # Run the real resolver so the diagnostic matches production exactly.
+    from app.workers.jobs import _fetch_polymarket_winning_outcomes
+    winning_ids, poly_resolved, note = (
+        await _fetch_polymarket_winning_outcomes(slug, db_outcomes)
+        if db_outcomes else (frozenset(), False, "no DB outcomes")
+    )
+    winners = [
+        {"outcome_id": o.id, "bucket": o.bucket_label, "side_that_wins": "YES"}
+        for o in db_outcomes if o.id in winning_ids
+    ]
+
+    return {
+        "slug": slug,
+        "found": True,
+        "title": event.get("title"),
+        "poly_resolved": poly_resolved,
+        "resolver_note": note,
+        "winning_outcome_ids": list(winning_ids),
+        "winners": winners,
+        "buckets": buckets,
+        "db_outcome_count": len(db_outcomes),
+    }
+
+
 @router.get("/diag/last-discovery")
 async def admin_diag_last_discovery(_: str = Depends(require_admin)):
     from app.workers.jobs import LAST_DISCOVERY
