@@ -17,6 +17,11 @@ class City(Base):
     timezone = Column(String(50), nullable=False)
     buoy_id = Column(String(10))
     active = Column(Boolean, default=True)
+    # Blacklisted cities still generate Telegram alerts (so we keep tracking the
+    # opportunity and learning from it), but never open a virtual-buy position —
+    # no simulated money is committed regardless of how high the confidence is.
+    # Use for cities whose markets we don't trust enough to bet on yet.
+    blacklisted = Column(Boolean, default=False, nullable=False, server_default="false")
     polymarket_slug = Column(String(60))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 

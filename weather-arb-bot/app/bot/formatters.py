@@ -670,6 +670,7 @@ def fmt_opportunity(
     virtual_section = ""
     create_buy = signals.get("_create_virtual_buy")
     buy_thresh = signals.get("_buy_threshold")
+    is_blacklisted = signals.get("_city_blacklisted", False)
     SHARES = 5
     if entry_cost is not None and create_buy:
         entry_cents_v = round(float(entry_cost) * 100)
@@ -679,6 +680,20 @@ def fmt_opportunity(
             f"\n\n\U0001f6d2 *Virtual buy*: {SHARES} shares × {entry_cents_v}¢ "
             f"= ${cost_v:.2f} cost\n"
             f"   If WIN: +${if_win_pnl:.2f} P&L  |  If LOSS: -${cost_v:.2f} P&L"
+        )
+    elif is_blacklisted:
+        # City is blacklisted: even if confidence cleared the buy threshold, no
+        # money is committed. Make the reason explicit so it isn't mistaken for
+        # a low-confidence skip.
+        cleared = buy_thresh is not None and confidence >= round(float(buy_thresh) * 100)
+        conf_note = (
+            f"confidence {confidence}% would normally buy, but "
+            if cleared else f"confidence {confidence}% — "
+        )
+        virtual_section = (
+            f"\n\n\U0001f6ab *No virtual buy* — *{city_name} is blacklisted*. "
+            f"({conf_note}blacklisted cities are alerted for tracking but never "
+            f"funded.)"
         )
     elif create_buy is False and buy_thresh is not None:
         virtual_section = (

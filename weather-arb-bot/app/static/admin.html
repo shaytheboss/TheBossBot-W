@@ -251,6 +251,7 @@
           <th>Lat</th>
           <th>Lon</th>
           <th>Active</th>
+          <th title="Blacklisted cities still alert but never open a virtual buy">Blacklist</th>
           <th></th>
         </tr></thead>
         <tbody id="citiesBody"></tbody>
@@ -824,6 +825,7 @@ async function loadCities() {
       <td><input style="width:82px;" type="number" step="0.0001" value="${c.nws_lat != null ? c.nws_lat.toFixed(4) : ''}" id="city-lat-${c.id}"/></td>
       <td><input style="width:88px;" type="number" step="0.0001" value="${c.nws_lon != null ? c.nws_lon.toFixed(4) : ''}" id="city-lon-${c.id}"/></td>
       <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
+      <td title="When checked: still alerts, but never opens a virtual buy"><input type="checkbox" ${c.blacklisted ? 'checked' : ''} id="city-blacklist-${c.id}"/></td>
       <td>
         <button class="btn primary" onclick="saveCity(${c.id})">Save</button>
         <button class="btn danger" onclick="deleteCity(${c.id}, ${JSON.stringify(c.name || '').replace(/'/g,"\\'")})">מחק</button>
@@ -843,6 +845,7 @@ async function saveCity(id) {
     nws_lat: latVal !== '' ? parseFloat(latVal) : null,
     nws_lon: lonVal !== '' ? parseFloat(lonVal) : null,
     active: document.getElementById('city-active-'+id).checked,
+    blacklisted: document.getElementById('city-blacklist-'+id).checked,
   };
   const r = await api('/cities/'+id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { loadCities(); } else { alert('Save failed'); }

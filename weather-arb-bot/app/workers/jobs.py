@@ -27,7 +27,7 @@ from app.collectors.pirep_collector import PirepCollector
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.analyzers.opportunity_detector import detect_opportunities
 from app.bot.telegram_bot import send_opportunity_alert
-from app.utils.units import resolve_bucket_unit
+from app.utils.units import resolve_bucket_unit, temp_in_bucket
 from app.utils.polymarket_discovery import (
     build_all_candidates,
     extract_event_slug,
@@ -821,15 +821,8 @@ async def job_check_resolutions():
                 # even when migration 005 hasn't run on this DB yet.
                 unit = resolve_bucket_unit(outcome)
                 actual_in_unit = actual_high_c if unit == "C" else actual_high_f
-                if bn is not None and bx is not None:
-                    if bn <= actual_in_unit < bx + 1:
-                        winning_outcome_ids.add(outcome.id)
-                elif bn is not None and bx is None:
-                    if actual_in_unit >= bn:
-                        winning_outcome_ids.add(outcome.id)
-                elif bn is None and bx is not None:
-                    if actual_in_unit <= bx:
-                        winning_outcome_ids.add(outcome.id)
+                if temp_in_bucket(bn, bx, actual_in_unit):
+                    winning_outcome_ids.add(outcome.id)
 
             market.resolved = True
             market.resolution_value = f"{actual_high_f}°F"
