@@ -267,21 +267,26 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
 
 @router.post("/retroactive-resolution-fix")
 async def admin_retroactive_resolution_fix(_: str = Depends(require_admin)):
-    """Re-resolve already-settled markets using Polymarket's authoritative data.
+    """Start the retroactive resolution fix as a background task.
 
-    Queries Polymarket's Gamma API for each resolved market to find which bucket
-    actually won, then corrects any opportunity outcomes (WIN/LOSS) that were
-    recorded incorrectly based on METAR temperature rounding differences.
-
-    Safe to run multiple times — only changes records that differ from Polymarket.
+    Returns immediately with status="started". Poll
+    GET /retroactive-resolution-fix/status for live progress.
     """
-    from app.workers.jobs import job_retroactive_resolution_fix
-    try:
-        summary = await job_retroactive_resolution_fix()
-        return {"ok": True, **summary}
-    except Exception as e:
-        logger.error(f"Admin retroactive-resolution-fix failed: {e}", exc_info=True)
-        raise HTTPException(500, f"Retroactive fix failed: {e}")
+    import asyncio
+    from app.workers.jobs import LAST_RETRO_FIX, job_retroactive_resolution_fix
+
+    if LAST_RETRO_FIX.get("status") == "running":
+        return {"ok": False, "already_running": True, **LAST_RETRO_FIX}
+
+    asyncio.create_task(job_retroactive_resolution_fix())
+    return {"ok": True, "started": True}
+
+
+@router.get("/retroactive-resolution-fix/status")
+async def admin_retro_fix_status(_: str = Depends(require_admin)):
+    """Poll the current state of the retroactive resolution fix."""
+    from app.workers.jobs import LAST_RETRO_FIX
+    return LAST_RETRO_FIX
 
 
 @router.get("/diag/polymarket")
