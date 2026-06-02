@@ -251,7 +251,11 @@ async def _evaluate_opportunity(
         )
         return None
 
-    create_virtual_buy = certainty >= buy_thresh
+    # Blacklisted cities still alert (so we keep tracking and learning) but never
+    # commit a virtual-buy position, no matter how high the confidence. The alert
+    # explains that the city's blacklist status — not the model — blocked the buy.
+    is_blacklisted = bool(getattr(city, "blacklisted", False))
+    create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted
 
     if await _has_opportunity_today(db, outcome.id, side):
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} today")
@@ -267,6 +271,7 @@ async def _evaluate_opportunity(
     signals["_alert_threshold"] = float(alert_thresh)
     signals["_buy_threshold"] = float(buy_thresh)
     signals["_create_virtual_buy"] = bool(create_virtual_buy)
+    signals["_city_blacklisted"] = is_blacklisted
     signals["_why_now"] = why_now
 
     opp = Opportunity(

@@ -51,6 +51,45 @@ def f_to_c(fahrenheit: Optional[float]) -> Optional[int]:
     return round((fahrenheit - 32) * 5 / 9)
 
 
+# Temperatures resolve Polymarket buckets, so the in/out-of-bucket decision must
+# be exact. The actual high is stored in °F and converted to °C for °C markets;
+# that conversion introduces binary floating-point dust. For example a true
+# 22.0°C high (71.6°F) converts back to 21.999999999999996°C, which is *just*
+# below the 22°C bucket floor — so the comparison `22 <= 21.9999996` fails and a
+# bucket that genuinely contained the actual temperature is judged a loss. That
+# flips the YES/NO outcome and gets written to the DB (e.g. "22°C NO → WIN" when
+# the high was exactly 22°C). We round to kill the float dust without disturbing
+# any real fractional temperature (4 decimals = 0.0001°C, far finer than any
+# real measurement resolution).
+_BUCKET_RESOLVE_PRECISION = 4
+
+
+def temp_in_bucket(
+    bucket_min: Optional[float],
+    bucket_max: Optional[float],
+    actual_in_unit: float,
+) -> bool:
+    """True iff the actual temperature falls inside the (YES) bucket.
+
+    `bucket_min`/`bucket_max` are inclusive integer bounds in the bucket's native
+    unit. A bounded bucket [bmin, bmax] covers the half-open interval
+    [bmin, bmax+1) — e.g. the "22°C" bucket covers [22, 23). Open-ended buckets
+    use a single bound ("22°C or higher" → bmin only; "22°C or lower" → bmax only).
+
+    `actual_in_unit` must already be expressed in the bucket's native unit. It is
+    rounded to remove float-conversion dust before comparison (see note above).
+    """
+    actual = round(actual_in_unit, _BUCKET_RESOLVE_PRECISION)
+    if bucket_min is not None and bucket_max is not None:
+        return bucket_min <= actual < bucket_max + 1
+    if bucket_min is not None:
+        return actual >= bucket_min
+    if bucket_max is not None:
+        return actual <= bucket_max
+    return False
+
+
+
 def fmt_temp_dual(temp_f: Optional[float], show_celsius: bool) -> str:
     """Render a temperature in °F, with °C appended when show_celsius is True."""
     if temp_f is None:

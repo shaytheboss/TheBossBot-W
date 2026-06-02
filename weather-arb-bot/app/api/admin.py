@@ -21,7 +21,7 @@ from app.utils.log_buffer import recent_logs
 from app.utils.polymarket_discovery import (
     GAMMA_API, build_all_candidates, fetch_event_by_slug, fetch_events_by_tag,
 )
-from app.utils.units import resolve_bucket_unit
+from app.utils.units import resolve_bucket_unit, temp_in_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -128,16 +128,9 @@ async def admin_discover(_: str = Depends(require_admin)):
     return {"ok": True, **stats}
 
 
-def _bucket_won(
-    bucket_min: Optional[int], bucket_max: Optional[int], actual_in_unit: float
-) -> bool:
-    if bucket_min is not None and bucket_max is not None:
-        return bucket_min <= actual_in_unit < bucket_max + 1
-    if bucket_min is not None:
-        return actual_in_unit >= bucket_min
-    if bucket_max is not None:
-        return actual_in_unit <= bucket_max
-    return False
+# Resolution uses the shared temp_in_bucket() helper (app/utils/units.py) so the
+# admin force-resolve path and the scheduled job_check_resolutions path apply
+# identical, float-dust-safe bucket math.
 
 
 @router.post("/resolve-pending")
@@ -214,7 +207,7 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
             unit = resolve_bucket_unit(oc)
             actual_in_unit = actual_c if unit == "C" else actual_f
 
-            won = _bucket_won(oc.bucket_min, oc.bucket_max, actual_in_unit)
+            won = temp_in_bucket(oc.bucket_min, oc.bucket_max, actual_in_unit)
             if opp.side == "YES":
                 opp.outcome = "WIN" if won else "LOSS"
             else:
@@ -800,6 +793,7 @@ async def admin_cities(_: str = Depends(require_admin), db: AsyncSession = Depen
             "nws_lat": float(c.nws_lat) if c.nws_lat else None,
             "nws_lon": float(c.nws_lon) if c.nws_lon else None,
             "active": c.active,
+            "blacklisted": bool(getattr(c, "blacklisted", False)),
         }
         for c in rows
     ]
@@ -863,6 +857,8 @@ async def admin_city_update(
             setattr(city, k, val)
     if "active" in payload:
         city.active = bool(payload["active"])
+    if "blacklisted" in payload:
+        city.blacklisted = bool(payload["blacklisted"])
     for k in ("nws_lat", "nws_lon"):
         if k in payload and payload[k] is not None:
             setattr(city, k, float(payload[k]))
