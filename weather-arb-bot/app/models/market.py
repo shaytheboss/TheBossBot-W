@@ -39,6 +39,11 @@ class MarketOutcome(Base):
     # holds: range covered is [bucket_min, bucket_max + 1).
     bucket_unit = Column(String(1), nullable=False, default="F")
     token_id = Column(String(100))
+    # Set when the parent market resolves on Polymarket: True for the winning
+    # bucket, False for losing buckets, NULL while the market is unresolved.
+    # This is the authoritative "which bucket won" record (Polymarket-sourced)
+    # and powers per-model accuracy scoring in the dashboard.
+    won = Column(Boolean, nullable=True, default=None)
 
     market = relationship("Market", back_populates="outcomes")
     prices = relationship("MarketPrice", back_populates="outcome")

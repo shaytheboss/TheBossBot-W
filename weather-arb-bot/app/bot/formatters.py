@@ -1071,9 +1071,21 @@ def fmt_opportunity(
         f"(directional confidence = max(P(YES), P(NO)) of our blend)"
     )
 
+    # Headline: when a virtual buy is actually opened, make that unmistakable at
+    # the very top and add a #BUY hashtag so these messages are trivially
+    # searchable in Telegram (tap the tag or search "#BUY"). Non-buy alerts keep
+    # the original opportunity headline.
+    if create_buy:
+        headline = (
+            f"\U0001f6d2 *BUY — {side} {bucket_label}* "
+            f"({city_name}, {date_str})\n#BUY"
+        )
+    else:
+        headline = "\U0001f3af *HIGH CONFIDENCE OPPORTUNITY*"
+
     return (
         f"{update_section}"
-        f"\U0001f3af *HIGH CONFIDENCE OPPORTUNITY*\n\n"
+        f"{headline}\n\n"
         f"{loc_line}\n"
         f"\U0001f4ca Market: {market_question}\n"
         f"\U0001f3e2 Bucket: {bucket_display} (*{side}*)\n\n"

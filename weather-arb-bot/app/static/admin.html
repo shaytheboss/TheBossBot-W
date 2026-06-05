@@ -130,6 +130,9 @@
       <div class="grid" id="statsOpps"></div>
       <h3 style="margin-top:24px;">Virtual Positions (P&amp;L)</h3>
       <div class="grid" id="statsPositions"></div>
+      <h3 style="margin-top:24px;">Model accuracy</h3>
+      <p class="small">Each weather model's point forecast scored against the bucket Polymarket settled, over resolved markets in the current filter. Helps spot which model performs best — and where (per-city), so models could later be weighted per city.</p>
+      <div id="statsModels"></div>
       <h3 style="margin-top:24px;">Inventory</h3>
       <div class="grid" id="statsInv"></div>
     </section>
@@ -182,6 +185,7 @@
           <th data-sort-key="payout" data-sort-type="num">Payout</th>
           <th data-sort-key="pnl" data-sort-type="num">P&amp;L</th>
           <th data-sort-key="status" data-sort-type="str">Status</th>
+          <th>Models</th>
           <th>Link</th>
           <th>Details</th>
         </tr></thead>
@@ -247,6 +251,7 @@
           <th data-sort-key="confidence" data-sort-type="num">Conf</th>
           <th data-sort-key="alert_sent" data-sort-type="num">Alert</th>
           <th data-sort-key="outcome" data-sort-type="str">Outcome</th>
+          <th>Models</th>
           <th>Link</th>
           <th>Details</th>
         </tr></thead>
@@ -350,6 +355,17 @@
         <button class="btn small" onclick="closeAlertModal()">Close</button>
       </div>
       <div class="modal-body" id="alertModalBody">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Per-model forecast modal -->
+  <div id="modelsModal" class="modal-backdrop hidden" onclick="closeModelsModal(event)">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-head">
+        <h3 id="modelsModalTitle">Model forecasts</h3>
+        <button class="btn small" onclick="closeModelsModal()">Close</button>
+      </div>
+      <div class="modal-body" id="modelsModalBody">Loading…</div>
     </div>
   </div>
 </div>
@@ -578,6 +594,38 @@ async function loadStats() {
   document.getElementById('statsInv').innerHTML =
     card('Cities', i.cities) + card('Markets', i.markets) + card('Outcomes', i.outcomes) +
     card('Outcomes w/ token', i.outcomes_with_token) + card('Telegram users', i.telegram_users);
+  loadModelAccuracy();
+}
+
+async function loadModelAccuracy() {
+  const box = document.getElementById('statsModels');
+  if (!box) return;
+  const r = await api('/model-accuracy?' + _statsParams());
+  if (!r.ok) { box.innerHTML = '<p class="small">Could not load model accuracy.</p>'; return; }
+  const j = await r.json();
+  const overall = j.overall || [];
+  if (!overall.length) {
+    box.innerHTML = '<p class="small">No resolved markets with model forecasts in this range yet.</p>';
+    return;
+  }
+  const pctCell = p => (p == null ? '—' : p + '%');
+  let html = '<table><thead><tr><th>Model</th><th>Correct</th><th>Total</th><th>Accuracy</th></tr></thead><tbody>';
+  html += overall.map(m =>
+    `<tr><td>${escapeHtml(m.model)}</td><td>${m.correct}</td><td>${m.total}</td><td>${pctCell(m.pct)}</td></tr>`
+  ).join('');
+  html += '</tbody></table>';
+  const byCity = j.by_city || [];
+  if (byCity.length) {
+    html += '<h4 style="margin-top:16px;">Best model per city</h4>';
+    html += '<table><thead><tr><th>City</th><th>Best model</th><th>Accuracy</th><th>Samples</th></tr></thead><tbody>';
+    html += byCity.map(c => {
+      const b = c.best_model;
+      return `<tr><td>${escapeHtml(c.city)}</td><td>${b ? escapeHtml(b.model) : '—'}</td>` +
+        `<td>${b ? pctCell(b.pct) : '—'}</td><td>${b ? b.total : 0}</td></tr>`;
+    }).join('');
+    html += '</tbody></table>';
+  }
+  box.innerHTML = html;
 }
 
 function resetPosFilter() {
@@ -610,6 +658,7 @@ function _renderPositions(rows) {
       <td>${fmtMoney(o.payout)}</td>
       <td style="color:${(o.pnl||0) >= 0 ? 'var(--win)' : 'var(--loss)'}">${fmtMoney(o.pnl)}</td>
       <td>${escapeHtml(o.status || '')}</td>
+      <td>${_modelsCell(o)}</td>
       <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
       <td><button class="btn small" onclick="viewAlert(${o.id})">View</button></td>
     </tr>
@@ -769,7 +818,7 @@ async function resolvePending(btn) {
         `Resolved ${j.markets_resolved ?? 0} markets`,
         `settled ${j.positions_settled ?? 0} positions`,
       ];
-      if (j.markets_still_pending) parts.push(`${j.markets_still_pending} still pending (no METAR yet?)`);
+      if (j.markets_still_pending) parts.push(`${j.markets_still_pending} still pending (not settled on Polymarket yet)`);
       status.textContent = parts.join(', ') + '.';
       loadPositions();
     } else {
@@ -922,6 +971,7 @@ function _renderOpps(rows) {
       <td>${o.confidence}</td>
       <td>${o.alert_sent ? '✓' : ''}</td>
       <td>${pill(o.outcome)}</td>
+      <td>${_modelsCell(o)}</td>
       <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
       <td><button class="btn small" onclick="viewAlert(${o.id})">View</button></td>
     </tr>
@@ -1001,6 +1051,66 @@ function closeAlertModal(event) {
     // but stopPropagation on .modal-box means we only reach here from backdrop
   }
   document.getElementById('alertModal').classList.add('hidden');
+}
+
+// --- Per-model forecast modal ------------------------------------------------
+
+// Compact "Models" cell: a button plus an N/total✓ correctness badge once the
+// market has resolved. Both the Positions and Opportunities rows carry the same
+// `model_forecasts` map keyed by source label → {f, correct}.
+function _modelsCell(o) {
+  const mf = o.model_forecasts || {};
+  const labels = Object.keys(mf);
+  if (!labels.length) return '<span class="small">—</span>';
+  const scored = labels.filter(k => mf[k].correct !== null);
+  let badge = '';
+  if (scored.length) {
+    const nCorrect = scored.filter(k => mf[k].correct).length;
+    badge = ` <span class="small">${nCorrect}/${scored.length}✓</span>`;
+  }
+  return `<button class="btn small" onclick="viewModels(${o.id})">Models</button>${badge}`;
+}
+
+function _findRowById(id) {
+  for (const tb of ['oppsBody', 'positionsBody']) {
+    const rows = _tableCache[tb];
+    if (rows) { const r = rows.find(x => x.id === id); if (r) return r; }
+  }
+  return null;
+}
+
+function viewModels(id) {
+  const o = _findRowById(id);
+  const modal = document.getElementById('modelsModal');
+  const body = document.getElementById('modelsModalBody');
+  const title = document.getElementById('modelsModalTitle');
+  title.textContent = 'Model forecasts' + (o ? ` — ${o.city || ''} ${o.bucket || ''}`.trimEnd() : ` #${id}`);
+  const mf = (o && o.model_forecasts) || {};
+  const labels = Object.keys(mf);
+  if (!labels.length) {
+    body.innerHTML = '<p>No model forecasts were captured for this opportunity.</p>';
+  } else {
+    const resolved = labels.some(k => mf[k].correct !== null);
+    const rowsHtml = labels.map(k => {
+      const m = mf[k];
+      let mark = '<span class="small">—</span>';
+      if (m.correct === true) mark = '<span style="color:var(--win)">✓ correct</span>';
+      else if (m.correct === false) mark = '<span style="color:var(--loss)">✗ wrong</span>';
+      return `<tr><td>${escapeHtml(k)}</td><td>${m.f}°F</td><td>${mark}</td></tr>`;
+    }).join('');
+    body.innerHTML =
+      `<p class="small">Each model's predicted daily high, captured when the opportunity was detected` +
+      (resolved
+        ? ', scored against the bucket Polymarket settled.'
+        : ' (market not resolved yet).') +
+      `</p><table><thead><tr><th>Model</th><th>Forecast high</th><th>Result</th></tr></thead>` +
+      `<tbody>${rowsHtml}</tbody></table>`;
+  }
+  modal.classList.remove('hidden');
+}
+
+function closeModelsModal() {
+  document.getElementById('modelsModal').classList.add('hidden');
 }
 
 async function loadCities() {
