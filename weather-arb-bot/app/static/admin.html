@@ -112,6 +112,12 @@
   <main>
     <section id="tab-stats">
       <div class="toolbar">
+        <label class="row small">Date by
+          <select id="statsDateField">
+            <option value="detected">Detected date</option>
+            <option value="event">Event date</option>
+          </select>
+        </label>
         <label class="row small">From <input type="date" id="statsFrom" /></label>
         <label class="row small">To <input type="date" id="statsTo" /></label>
         <label class="row small">City
@@ -130,6 +136,12 @@
 
     <section id="tab-positions" class="hidden">
       <div class="toolbar">
+        <label class="row small">Date by
+          <select id="posDateField">
+            <option value="detected">Detected date</option>
+            <option value="event">Event date</option>
+          </select>
+        </label>
         <label class="row small">From <input type="date" id="posFrom" /></label>
         <label class="row small">To <input type="date" id="posTo" /></label>
         <label class="row small">City
@@ -194,6 +206,12 @@
 
     <section id="tab-opps" class="hidden">
       <div class="toolbar">
+        <label class="row small">Date by
+          <select id="oppDateField">
+            <option value="detected">Detected date</option>
+            <option value="event">Event date</option>
+          </select>
+        </label>
         <label class="row small">From <input type="date" id="oppFrom" /></label>
         <label class="row small">To <input type="date" id="oppTo" /></label>
         <label class="row small">City
@@ -512,9 +530,11 @@ function _statsParams() {
   const f = document.getElementById('statsFrom').value;
   const t = document.getElementById('statsTo').value;
   const c = document.getElementById('statsCity').value;
+  const df = document.getElementById('statsDateField').value;
   if (f) p.set('from_date', f);
   if (t) p.set('to_date', t);
   if (c) p.set('city_id', c);
+  if (df) p.set('date_field', df);
   return p;
 }
 
@@ -522,6 +542,7 @@ function resetStatsFilter() {
   document.getElementById('statsFrom').value = '';
   document.getElementById('statsTo').value = '';
   document.getElementById('statsCity').value = '';
+  document.getElementById('statsDateField').value = 'detected';
   loadStats();
 }
 
@@ -537,12 +558,18 @@ async function loadStats() {
     card('Wins', o.wins) + card('Losses', o.losses) + card('Win rate', o.win_rate_pct + '%');
   const p = s.positions || {};
   const fmt = v => (v == null ? '—' : (v >= 0 ? '$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)));
+  // Return on closed capital: net P&L over money actually invested in settled
+  // trades. Lets us read yield directly (e.g. +$12 on $100 cost = +12%).
+  const roi = (p.total_cost && p.total_cost > 0)
+    ? ((p.net_pnl || 0) / p.total_cost * 100).toFixed(1) + '%'
+    : '—';
   document.getElementById('statsPositions').innerHTML =
     card('Opened', p.opened || 0) +
-    card('Cost (closed)', '$' + (p.total_cost || 0).toFixed(2)) +
+    card('Invested (closed)', '$' + (p.total_cost || 0).toFixed(2)) +
     card('At risk (open)', '$' + (p.open_cost || 0).toFixed(2)) +
     card('Total payout', '$' + (p.total_payout || 0).toFixed(2)) +
     card('Net P&L (closed)', fmt(p.net_pnl)) +
+    card('ROI (closed)', roi) +
     card('Win rate', (p.win_rate_pct || 0) + '%') +
     card('Avg cost', '$' + (p.avg_cost || 0).toFixed(2)) +
     card('Best position', fmt(p.best_pnl)) +
@@ -560,6 +587,7 @@ function resetPosFilter() {
   document.getElementById('posSide').value = '';
   document.getElementById('posStatus').value = '';
   document.getElementById('posMinConf').value = '';
+  document.getElementById('posDateField').value = 'detected';
   _clientFilters['positionsBody'] = null;
   loadPositions();
 }
@@ -595,9 +623,11 @@ async function loadPositions() {
   const f = document.getElementById('posFrom').value;
   const t = document.getElementById('posTo').value;
   const c = document.getElementById('posCity').value;
+  const df = document.getElementById('posDateField').value;
   if (f) p.set('from_date', f);
   if (t) p.set('to_date', t);
   if (c) p.set('city_id', c);
+  if (df) p.set('date_field', df);
   const r = await api('/positions?' + p); if (!r.ok) return;
   const rows = await r.json();
   // Side-aware probability so the displayed P matches the chosen side (YES/NO),
@@ -905,6 +935,7 @@ function resetOppFilter() {
   document.getElementById('oppSide').value = '';
   document.getElementById('oppMinConf').value = '';
   document.getElementById('oppMinEdge').value = '';
+  document.getElementById('oppDateField').value = 'detected';
   _clientFilters['oppsBody'] = null;
   loadOpps();
 }
@@ -919,9 +950,14 @@ async function loadOpps() {
   const f = document.getElementById('oppFrom').value;
   const t = document.getElementById('oppTo').value;
   const c = document.getElementById('oppCity').value;
+  const df = document.getElementById('oppDateField').value;
   if (f) params.set('from_date', f);
   if (t) params.set('to_date', t);
   if (c) params.set('city_id', c);
+  if (df) params.set('date_field', df);
+  // Pull a wider window so the table isn't capped to just the most recent ~3
+  // days of detections (the server orders by detected_at desc).
+  params.set('limit', '500');
   const r = await api('/opportunities?' + params); if (!r.ok) return;
   const rows = await r.json();
   // Precompute side-aware display values so column sorting matches what the user sees.

@@ -462,24 +462,37 @@ def _parse_iso_date(s: Optional[str], name: str) -> Optional[datetime]:
 async def admin_stats(
     _: str = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    from_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD; filter by detected_at"),
-    to_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD; exclusive upper"),
+    from_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD"),
+    to_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD; inclusive"),
     city_id: Optional[int] = Query(default=None),
+    date_field: str = Query(default="detected", description="'detected' or 'event'"),
 ):
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
     to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+    by_event = date_field == "event"
+    from_ev = from_dt.date() if (from_dt and by_event) else None
+    to_ev = to_dt_inc.date() if (to_dt_inc and by_event) else None
 
     def opp_q(base):
         q = base
-        if from_dt is not None:
-            q = q.where(Opportunity.detected_at >= from_dt)
-        if to_dt is not None:
-            q = q.where(Opportunity.detected_at < to_dt)
-        if city_id is not None:
+        # Filtering by event_date (or city) needs the Market join. The join is
+        # 1:1 (outcome→market) so it never inflates counts/sums.
+        if by_event or city_id is not None:
             q = q.join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id) \
-                 .join(Market, Market.id == MarketOutcome.market_id) \
-                 .where(Market.city_id == city_id)
+                 .join(Market, Market.id == MarketOutcome.market_id)
+        if by_event:
+            if from_ev is not None:
+                q = q.where(Market.event_date >= from_ev)
+            if to_ev is not None:
+                q = q.where(Market.event_date <= to_ev)
+        else:
+            if from_dt is not None:
+                q = q.where(Opportunity.detected_at >= from_dt)
+            if to_dt is not None:
+                q = q.where(Opportunity.detected_at < to_dt)
+        if city_id is not None:
+            q = q.where(Market.city_id == city_id)
         return q
 
     total_opps = (await db.execute(opp_q(select(func.count(Opportunity.id))))).scalar() or 0
@@ -597,11 +610,13 @@ async def admin_positions(
     from_date: Optional[str] = Query(default=None),
     to_date: Optional[str] = Query(default=None),
     city_id: Optional[int] = Query(default=None),
+    date_field: str = Query(default="detected", description="'detected' or 'event'"),
     limit: int = Query(default=200, le=1000),
 ):
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
     to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+    by_event = date_field == "event"
 
     q = (
         select(Opportunity, MarketOutcome, Market, City)
@@ -612,10 +627,16 @@ async def admin_positions(
         .order_by(desc(Opportunity.detected_at))
         .limit(limit)
     )
-    if from_dt is not None:
-        q = q.where(Opportunity.detected_at >= from_dt)
-    if to_dt is not None:
-        q = q.where(Opportunity.detected_at < to_dt)
+    if by_event:
+        if from_dt is not None:
+            q = q.where(Market.event_date >= from_dt.date())
+        if to_dt_inc is not None:
+            q = q.where(Market.event_date <= to_dt_inc.date())
+    else:
+        if from_dt is not None:
+            q = q.where(Opportunity.detected_at >= from_dt)
+        if to_dt is not None:
+            q = q.where(Opportunity.detected_at < to_dt)
     if city_id is not None:
         q = q.where(Market.city_id == city_id)
 
@@ -814,32 +835,40 @@ async def admin_opportunities(
     from_date: Optional[str] = Query(default=None),
     to_date: Optional[str] = Query(default=None),
     city_id: Optional[int] = Query(default=None),
+    date_field: str = Query(default="detected", description="'detected' or 'event'"),
 ):
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
     to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+    by_event = date_field == "event"
 
-    # Join through to Market only when a city filter is requested, so the
-    # default (unfiltered) query stays as cheap as before.
-    if city_id is not None:
+    # Join through to Market when a city filter or event-date filter is needed.
+    if city_id is not None or by_event:
         q = (
             select(Opportunity)
             .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
             .join(Market, Market.id == MarketOutcome.market_id)
-            .where(Market.city_id == city_id)
             .order_by(desc(Opportunity.detected_at))
             .limit(limit)
         )
+        if city_id is not None:
+            q = q.where(Market.city_id == city_id)
     else:
         q = select(Opportunity).order_by(desc(Opportunity.detected_at)).limit(limit)
     if only_alerted:
         q = q.where(Opportunity.alert_sent == True)
     if outcome:
         q = q.where(Opportunity.outcome == outcome.upper())
-    if from_dt is not None:
-        q = q.where(Opportunity.detected_at >= from_dt)
-    if to_dt is not None:
-        q = q.where(Opportunity.detected_at < to_dt)
+    if by_event:
+        if from_dt is not None:
+            q = q.where(Market.event_date >= from_dt.date())
+        if to_dt_inc is not None:
+            q = q.where(Market.event_date <= to_dt_inc.date())
+    else:
+        if from_dt is not None:
+            q = q.where(Opportunity.detected_at >= from_dt)
+        if to_dt is not None:
+            q = q.where(Opportunity.detected_at < to_dt)
     rows = (await db.execute(q)).scalars().all()
 
     out = []

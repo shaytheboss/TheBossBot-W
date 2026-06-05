@@ -922,18 +922,39 @@ async def _send_resolution_alert(
     poly_url = f"https://polymarket.com/event/{market.external_id}"
 
     has_c_bucket = any(resolve_bucket_unit(o) == "C" for o in outcomes)
-    if actual_high_f is None:
-        actual_str = "*N/A (METAR unavailable)*"
-    elif has_c_bucket:
-        actual_c = (actual_high_f - 32.0) * 5.0 / 9.0
-        actual_str = f"*{actual_high_f}°F / {actual_c:.1f}°C*"
+
+    def _metar_str() -> Optional[str]:
+        if actual_high_f is None:
+            return None
+        if has_c_bucket:
+            actual_c = (actual_high_f - 32.0) * 5.0 / 9.0
+            return f"{actual_high_f}°F / {actual_c:.1f}°C"
+        return f"{actual_high_f}°F"
+
+    # When Polymarket is the authoritative source, the WIN/LOSS rows reflect the
+    # bucket Polymarket actually settled. The METAR high can disagree (different
+    # station, rounding, time window) so showing it as "Actual high" previously
+    # contradicted the rows — e.g. METAR 86°F displayed while the 84-85°F bucket
+    # was the real winner. Show the winning bucket as the result and demote the
+    # METAR reading to a clearly-labelled reference line.
+    winning_labels = [
+        o.bucket_label for o in outcomes if o.id in winning_outcome_ids
+    ]
+    result_lines: list[str]
+    if resolution_source == "Polymarket" and winning_labels:
+        result_lines = [f"\U0001f3c6 Winning bucket: *{', '.join(winning_labels)}*"]
+        metar = _metar_str()
+        if metar is not None:
+            result_lines.append(f"\U0001f321️ METAR high (reference only): {metar}")
     else:
-        actual_str = f"*{actual_high_f}°F*"
+        metar = _metar_str()
+        actual_str = f"*{metar}*" if metar is not None else "*N/A (METAR unavailable)*"
+        result_lines = [f"\U0001f321️ Actual high: {actual_str}"]
 
     lines = [
         header,
         f"\U0001f4cd {city.name} (`{city.primary_icao}`) — {market.event_date.strftime('%b %d, %Y')}",
-        f"\U0001f321️ Actual high: {actual_str}",
+        *result_lines,
         f"\U0001f4ca Resolved via: {resolution_source}",
         f"[Polymarket]({poly_url})",
         "",
@@ -1044,10 +1065,15 @@ async def job_check_resolutions():
             if poly_resolved:
                 winning_outcome_ids = set(poly_winning)
                 resolution_source = "Polymarket"
-                res_val = (
-                    f"{actual_high_f}°F (Polymarket)" if actual_high_f is not None
-                    else f"Polymarket: {poly_note}"
-                )
+                # Store the authoritative winning bucket(s), not the METAR temp,
+                # so the recorded resolution can't contradict the WIN/LOSS rows.
+                win_labels = [
+                    o.bucket_label for o in outcomes if o.id in winning_outcome_ids
+                ]
+                if win_labels:
+                    res_val = f"{', '.join(win_labels)} (Polymarket)"
+                else:
+                    res_val = f"Polymarket: {poly_note}"
                 logger.info(
                     f"job_check_resolutions: {market.external_id} → Polymarket: {poly_note}"
                 )
