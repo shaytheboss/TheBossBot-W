@@ -158,9 +158,22 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
         logger.error(f"Admin resolve-pending (job phase) failed: {e}", exc_info=True)
         raise HTTPException(500, f"Resolve failed: {e}")
 
-    # Phase 2: sweep stuck open virtual positions on past markets
+    # Phase 2: sweep stuck open virtual positions on past markets.
+    #
+    # IMPORTANT: settle WIN/LOSS from Polymarket's official result ONLY — never
+    # from METAR / temperature math. METAR can disagree with how Polymarket
+    # actually settled the market (different station, rounding, observation
+    # window), which previously produced wrong WIN/LOSS records. If Polymarket
+    # has not settled a market yet, its stuck positions are left open and retried
+    # on the next run.
+    from app.workers.jobs import (
+        _fetch_polymarket_winning_outcomes,
+        _mark_outcome_winners,
+    )
+
     settled = 0
-    skipped_no_metar = 0
+    markets_resolved = 0
+    skipped_no_poly = 0
     skipped_no_shares = 0
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(
@@ -174,63 +187,66 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
             )
         )).all()
 
-        # Cache actual-high lookups per (icao, date) so we don't re-query
-        # the same METAR window for each opportunity in the same market.
-        highs_cache: dict = {}
-
+        # Group stuck-open opps by market so we query the Polymarket API once
+        # per market, then settle every position on it.
+        by_market: dict[int, dict] = {}
         for opp, oc, market, city in rows:
-            if not opp.virtual_shares:
-                skipped_no_shares += 1
+            entry = by_market.setdefault(
+                market.id, {"market": market, "opps": []}
+            )
+            entry["opps"].append(opp)
+
+        dirty = False
+        for market_id, entry in by_market.items():
+            market = entry["market"]
+            outcomes = (await db.execute(
+                select(MarketOutcome).where(MarketOutcome.market_id == market.id)
+            )).scalars().all()
+
+            poly_winning, poly_resolved, poly_note = (
+                await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
+            )
+            if not poly_resolved:
+                skipped_no_poly += len(entry["opps"])
                 continue
 
-            key = (city.primary_icao, market.event_date)
-            if key not in highs_cache:
-                day_start = datetime(
-                    market.event_date.year, market.event_date.month, market.event_date.day,
-                    tzinfo=timezone.utc,
-                )
-                day_end = day_start + timedelta(days=1)
-                actual_raw = (await db.execute(
-                    select(func.max(MetarObservation.temperature_f)).where(
-                        MetarObservation.icao == city.primary_icao,
-                        MetarObservation.observed_at >= day_start,
-                        MetarObservation.observed_at < day_end,
-                    )
-                )).scalar_one_or_none()
-                highs_cache[key] = float(actual_raw) if actual_raw is not None else None
+            # Persist the winning bucket(s) for model-accuracy scoring.
+            _mark_outcome_winners(outcomes, set(poly_winning))
+            dirty = True
 
-            actual_f = highs_cache[key]
-            if actual_f is None:
-                skipped_no_metar += 1
-                continue
-            actual_c = (actual_f - 32.0) * 5.0 / 9.0
-            unit = resolve_bucket_unit(oc)
-            actual_in_unit = actual_c if unit == "C" else actual_f
+            for opp in entry["opps"]:
+                if not opp.virtual_shares:
+                    skipped_no_shares += 1
+                    continue
+                won = opp.outcome_id in poly_winning
+                if opp.side == "YES":
+                    opp.outcome = "WIN" if won else "LOSS"
+                else:
+                    opp.outcome = "WIN" if not won else "LOSS"
+                opp.closed_at = now
+                cost = float(opp.virtual_cost or 0.0)
+                if opp.outcome == "WIN":
+                    opp.virtual_payout = float(opp.virtual_shares) * 1.00
+                    opp.virtual_status = "win"
+                else:
+                    opp.virtual_payout = 0.0
+                    opp.virtual_status = "loss"
+                opp.virtual_pnl = float(opp.virtual_payout) - cost
+                settled += 1
+                dirty = True
 
-            won = temp_in_bucket(oc.bucket_min, oc.bucket_max, actual_in_unit)
-            if opp.side == "YES":
-                opp.outcome = "WIN" if won else "LOSS"
-            else:
-                opp.outcome = "WIN" if not won else "LOSS"
-            opp.closed_at = now
-            cost = float(opp.virtual_cost or 0.0)
-            if opp.outcome == "WIN":
-                opp.virtual_payout = float(opp.virtual_shares) * 1.00
-                opp.virtual_status = "win"
-            else:
-                opp.virtual_payout = 0.0
-                opp.virtual_status = "loss"
-            opp.virtual_pnl = float(opp.virtual_payout) - cost
-            settled += 1
-
-            # If the market itself was still unresolved (shouldn't happen
-            # often after phase 1, but possible if phase 1 had no METAR for
-            # a different opp's city), mark it resolved now.
+            # Mark the market resolved from Polymarket if phase 1 didn't already.
             if not market.resolved:
+                win_labels = [o.bucket_label for o in outcomes if o.id in poly_winning]
                 market.resolved = True
-                market.resolution_value = f"{actual_f}°F"
+                market.resolution_value = (
+                    f"{', '.join(win_labels)} (Polymarket)" if win_labels
+                    else f"Polymarket: {poly_note}"
+                )
+                markets_resolved += 1
+                dirty = True
 
-        if settled > 0:
+        if dirty:
             await db.commit()
 
     # Final counts for the UI
@@ -251,15 +267,17 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
         )).scalar() or 0
 
     logger.info(
-        f"Admin resolve-pending: settled {settled} stuck positions, "
-        f"skipped {skipped_no_metar} (no METAR), {skipped_no_shares} (no shares); "
-        f"still pending: {markets_still_pending} markets, {positions_still_open} positions"
+        f"Admin resolve-pending: resolved {markets_resolved} markets, settled "
+        f"{settled} stuck positions, skipped {skipped_no_poly} (not on Polymarket "
+        f"yet), {skipped_no_shares} (no shares); still pending: "
+        f"{markets_still_pending} markets, {positions_still_open} positions"
     )
 
     return {
         "ok": True,
+        "markets_resolved": markets_resolved,
         "positions_settled": settled,
-        "positions_skipped_no_metar": skipped_no_metar,
+        "positions_skipped_not_on_poly": skipped_no_poly,
         "markets_still_pending": int(markets_still_pending),
         "positions_still_open_past_date": int(positions_still_open),
     }
@@ -458,6 +476,96 @@ def _parse_iso_date(s: Optional[str], name: str) -> Optional[datetime]:
     return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
 
 
+# ── Per-model forecast helpers ──────────────────────────────────────────────
+# Each opportunity persists a snapshot of every weather model's forecast in its
+# `signals` JSONB (written by SignalAggregator). We surface those point
+# forecasts so the dashboard can show what each model predicted and, once the
+# market settles on Polymarket, whether that prediction was correct.
+
+# (signals key, display label) — order controls display order.
+_MODEL_SIGNAL_LABELS: list[tuple[str, str]] = [
+    ("gfs_forecast", "GFS"),
+    ("ecmwf_forecast", "ECMWF"),
+    ("hrrr_forecast", "HRRR"),
+    ("nws_forecast", "NWS"),
+    ("tomorrowio_forecast", "Tomorrow.io"),
+    ("meteosource_forecast", "Meteosource"),
+    ("icon_forecast", "ICON"),
+    ("wunderground_forecast", "Wunderground"),
+]
+
+
+def _extract_model_forecasts(signals) -> dict:
+    """Return {model label → predicted daily high °F} from an opp's signals."""
+    out: dict = {}
+    if not isinstance(signals, dict):
+        return out
+    for key, label in _MODEL_SIGNAL_LABELS:
+        fc = signals.get(key)
+        if isinstance(fc, dict):
+            v = fc.get("predicted_high_f")
+            if v is not None:
+                try:
+                    out[label] = round(float(v), 1)
+                except (TypeError, ValueError):
+                    pass
+    ens = signals.get("gfs_ensemble")
+    if isinstance(ens, dict):
+        v = ens.get("p50_high_f")
+        if v is None:
+            v = ens.get("mean_high_f")
+        if v is not None:
+            try:
+                out["GFS-ens"] = round(float(v), 1)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _forecast_f_in_bucket(model_high_f: float, winners: list) -> Optional[bool]:
+    """True if the model's °F high lands in any winning bucket.
+
+    `winners` is a list of (bucket_unit, bucket_min, bucket_max). Returns None
+    when there is no winning bucket recorded yet (market unresolved).
+    """
+    if not winners:
+        return None
+    for unit, bmin, bmax in winners:
+        val = (model_high_f - 32.0) * 5.0 / 9.0 if unit == "C" else model_high_f
+        if temp_in_bucket(bmin, bmax, val):
+            return True
+    return False
+
+
+def _score_model_forecasts(model_fc: dict, winners: list) -> dict:
+    """Annotate each model forecast with correctness vs the winning bucket(s).
+
+    Returns {label → {"f": high_f, "correct": bool|None}}.
+    """
+    out: dict = {}
+    for label, high_f in model_fc.items():
+        out[label] = {"f": high_f, "correct": _forecast_f_in_bucket(high_f, winners)}
+    return out
+
+
+async def _winning_bounds_map(db, market_ids: set) -> dict:
+    """market_id → list of (bucket_unit, bucket_min, bucket_max) for won buckets."""
+    if not market_ids:
+        return {}
+    rows = (await db.execute(
+        select(MarketOutcome).where(
+            MarketOutcome.market_id.in_(market_ids),
+            MarketOutcome.won == True,
+        )
+    )).scalars().all()
+    out: dict = {}
+    for oc in rows:
+        out.setdefault(oc.market_id, []).append(
+            (resolve_bucket_unit(oc), oc.bucket_min, oc.bucket_max)
+        )
+    return out
+
+
 @router.get("/stats")
 async def admin_stats(
     _: str = Depends(require_admin),
@@ -603,6 +711,101 @@ async def admin_stats(
     }
 
 
+@router.get("/model-accuracy")
+async def admin_model_accuracy(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+    city_id: Optional[int] = Query(default=None),
+    date_field: str = Query(default="detected", description="'detected' or 'event'"),
+):
+    """Per-model forecast accuracy over settled markets.
+
+    For every resolved opportunity we compare each weather model's captured
+    point forecast against the bucket Polymarket actually settled (MarketOutcome.won).
+    A model is "correct" for that opportunity when its predicted daily high lands
+    in the winning bucket. Results are aggregated overall and per city so we can
+    see which models perform best where (and potentially weight them per city).
+    """
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+    by_event = date_field == "event"
+
+    q = (
+        select(Opportunity, Market.id, City.name)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+        .where(Market.resolved == True, Opportunity.outcome.in_(["WIN", "LOSS"]))
+    )
+    if by_event:
+        if from_dt is not None:
+            q = q.where(Market.event_date >= from_dt.date())
+        if to_dt_inc is not None:
+            q = q.where(Market.event_date <= to_dt_inc.date())
+    else:
+        if from_dt is not None:
+            q = q.where(Opportunity.detected_at >= from_dt)
+        if to_dt is not None:
+            q = q.where(Opportunity.detected_at < to_dt)
+    if city_id is not None:
+        q = q.where(Market.city_id == city_id)
+
+    rows = (await db.execute(q)).all()
+    winners_map = await _winning_bounds_map(db, {mid for _o, mid, _c in rows})
+
+    # tally[label] = [correct, total]; city_tally[city][label] = [correct, total]
+    tally: dict = {}
+    city_tally: dict = {}
+    for opp, mid, city_name in rows:
+        winners = winners_map.get(mid, [])
+        if not winners:
+            continue  # market resolved but winner bucket not recorded yet
+        model_fc = _extract_model_forecasts(opp.signals)
+        for label, high_f in model_fc.items():
+            correct = _forecast_f_in_bucket(high_f, winners)
+            if correct is None:
+                continue
+            t = tally.setdefault(label, [0, 0])
+            t[1] += 1
+            if correct:
+                t[0] += 1
+            ct = city_tally.setdefault(city_name or "—", {}).setdefault(label, [0, 0])
+            ct[1] += 1
+            if correct:
+                ct[0] += 1
+
+    def _rank(d: dict) -> list:
+        items = [
+            {
+                "model": label,
+                "correct": c,
+                "total": n,
+                "pct": round(100 * c / n, 1) if n else None,
+            }
+            for label, (c, n) in d.items()
+        ]
+        items.sort(key=lambda x: (x["pct"] if x["pct"] is not None else -1), reverse=True)
+        return items
+
+    by_city = []
+    for cname, models in sorted(city_tally.items()):
+        ranked = _rank(models)
+        best = ranked[0] if ranked else None
+        by_city.append({"city": cname, "best_model": best, "models": ranked})
+
+    return {
+        "filter": {
+            "from_date": from_date, "to_date": to_date,
+            "city_id": city_id, "date_field": date_field,
+        },
+        "overall": _rank(tally),
+        "by_city": by_city,
+    }
+
+
 @router.get("/positions")
 async def admin_positions(
     _: str = Depends(require_admin),
@@ -641,8 +844,10 @@ async def admin_positions(
         q = q.where(Market.city_id == city_id)
 
     rows = (await db.execute(q)).all()
+    winners_map = await _winning_bounds_map(db, {m.id for _o, _oc, m, _c in rows})
     out = []
     for opp, oc, market, city in rows:
+        model_fc = _extract_model_forecasts(opp.signals)
         out.append({
             "id": opp.id,
             "detected_at": opp.detected_at.isoformat() if opp.detected_at else None,
@@ -666,6 +871,11 @@ async def admin_positions(
             "market_price": float(opp.market_price) if opp.market_price is not None else None,
             "edge": float(opp.edge) if opp.edge is not None else None,
             "confidence": opp.confidence_score,
+            # Per-model forecasts captured at detection time, scored against the
+            # winning bucket once the market settled (correct=None if unresolved).
+            "model_forecasts": _score_model_forecasts(
+                model_fc, winners_map.get(market.id, [])
+            ),
             "market_url": (
                 f"https://polymarket.com/event/{market.external_id}"
                 if market.external_id else None
@@ -872,6 +1082,10 @@ async def admin_opportunities(
     rows = (await db.execute(q)).scalars().all()
 
     out = []
+    # (out_dict, market_id, signals) so per-model forecasts can be scored against
+    # the winning bucket after a single batched winners lookup below.
+    pending: list[tuple] = []
+    market_ids: set = set()
     for opp in rows:
         oc_res = await db.execute(
             select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id)
@@ -888,7 +1102,7 @@ async def admin_opportunities(
                 c = cr.scalar_one_or_none()
                 city_name = c.name if c else None
                 market_url = f"https://polymarket.com/event/{market.external_id}"
-        out.append({
+        d = {
             "id": opp.id,
             "detected_at": opp.detected_at.isoformat() if opp.detected_at else None,
             "city": city_name,
@@ -904,7 +1118,19 @@ async def admin_opportunities(
             "alert_sent": opp.alert_sent,
             "outcome": opp.outcome,
             "closed_at": opp.closed_at.isoformat() if opp.closed_at else None,
-        })
+            "model_forecasts": {},
+        }
+        out.append(d)
+        mid = market.id if market else None
+        if mid is not None:
+            market_ids.add(mid)
+        pending.append((d, mid, opp.signals))
+
+    winners_map = await _winning_bounds_map(db, market_ids)
+    for d, mid, sig in pending:
+        d["model_forecasts"] = _score_model_forecasts(
+            _extract_model_forecasts(sig), winners_map.get(mid, [])
+        )
     return out
 
 

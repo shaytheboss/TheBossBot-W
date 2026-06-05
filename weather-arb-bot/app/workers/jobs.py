@@ -897,6 +897,18 @@ async def _fetch_polymarket_winning_outcomes(
         return frozenset(), False, None
 
 
+def _mark_outcome_winners(outcomes: list, winning_outcome_ids: set) -> None:
+    """Persist Polymarket's verdict on each bucket onto MarketOutcome.won.
+
+    True for the winning bucket(s), False for every other bucket on the same
+    (now-resolved) market. Called from every resolution path so the dashboard
+    has an authoritative, model-independent record of which bucket won — which
+    is what per-model accuracy scoring compares each forecast against.
+    """
+    for o in outcomes:
+        o.won = o.id in winning_outcome_ids
+
+
 async def _send_resolution_alert(
     city: City, market: Market, actual_high_f: Optional[float], opps: list,
     winning_outcome_ids: set, db, outcomes: list, resolution_source: str = "METAR",
@@ -1044,64 +1056,52 @@ async def job_check_resolutions():
                 )
             )
             actual_high_raw = temp_result.scalar_one_or_none()
+            # METAR high is kept only as a reference figure for the alert; it is
+            # NOT used to decide WIN/LOSS (Polymarket is authoritative).
             actual_high_f: Optional[float] = float(actual_high_raw) if actual_high_raw is not None else None
-            actual_high_c: Optional[float] = (
-                (actual_high_f - 32.0) * 5.0 / 9.0 if actual_high_f is not None else None
-            )
 
             outcomes_result = await db.execute(
                 select(MarketOutcome).where(MarketOutcome.market_id == market.id)
             )
             outcomes = outcomes_result.scalars().all()
 
-            # --- Resolution source: Polymarket first, METAR fallback ---
+            # --- Resolution source: Polymarket ONLY ---
+            # WIN/LOSS must reflect how Polymarket actually settled the market.
+            # METAR (or any temperature computation) can disagree with
+            # Polymarket's official result — different station, rounding, or
+            # observation window — so it must NEVER decide WIN/LOSS. If
+            # Polymarket hasn't settled yet we leave the market unresolved and
+            # retry on the next run. The METAR high is still fetched above, but
+            # only for display as a reference figure in the alert.
             poly_winning, poly_resolved, poly_note = (
                 await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
             )
 
-            winning_outcome_ids: set[int]
-            resolution_source: str
-
-            if poly_resolved:
-                winning_outcome_ids = set(poly_winning)
-                resolution_source = "Polymarket"
-                # Store the authoritative winning bucket(s), not the METAR temp,
-                # so the recorded resolution can't contradict the WIN/LOSS rows.
-                win_labels = [
-                    o.bucket_label for o in outcomes if o.id in winning_outcome_ids
-                ]
-                if win_labels:
-                    res_val = f"{', '.join(win_labels)} (Polymarket)"
-                else:
-                    res_val = f"Polymarket: {poly_note}"
+            if not poly_resolved:
                 logger.info(
-                    f"job_check_resolutions: {market.external_id} → Polymarket: {poly_note}"
-                )
-            elif actual_high_f is not None:
-                # METAR fallback: compute bucket winner from temperature.
-                winning_outcome_ids = set()
-                for outcome in outcomes:
-                    bn, bx = outcome.bucket_min, outcome.bucket_max
-                    unit = resolve_bucket_unit(outcome)
-                    actual_in_unit = actual_high_c if unit == "C" else actual_high_f
-                    if temp_in_bucket(bn, bx, actual_in_unit):
-                        winning_outcome_ids.add(outcome.id)
-                resolution_source = "METAR"
-                res_val = f"{actual_high_f}°F"
-                logger.info(
-                    f"job_check_resolutions: {market.external_id} → METAR fallback: {actual_high_f}°F "
-                    f"(Polymarket not yet resolved)"
-                )
-            else:
-                # Neither Polymarket nor METAR available — skip for now.
-                logger.debug(
-                    f"job_check_resolutions: {market.external_id} skipped "
-                    f"(no Polymarket resolution, no METAR data)"
+                    f"job_check_resolutions: {market.external_id} not yet settled on "
+                    f"Polymarket — leaving unresolved (METAR not used for resolution)"
                 )
                 continue
 
+            winning_outcome_ids: set[int] = set(poly_winning)
+            resolution_source = "Polymarket"
+            # Store the authoritative winning bucket(s), not the METAR temp,
+            # so the recorded resolution can't contradict the WIN/LOSS rows.
+            win_labels = [
+                o.bucket_label for o in outcomes if o.id in winning_outcome_ids
+            ]
+            if win_labels:
+                res_val = f"{', '.join(win_labels)} (Polymarket)"
+            else:
+                res_val = f"Polymarket: {poly_note}"
+            logger.info(
+                f"job_check_resolutions: {market.external_id} → Polymarket: {poly_note}"
+            )
+
             market.resolved = True
             market.resolution_value = res_val
+            _mark_outcome_winners(outcomes, winning_outcome_ids)
 
             opps_result = await db.execute(
                 select(Opportunity)
@@ -1211,6 +1211,11 @@ async def job_retroactive_resolution_fix() -> dict:
                     )
                     continue
 
+                # Record the authoritative winning bucket(s) for every resolved
+                # market, even when no opportunity needs correcting — this keeps
+                # MarketOutcome.won populated for model-accuracy scoring.
+                _mark_outcome_winners(outcomes, set(poly_winning))
+
                 # Fetch all settled opps on this market.
                 opps_result = await db.execute(
                     select(Opportunity)
@@ -1279,8 +1284,9 @@ async def job_retroactive_resolution_fix() -> dict:
                         market.resolution_value = f"Polymarket: {poly_note}"
                     await db.commit()
 
-            if corrected == 0 and markets_checked > 0:
-                await db.commit()
+            # Flush any remaining pending changes (e.g. `won` flags set on
+            # resolved markets that needed no opportunity corrections).
+            await db.commit()
 
         result_summary = {
             "status": "done",
