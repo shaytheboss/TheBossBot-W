@@ -814,7 +814,7 @@ async def admin_positions(
     to_date: Optional[str] = Query(default=None),
     city_id: Optional[int] = Query(default=None),
     date_field: str = Query(default="detected", description="'detected' or 'event'"),
-    limit: int = Query(default=200, le=1000),
+    limit: int = Query(default=500, le=5000),
 ):
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
@@ -1039,7 +1039,7 @@ async def admin_lessons(
 async def admin_opportunities(
     _: str = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=500, le=5000),
     only_alerted: bool = Query(default=False),
     outcome: Optional[str] = Query(default=None),
     from_date: Optional[str] = Query(default=None),
@@ -1052,23 +1052,25 @@ async def admin_opportunities(
     to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
     by_event = date_field == "event"
 
-    # Join through to Market when a city filter or event-date filter is needed.
-    if city_id is not None or by_event:
-        q = (
-            select(Opportunity)
-            .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
-            .join(Market, Market.id == MarketOutcome.market_id)
-            .order_by(desc(Opportunity.detected_at))
-            .limit(limit)
-        )
-        if city_id is not None:
-            q = q.where(Market.city_id == city_id)
-    else:
-        q = select(Opportunity).order_by(desc(Opportunity.detected_at)).limit(limit)
+    # Single joined query for every row's outcome/market/city. The previous
+    # version issued 3 extra queries PER opportunity (an N+1 that became a
+    # timeout risk once the row cap was raised so date-range listings are
+    # complete). The outcome→market→city chain is 1:1, so the joins never
+    # inflate the row count.
+    q = (
+        select(Opportunity, MarketOutcome, Market, City)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+        .order_by(desc(Opportunity.detected_at))
+        .limit(limit)
+    )
     if only_alerted:
         q = q.where(Opportunity.alert_sent == True)
     if outcome:
         q = q.where(Opportunity.outcome == outcome.upper())
+    if city_id is not None:
+        q = q.where(Market.city_id == city_id)
     if by_event:
         if from_dt is not None:
             q = q.where(Market.event_date >= from_dt.date())
@@ -1079,58 +1081,39 @@ async def admin_opportunities(
             q = q.where(Opportunity.detected_at >= from_dt)
         if to_dt is not None:
             q = q.where(Opportunity.detected_at < to_dt)
-    rows = (await db.execute(q)).scalars().all()
 
+    rows = (await db.execute(q)).all()
+    winners_map = await _winning_bounds_map(db, {m.id for _o, _oc, m, _c in rows})
     out = []
-    # (out_dict, market_id, signals) so per-model forecasts can be scored against
-    # the winning bucket after a single batched winners lookup below.
-    pending: list[tuple] = []
-    market_ids: set = set()
-    for opp in rows:
-        oc_res = await db.execute(
-            select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id)
-        )
-        oc = oc_res.scalar_one_or_none()
-        market = None
-        city_name = None
-        market_url = None
-        if oc:
-            mr = await db.execute(select(Market).where(Market.id == oc.market_id))
-            market = mr.scalar_one_or_none()
-            if market:
-                cr = await db.execute(select(City).where(City.id == market.city_id))
-                c = cr.scalar_one_or_none()
-                city_name = c.name if c else None
-                market_url = f"https://polymarket.com/event/{market.external_id}"
-        d = {
+    for opp, oc, market, city in rows:
+        out.append({
             "id": opp.id,
             "detected_at": opp.detected_at.isoformat() if opp.detected_at else None,
-            "city": city_name,
+            "city": city.name if city else None,
             "market": market.question if market else None,
-            "market_url": market_url,
-            "event_date": market.event_date.isoformat() if market else None,
+            "market_url": (
+                f"https://polymarket.com/event/{market.external_id}"
+                if market and market.external_id else None
+            ),
+            "event_date": (
+                market.event_date.isoformat()
+                if market and market.event_date else None
+            ),
             "bucket": oc.bucket_label if oc else None,
             "side": opp.side,
-            "market_price": float(opp.market_price),
-            "true_prob": float(opp.estimated_true_prob),
-            "edge": float(opp.edge),
+            "market_price": float(opp.market_price) if opp.market_price is not None else None,
+            "true_prob": float(opp.estimated_true_prob) if opp.estimated_true_prob is not None else None,
+            "edge": float(opp.edge) if opp.edge is not None else None,
             "confidence": opp.confidence_score,
             "alert_sent": opp.alert_sent,
             "outcome": opp.outcome,
             "closed_at": opp.closed_at.isoformat() if opp.closed_at else None,
-            "model_forecasts": {},
-        }
-        out.append(d)
-        mid = market.id if market else None
-        if mid is not None:
-            market_ids.add(mid)
-        pending.append((d, mid, opp.signals))
-
-    winners_map = await _winning_bounds_map(db, market_ids)
-    for d, mid, sig in pending:
-        d["model_forecasts"] = _score_model_forecasts(
-            _extract_model_forecasts(sig), winners_map.get(mid, [])
-        )
+            # Per-model forecasts captured at detection time, scored against the
+            # winning bucket once the market settles (correct=None if unresolved).
+            "model_forecasts": _score_model_forecasts(
+                _extract_model_forecasts(opp.signals), winners_map.get(market.id, [])
+            ),
+        })
     return out
 
 
