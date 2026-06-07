@@ -566,6 +566,61 @@ async def _winning_bounds_map(db, market_ids: set) -> dict:
     return out
 
 
+# Per-range confidence bands (not cumulative) for the Stats breakdown. Each
+# position falls into exactly one band, so summing every band reproduces the
+# panel totals. Cumulative thresholds were dropped because they produced
+# duplicate rows whenever positions cluster in a narrow range (the bot only
+# buys high-confidence opps, so 50%–90% all showed identical numbers).
+_CONF_BANDS: list[tuple[int, int]] = [
+    (0, 49), (50, 59), (60, 69), (70, 74), (75, 79),
+    (80, 84), (85, 89), (90, 94), (95, 100),
+]
+
+
+def _band_stats(subset: list) -> dict:
+    """Aggregate P&L stats for a slice of position rows.
+
+    Each row must expose .virtual_status, .virtual_cost, .virtual_pnl.
+    "Settled" = win/loss only; invested/net_pnl/roi are computed over those.
+    `positions` counts every row in the slice (open + settled).
+    """
+    settled = [r for r in subset if r.virtual_status in ("win", "loss")]
+    w = sum(1 for r in settled if r.virtual_status == "win")
+    l = sum(1 for r in settled if r.virtual_status == "loss")
+    cost = sum(float(r.virtual_cost or 0) for r in settled)
+    pnl = sum(float(r.virtual_pnl or 0) for r in settled)
+    n_settled = w + l
+    return {
+        "positions": len(subset),
+        "wins": w,
+        "losses": l,
+        "win_rate_pct": round(w / n_settled * 100, 1) if n_settled else None,
+        "invested": round(cost, 2),
+        "net_pnl": round(pnl, 2),
+        "roi_pct": round(pnl / cost * 100, 1) if cost > 0 else None,
+    }
+
+
+def _confidence_band_breakdown(rows: list) -> list:
+    """Group already-filtered position rows into per-confidence-band stats.
+
+    `rows` must each expose .confidence_score plus the fields _band_stats needs.
+    Callers pass the SAME filtered row set the headline cards are computed from
+    (date/city/min-conf), which guarantees the band rows reconcile with the
+    panel: summing positions / invested / net_pnl across bands reproduces the
+    headline totals exactly. Empty bands are omitted so the table has no blank
+    rows.
+    """
+    out: list = []
+    for lo, hi in _CONF_BANDS:
+        subset = [r for r in rows if lo <= (r.confidence_score or 0) <= hi]
+        if not subset:
+            continue
+        label = f"{lo}–{hi}%" if hi < 100 else f"{lo}–100%"
+        out.append({"band": label, "min_conf": lo, "max_conf": hi, **_band_stats(subset)})
+    return out
+
+
 @router.get("/stats")
 async def admin_stats(
     _: str = Depends(require_admin),
@@ -682,54 +737,21 @@ async def admin_stats(
     )).scalar()
 
     # ── Performance by confidence band ──────────────────────────────────────
-    # Fetch all positions in the date/city window (ignoring min_confidence so
-    # the breakdown always covers all bands regardless of the card filter).
-    # Each row: (confidence_score, virtual_status, virtual_cost, virtual_pnl).
-    # We group in Python — one SQL round-trip instead of one per band.
-    #
-    # Bands are per-range (not cumulative) so each row always shows distinct
-    # data. Cumulative thresholds would show identical rows whenever the data
-    # is concentrated in a narrow range (e.g. only 90-95% positions exist).
-    _CONF_BANDS = [(0, 49), (50, 59), (60, 69), (70, 74), (75, 79),
-                   (80, 84), (85, 89), (90, 94), (95, 100)]
+    # Honours the SAME filters as the cards above (date/city/min-conf) so the
+    # band rows always reconcile with the headline panel — see
+    # _confidence_band_breakdown for the full rationale. One SQL round-trip;
+    # grouped into bands in Python.
     band_rows = (await db.execute(
-        opp_q(
+        fq(
             select(
                 Opportunity.confidence_score,
                 Opportunity.virtual_status,
                 Opportunity.virtual_cost,
                 Opportunity.virtual_pnl,
-            ),
-            min_conf=None,          # always cover all confidence levels
+            )
         ).where(Opportunity.virtual_shares != None)
     )).all()
-
-    def _band_stats(subset):
-        """Aggregate P&L stats for a slice of position rows."""
-        settled = [r for r in subset if r.virtual_status in ("win", "loss")]
-        w = sum(1 for r in settled if r.virtual_status == "win")
-        l = sum(1 for r in settled if r.virtual_status == "loss")
-        cost = sum(float(r.virtual_cost or 0) for r in settled)
-        pnl = sum(float(r.virtual_pnl or 0) for r in settled)
-        n_settled = w + l
-        return {
-            "positions": len(subset),
-            "wins": w,
-            "losses": l,
-            "win_rate_pct": round(w / n_settled * 100, 1) if n_settled else None,
-            "invested": round(cost, 2),
-            "net_pnl": round(pnl, 2),
-            "roi_pct": round(pnl / cost * 100, 1) if cost > 0 else None,
-        }
-
-    by_confidence_band = []
-    for lo, hi in _CONF_BANDS:
-        subset = [r for r in band_rows if lo <= (r.confidence_score or 0) <= hi]
-        if not subset:
-            continue                # skip empty bands so table has no blank rows
-        label = f"{lo}–{hi}%" if hi < 100 else f"{lo}–100%"
-        by_confidence_band.append({"band": label, "min_conf": lo, "max_conf": hi,
-                                   **_band_stats(subset)})
+    by_confidence_band = _confidence_band_breakdown(band_rows)
 
     return {
         "filter": {
@@ -766,10 +788,10 @@ async def admin_stats(
             "outcomes_with_token": outcomes_with_token,
             "telegram_users": telegram_users,
         },
-        # Per-band breakdown: each row = positions with confidence in [min_conf, max_conf].
-        # Only non-empty bands are included. Gives the actual distribution —
-        # "where do my positions sit?" — without the duplicate-row problem that
-        # cumulative thresholds produce when data is concentrated in a narrow range.
+        # Per-band breakdown: each row = positions with confidence in
+        # [min_conf, max_conf]. Honours the same filters as the cards above
+        # (date/city/min-conf), so the band rows always reconcile with the
+        # headline panel. Only non-empty bands are included.
         "by_confidence_band": by_confidence_band,
     }
 
