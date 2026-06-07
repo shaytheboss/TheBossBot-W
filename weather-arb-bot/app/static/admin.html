@@ -167,6 +167,7 @@
         <button class="btn primary" onclick="resolvePending(this)" title="Run resolution on past markets whose virtual positions never closed">🔄 Resolve pending</button>
         <button class="btn warning" onclick="retroactiveFix(this)" title="Re-check all resolved markets against Polymarket's official result and correct any mis-recorded WIN/LOSS">🔁 Retroactive Poly fix</button>
         <button class="btn" onclick="exportCsv('positionsBody', 'positions')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
+        <span id="posCapWarn" class="small" style="color:var(--warn);"></span>
         <span id="resolveStatus" class="small"></span>
       </div>
       <table id="positionsTable">
@@ -237,6 +238,7 @@
         <button class="btn primary" onclick="loadOpps()">Apply Filter</button>
         <button class="btn" onclick="resetOppFilter()">Reset</button>
         <button class="btn" onclick="exportCsv('oppsBody', 'opportunities')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
+        <span id="oppCapWarn" class="small" style="color:var(--warn);"></span>
       </div>
       <table id="oppsTable">
         <thead><tr>
@@ -508,6 +510,17 @@ function card(label, value) {
   return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
 }
 
+// Warn when a table listing was truncated by the server row cap. A truncated
+// listing makes client-side filters (Min conf, side, status) and the visible
+// counts unreliable, so we tell the user to narrow the date range.
+function _setCapWarning(elId, count, limit) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.textContent = (count >= limit)
+    ? `⚠ Showing first ${limit} rows — narrow the date range for complete results.`
+    : '';
+}
+
 async function ensureCitiesLoaded() {
   if (window._citiesCache) return window._citiesCache;
   const r = await api('/cities');
@@ -677,8 +690,16 @@ async function loadPositions() {
   if (t) p.set('to_date', t);
   if (c) p.set('city_id', c);
   if (df) p.set('date_field', df);
+  // Pull a wide window so the table holds every position in the date range.
+  // The Min-conf / side / status filters run client-side, so if the server
+  // truncated the result the counts would be wrong (you'd see fewer high-conf
+  // rows merely because newer rows pushed older ones past the cap). We request
+  // the full window and warn loudly if the cap is ever hit.
+  const LIMIT = 5000;
+  p.set('limit', String(LIMIT));
   const r = await api('/positions?' + p); if (!r.ok) return;
   const rows = await r.json();
+  _setCapWarning('posCapWarn', rows.length, LIMIT);
   // Side-aware probability so the displayed P matches the chosen side (YES/NO),
   // mirroring the Opportunities screen.
   rows.forEach(o => {
@@ -965,10 +986,10 @@ function _renderOpps(rows) {
       <td>${o.event_date || ''}</td>
       <td>${o.bucket || ''}</td>
       <td>${o.side}</td>
-      <td>${Math.round(o._display_price*100)}¢</td>
-      <td>${Math.round(o._display_prob*100)}%</td>
-      <td>${(o.edge*100).toFixed(0)}pp</td>
-      <td>${o.confidence}</td>
+      <td>${o._display_price != null ? Math.round(o._display_price*100) + '¢' : ''}</td>
+      <td>${o._display_prob != null ? Math.round(o._display_prob*100) + '%' : ''}</td>
+      <td>${o.edge != null ? (o.edge*100).toFixed(0) + 'pp' : ''}</td>
+      <td>${o.confidence ?? ''}</td>
       <td>${o.alert_sent ? '✓' : ''}</td>
       <td>${pill(o.outcome)}</td>
       <td>${_modelsCell(o)}</td>
@@ -1005,15 +1026,23 @@ async function loadOpps() {
   if (t) params.set('to_date', t);
   if (c) params.set('city_id', c);
   if (df) params.set('date_field', df);
-  // Pull a wider window so the table isn't capped to just the most recent ~3
-  // days of detections (the server orders by detected_at desc).
-  params.set('limit', '500');
+  // Pull the full window so the table isn't capped to just the most recent
+  // detections (the server orders by detected_at desc). Client-side Min-conf /
+  // Min-edge / side filters run over these rows, so truncating here would make
+  // the visible counts depend on how many newer rows exist — exactly the bug
+  // that made widening the date range show *fewer* matching rows.
+  const LIMIT = 5000;
+  params.set('limit', String(LIMIT));
   const r = await api('/opportunities?' + params); if (!r.ok) return;
   const rows = await r.json();
-  // Precompute side-aware display values so column sorting matches what the user sees.
+  _setCapWarning('oppCapWarn', rows.length, LIMIT);
+  // Precompute side-aware display values so column sorting matches what the user
+  // sees. Guard nulls so missing prices/probs render blank rather than NaN.
   rows.forEach(o => {
-    o._display_price = (o.side === 'NO') ? (1 - o.market_price) : o.market_price;
-    o._display_prob = (o.side === 'NO') ? (1 - o.true_prob) : o.true_prob;
+    o._display_price = (o.market_price == null)
+      ? null : ((o.side === 'NO') ? (1 - o.market_price) : o.market_price);
+    o._display_prob = (o.true_prob == null)
+      ? null : ((o.side === 'NO') ? (1 - o.true_prob) : o.true_prob);
   });
   _registerTable('oppsBody', rows, _renderOpps, { key: 'detected_at', dir: 'desc', type: 'date' });
 }
