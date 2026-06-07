@@ -681,12 +681,17 @@ async def admin_stats(
         .where(Opportunity.virtual_status.in_(["win", "loss"]))
     )).scalar()
 
-    # ── Performance by confidence threshold ─────────────────────────────────
+    # ── Performance by confidence band ──────────────────────────────────────
     # Fetch all positions in the date/city window (ignoring min_confidence so
-    # the breakdown always shows all bands regardless of the card filter).
+    # the breakdown always covers all bands regardless of the card filter).
     # Each row: (confidence_score, virtual_status, virtual_cost, virtual_pnl).
-    # We then group in Python — one SQL round-trip instead of one per band.
-    _CONF_THRESHOLDS = [50, 60, 70, 75, 80, 85, 90, 95]
+    # We group in Python — one SQL round-trip instead of one per band.
+    #
+    # Bands are per-range (not cumulative) so each row always shows distinct
+    # data. Cumulative thresholds would show identical rows whenever the data
+    # is concentrated in a narrow range (e.g. only 90-95% positions exist).
+    _CONF_BANDS = [(0, 49), (50, 59), (60, 69), (70, 74), (75, 79),
+                   (80, 84), (85, 89), (90, 94), (95, 100)]
     band_rows = (await db.execute(
         opp_q(
             select(
@@ -699,16 +704,16 @@ async def admin_stats(
         ).where(Opportunity.virtual_shares != None)
     )).all()
 
-    def _band_stats(rows):
+    def _band_stats(subset):
         """Aggregate P&L stats for a slice of position rows."""
-        settled = [r for r in rows if r.virtual_status in ("win", "loss")]
+        settled = [r for r in subset if r.virtual_status in ("win", "loss")]
         w = sum(1 for r in settled if r.virtual_status == "win")
         l = sum(1 for r in settled if r.virtual_status == "loss")
         cost = sum(float(r.virtual_cost or 0) for r in settled)
         pnl = sum(float(r.virtual_pnl or 0) for r in settled)
         n_settled = w + l
         return {
-            "positions": len(rows),
+            "positions": len(subset),
             "wins": w,
             "losses": l,
             "win_rate_pct": round(w / n_settled * 100, 1) if n_settled else None,
@@ -717,10 +722,14 @@ async def admin_stats(
             "roi_pct": round(pnl / cost * 100, 1) if cost > 0 else None,
         }
 
-    by_confidence_threshold = [
-        {"min_conf": t, **_band_stats([r for r in band_rows if (r.confidence_score or 0) >= t])}
-        for t in _CONF_THRESHOLDS
-    ]
+    by_confidence_band = []
+    for lo, hi in _CONF_BANDS:
+        subset = [r for r in band_rows if lo <= (r.confidence_score or 0) <= hi]
+        if not subset:
+            continue                # skip empty bands so table has no blank rows
+        label = f"{lo}–{hi}%" if hi < 100 else f"{lo}–100%"
+        by_confidence_band.append({"band": label, "min_conf": lo, "max_conf": hi,
+                                   **_band_stats(subset)})
 
     return {
         "filter": {
@@ -757,9 +766,11 @@ async def admin_stats(
             "outcomes_with_token": outcomes_with_token,
             "telegram_users": telegram_users,
         },
-        # Cumulative breakdown: each row = positions with confidence ≥ min_conf.
-        # Lets the user find the confidence threshold where ROI/win-rate peaks.
-        "by_confidence_threshold": by_confidence_threshold,
+        # Per-band breakdown: each row = positions with confidence in [min_conf, max_conf].
+        # Only non-empty bands are included. Gives the actual distribution —
+        # "where do my positions sit?" — without the duplicate-row problem that
+        # cumulative thresholds produce when data is concentrated in a narrow range.
+        "by_confidence_band": by_confidence_band,
     }
 
 

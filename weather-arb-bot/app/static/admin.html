@@ -131,8 +131,8 @@
       <div class="grid" id="statsOpps"></div>
       <h3 style="margin-top:24px;">Virtual Positions (P&amp;L)</h3>
       <div class="grid" id="statsPositions"></div>
-      <h3 style="margin-top:24px;">Performance by confidence threshold</h3>
-      <p class="small">Each row = virtual positions with confidence ≥ the threshold shown. Find the cut-off where win rate and ROI peak. The breakdown always uses the full date/city filter above (ignoring the Min-conf card filter) so all thresholds are visible at once.</p>
+      <h3 style="margin-top:24px;">Performance by confidence band</h3>
+      <p class="small">Each row = positions whose confidence score falls <strong>within that band only</strong> (not cumulative). Empty bands are hidden. This shows the actual distribution — where your positions sit — and whether ROI improves in higher bands.</p>
       <div id="statsConfBreakdown"></div>
       <h3 style="margin-top:24px;">Model accuracy</h3>
       <p class="small">Each weather model's point forecast scored against the bucket Polymarket settled, over resolved markets in the current filter. Helps spot which model performs best — and where (per-city), so models could later be weighted per city.</p>
@@ -614,19 +614,17 @@ async function loadStats() {
   document.getElementById('statsInv').innerHTML =
     card('Cities', i.cities) + card('Markets', i.markets) + card('Outcomes', i.outcomes) +
     card('Outcomes w/ token', i.outcomes_with_token) + card('Telegram users', i.telegram_users);
-  _renderConfBreakdown(s.by_confidence_threshold || []);
+  _renderConfBreakdown(s.by_confidence_band || []);
   loadModelAccuracy();
 }
 
 function _renderConfBreakdown(rows) {
   const box = document.getElementById('statsConfBreakdown');
   if (!box) return;
-  const settled = rows.filter(r => (r.wins + r.losses) > 0);
-  if (!settled.length) {
+  if (!rows.length) {
     box.innerHTML = '<p class="small">No settled positions yet to build this breakdown.</p>';
     return;
   }
-  const fmt = v => (v == null ? '—' : (v >= 0 ? '$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)));
   const fmtRoi = v => {
     if (v == null) return '—';
     const color = v >= 0 ? 'var(--win)' : 'var(--loss)';
@@ -644,7 +642,7 @@ function _renderConfBreakdown(rows) {
   };
   let html = `<table>
     <thead><tr>
-      <th>Min conf</th>
+      <th>Conf band</th>
       <th>Positions</th>
       <th>Settled</th>
       <th>Wins</th>
@@ -656,7 +654,7 @@ function _renderConfBreakdown(rows) {
   for (const r of rows) {
     const n_settled = r.wins + r.losses;
     html += `<tr>
-      <td><strong>≥ ${r.min_conf}%</strong></td>
+      <td><strong>${escapeHtml(r.band)}</strong></td>
       <td>${r.positions}</td>
       <td>${n_settled}</td>
       <td>${r.wins}</td>
