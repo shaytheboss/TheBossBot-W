@@ -574,6 +574,7 @@ async def admin_stats(
     to_date: Optional[str] = Query(default=None, description="ISO YYYY-MM-DD; inclusive"),
     city_id: Optional[int] = Query(default=None),
     date_field: str = Query(default="detected", description="'detected' or 'event'"),
+    min_confidence: Optional[int] = Query(default=None, description="Minimum confidence score 0-100"),
 ):
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
@@ -582,10 +583,10 @@ async def admin_stats(
     from_ev = from_dt.date() if (from_dt and by_event) else None
     to_ev = to_dt_inc.date() if (to_dt_inc and by_event) else None
 
-    def opp_q(base):
+    def opp_q(base, min_conf: Optional[int] = None):
+        """Apply date/city filters (and optional confidence floor) to a query."""
         q = base
-        # Filtering by event_date (or city) needs the Market join. The join is
-        # 1:1 (outcome→market) so it never inflates counts/sums.
+        # event_date or city filtering needs the Market join (1:1, no inflation).
         if by_event or city_id is not None:
             q = q.join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id) \
                  .join(Market, Market.id == MarketOutcome.market_id)
@@ -601,20 +602,26 @@ async def admin_stats(
                 q = q.where(Opportunity.detected_at < to_dt)
         if city_id is not None:
             q = q.where(Market.city_id == city_id)
+        if min_conf is not None:
+            q = q.where(Opportunity.confidence_score >= min_conf)
         return q
 
-    total_opps = (await db.execute(opp_q(select(func.count(Opportunity.id))))).scalar() or 0
+    # Helper so callers that always pass min_confidence don't need to repeat it.
+    def fq(base):
+        return opp_q(base, min_conf=min_confidence)
+
+    total_opps = (await db.execute(fq(select(func.count(Opportunity.id))))).scalar() or 0
     alerted = (await db.execute(
-        opp_q(select(func.count(Opportunity.id))).where(Opportunity.alert_sent == True)
+        fq(select(func.count(Opportunity.id))).where(Opportunity.alert_sent == True)
     )).scalar() or 0
     wins = (await db.execute(
-        opp_q(select(func.count(Opportunity.id))).where(Opportunity.outcome == "WIN")
+        fq(select(func.count(Opportunity.id))).where(Opportunity.outcome == "WIN")
     )).scalar() or 0
     losses = (await db.execute(
-        opp_q(select(func.count(Opportunity.id))).where(Opportunity.outcome == "LOSS")
+        fq(select(func.count(Opportunity.id))).where(Opportunity.outcome == "LOSS")
     )).scalar() or 0
     open_pos = (await db.execute(
-        opp_q(select(func.count(Opportunity.id)))
+        fq(select(func.count(Opportunity.id)))
         .where(Opportunity.alert_sent == True, Opportunity.outcome == None)
     )).scalar() or 0
 
@@ -631,54 +638,96 @@ async def admin_stats(
     win_rate = round(wins / max(wins + losses, 1) * 100, 1)
 
     positions_opened = (await db.execute(
-        opp_q(select(func.count(Opportunity.id)))
+        fq(select(func.count(Opportunity.id)))
         .where(Opportunity.virtual_shares != None)
     )).scalar() or 0
     # Cost of CLOSED positions only (win + loss) — used together with total_payout
     # and net_pnl so the three numbers are internally consistent:
     #   net_pnl = total_payout - total_cost  (within closed positions)
     total_cost = (await db.execute(
-        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_cost), 0.0)))
+        fq(select(func.coalesce(func.sum(Opportunity.virtual_cost), 0.0)))
         .where(Opportunity.virtual_status.in_(["win", "loss"]))
     )).scalar() or 0.0
     # Cost of still-open positions = money at risk, not yet resolved
     open_cost = (await db.execute(
-        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_cost), 0.0)))
+        fq(select(func.coalesce(func.sum(Opportunity.virtual_cost), 0.0)))
         .where(Opportunity.virtual_status == "open")
     )).scalar() or 0.0
     total_payout = (await db.execute(
-        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_payout), 0.0)))
+        fq(select(func.coalesce(func.sum(Opportunity.virtual_payout), 0.0)))
         .where(Opportunity.virtual_status.in_(["win", "loss"]))
     )).scalar() or 0.0
     net_pnl = (await db.execute(
-        opp_q(select(func.coalesce(func.sum(Opportunity.virtual_pnl), 0.0)))
+        fq(select(func.coalesce(func.sum(Opportunity.virtual_pnl), 0.0)))
         .where(Opportunity.virtual_status.in_(["win", "loss"]))
     )).scalar() or 0.0
     pos_wins = (await db.execute(
-        opp_q(select(func.count(Opportunity.id)))
+        fq(select(func.count(Opportunity.id)))
         .where(Opportunity.virtual_status == "win")
     )).scalar() or 0
     pos_losses = (await db.execute(
-        opp_q(select(func.count(Opportunity.id)))
+        fq(select(func.count(Opportunity.id)))
         .where(Opportunity.virtual_status == "loss")
     )).scalar() or 0
     pos_win_rate = round(pos_wins / max(pos_wins + pos_losses, 1) * 100, 1)
-    # avg_cost across all opened positions (closed + open), so use total_cost + open_cost
+    # avg_cost across all opened positions (closed + open)
     avg_cost = (float(total_cost + open_cost) / positions_opened) if positions_opened else 0.0
     best_pnl = (await db.execute(
-        opp_q(select(func.max(Opportunity.virtual_pnl)))
+        fq(select(func.max(Opportunity.virtual_pnl)))
         .where(Opportunity.virtual_status.in_(["win", "loss"]))
     )).scalar()
     worst_pnl = (await db.execute(
-        opp_q(select(func.min(Opportunity.virtual_pnl)))
+        fq(select(func.min(Opportunity.virtual_pnl)))
         .where(Opportunity.virtual_status.in_(["win", "loss"]))
     )).scalar()
+
+    # ── Performance by confidence threshold ─────────────────────────────────
+    # Fetch all positions in the date/city window (ignoring min_confidence so
+    # the breakdown always shows all bands regardless of the card filter).
+    # Each row: (confidence_score, virtual_status, virtual_cost, virtual_pnl).
+    # We then group in Python — one SQL round-trip instead of one per band.
+    _CONF_THRESHOLDS = [50, 60, 70, 75, 80, 85, 90, 95]
+    band_rows = (await db.execute(
+        opp_q(
+            select(
+                Opportunity.confidence_score,
+                Opportunity.virtual_status,
+                Opportunity.virtual_cost,
+                Opportunity.virtual_pnl,
+            ),
+            min_conf=None,          # always cover all confidence levels
+        ).where(Opportunity.virtual_shares != None)
+    )).all()
+
+    def _band_stats(rows):
+        """Aggregate P&L stats for a slice of position rows."""
+        settled = [r for r in rows if r.virtual_status in ("win", "loss")]
+        w = sum(1 for r in settled if r.virtual_status == "win")
+        l = sum(1 for r in settled if r.virtual_status == "loss")
+        cost = sum(float(r.virtual_cost or 0) for r in settled)
+        pnl = sum(float(r.virtual_pnl or 0) for r in settled)
+        n_settled = w + l
+        return {
+            "positions": len(rows),
+            "wins": w,
+            "losses": l,
+            "win_rate_pct": round(w / n_settled * 100, 1) if n_settled else None,
+            "invested": round(cost, 2),
+            "net_pnl": round(pnl, 2),
+            "roi_pct": round(pnl / cost * 100, 1) if cost > 0 else None,
+        }
+
+    by_confidence_threshold = [
+        {"min_conf": t, **_band_stats([r for r in band_rows if (r.confidence_score or 0) >= t])}
+        for t in _CONF_THRESHOLDS
+    ]
 
     return {
         "filter": {
             "from_date": from_date,
             "to_date": to_date,
             "city_id": city_id,
+            "min_confidence": min_confidence,
         },
         "opportunities": {
             "total": total_opps,
@@ -708,6 +757,9 @@ async def admin_stats(
             "outcomes_with_token": outcomes_with_token,
             "telegram_users": telegram_users,
         },
+        # Cumulative breakdown: each row = positions with confidence ≥ min_conf.
+        # Lets the user find the confidence threshold where ROI/win-rate peaks.
+        "by_confidence_threshold": by_confidence_threshold,
     }
 
 

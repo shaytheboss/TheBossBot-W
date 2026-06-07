@@ -123,6 +123,7 @@
         <label class="row small">City
           <select id="statsCity"><option value="">All cities</option></select>
         </label>
+        <label class="row small" title="Filter main stats cards to opportunities with at least this confidence score">Min conf <input type="number" id="statsMinConf" min="0" max="100" step="1" style="width:46px;" /></label>
         <button class="btn primary" onclick="loadStats()">Apply Filter</button>
         <button class="btn" onclick="resetStatsFilter()">Reset</button>
       </div>
@@ -130,6 +131,9 @@
       <div class="grid" id="statsOpps"></div>
       <h3 style="margin-top:24px;">Virtual Positions (P&amp;L)</h3>
       <div class="grid" id="statsPositions"></div>
+      <h3 style="margin-top:24px;">Performance by confidence threshold</h3>
+      <p class="small">Each row = virtual positions with confidence ≥ the threshold shown. Find the cut-off where win rate and ROI peak. The breakdown always uses the full date/city filter above (ignoring the Min-conf card filter) so all thresholds are visible at once.</p>
+      <div id="statsConfBreakdown"></div>
       <h3 style="margin-top:24px;">Model accuracy</h3>
       <p class="small">Each weather model's point forecast scored against the bucket Polymarket settled, over resolved markets in the current filter. Helps spot which model performs best — and where (per-city), so models could later be weighted per city.</p>
       <div id="statsModels"></div>
@@ -560,10 +564,12 @@ function _statsParams() {
   const t = document.getElementById('statsTo').value;
   const c = document.getElementById('statsCity').value;
   const df = document.getElementById('statsDateField').value;
+  const mc = parseInt(document.getElementById('statsMinConf').value);
   if (f) p.set('from_date', f);
   if (t) p.set('to_date', t);
   if (c) p.set('city_id', c);
   if (df) p.set('date_field', df);
+  if (!isNaN(mc) && mc > 0) p.set('min_confidence', mc);
   return p;
 }
 
@@ -572,6 +578,7 @@ function resetStatsFilter() {
   document.getElementById('statsTo').value = '';
   document.getElementById('statsCity').value = '';
   document.getElementById('statsDateField').value = 'detected';
+  document.getElementById('statsMinConf').value = '';
   loadStats();
 }
 
@@ -607,7 +614,60 @@ async function loadStats() {
   document.getElementById('statsInv').innerHTML =
     card('Cities', i.cities) + card('Markets', i.markets) + card('Outcomes', i.outcomes) +
     card('Outcomes w/ token', i.outcomes_with_token) + card('Telegram users', i.telegram_users);
+  _renderConfBreakdown(s.by_confidence_threshold || []);
   loadModelAccuracy();
+}
+
+function _renderConfBreakdown(rows) {
+  const box = document.getElementById('statsConfBreakdown');
+  if (!box) return;
+  const settled = rows.filter(r => (r.wins + r.losses) > 0);
+  if (!settled.length) {
+    box.innerHTML = '<p class="small">No settled positions yet to build this breakdown.</p>';
+    return;
+  }
+  const fmt = v => (v == null ? '—' : (v >= 0 ? '$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)));
+  const fmtRoi = v => {
+    if (v == null) return '—';
+    const color = v >= 0 ? 'var(--win)' : 'var(--loss)';
+    return `<span style="color:${color};font-weight:600">${v >= 0 ? '+' : ''}${v}%</span>`;
+  };
+  const fmtPnl = v => {
+    if (v == null) return '—';
+    const color = v >= 0 ? 'var(--win)' : 'var(--loss)';
+    return `<span style="color:${color}">${v >= 0 ? '+$' : '-$'}${Math.abs(v).toFixed(2)}</span>`;
+  };
+  const fmtWr = v => {
+    if (v == null) return '—';
+    const color = v >= 60 ? 'var(--win)' : (v >= 45 ? 'var(--warn)' : 'var(--loss)');
+    return `<span style="color:${color}">${v}%</span>`;
+  };
+  let html = `<table>
+    <thead><tr>
+      <th>Min conf</th>
+      <th>Positions</th>
+      <th>Settled</th>
+      <th>Wins</th>
+      <th>Win rate</th>
+      <th>Invested</th>
+      <th>Net P&amp;L</th>
+      <th>ROI</th>
+    </tr></thead><tbody>`;
+  for (const r of rows) {
+    const n_settled = r.wins + r.losses;
+    html += `<tr>
+      <td><strong>≥ ${r.min_conf}%</strong></td>
+      <td>${r.positions}</td>
+      <td>${n_settled}</td>
+      <td>${r.wins}</td>
+      <td>${fmtWr(r.win_rate_pct)}</td>
+      <td>${r.invested != null ? '$' + r.invested.toFixed(2) : '—'}</td>
+      <td>${fmtPnl(r.net_pnl)}</td>
+      <td>${fmtRoi(r.roi_pct)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  box.innerHTML = html;
 }
 
 async function loadModelAccuracy() {
