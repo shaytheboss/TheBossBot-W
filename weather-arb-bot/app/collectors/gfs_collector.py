@@ -94,9 +94,14 @@ class GFSCollector(BaseCollector):
         return parsed
 
     async def collect_ensemble(
-        self, lat: float, lon: float, forecast_date: Optional[date] = None
+        self, lat: float, lon: float, forecast_date: Optional[date] = None,
+        model: str = "gfs_seamless",
     ) -> Optional[dict]:
-        """Fetch GFS ensemble members from Open-Meteo and return daily max/min distribution."""
+        """Fetch ensemble members from Open-Meteo and return daily max/min distribution.
+
+        `model` selects the ensemble system: "gfs_seamless" (default, ~30
+        members) or "ecmwf_ifs025" (ECMWF IFS ensemble, ~50 members).
+        """
         target = forecast_date or date.today()
         target_str = str(target)
         days_ahead = max(1, (target - date.today()).days + 2)
@@ -108,7 +113,7 @@ class GFSCollector(BaseCollector):
                     "latitude": lat,
                     "longitude": lon,
                     "hourly": "temperature_2m",
-                    "models": "gfs_seamless",
+                    "models": model,
                     "temperature_unit": "fahrenheit",
                     "forecast_days": days_ahead,
                     "timezone": "auto",
@@ -178,14 +183,16 @@ class GFSCollector(BaseCollector):
         lon: float,
         forecast_date: date,
         db: AsyncSession,
+        model: str = "gfs_seamless",
+        source: str = "gfs_ensemble",
     ) -> Optional[dict]:
-        parsed = await self.collect_ensemble(lat, lon, forecast_date)
+        parsed = await self.collect_ensemble(lat, lon, forecast_date, model=model)
         if not parsed:
             return None
 
         forecast = Forecast(
             city_id=city_id,
-            source="gfs_ensemble",
+            source=source,
             forecast_for_date=forecast_date,
             predicted_high_f=parsed.get("mean_high_f"),
             predicted_low_f=parsed.get("mean_low_f"),
@@ -194,7 +201,7 @@ class GFSCollector(BaseCollector):
         db.add(forecast)
         await db.commit()
         logger.info(
-            f"GFS ensemble stored for city {city_id} date {forecast_date}: "
+            f"{source} stored for city {city_id} date {forecast_date}: "
             f"n={parsed['ensemble_count']} p50_high={parsed.get('p50_high_f')}"
         )
         return parsed

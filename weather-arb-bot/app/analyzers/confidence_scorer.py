@@ -1,3 +1,10 @@
+"""Legacy heuristic confidence score.
+
+NOTE: the live system (detector, dashboard, /scan, market analysis) now uses a
+single unified definition of confidence — the certainty of the better side
+derived from the probability estimate (round(100 * max(p, 1-p))). This module
+is kept for reference/experiments only and is no longer called by the app.
+"""
 from typing import Optional
 
 
@@ -57,8 +64,14 @@ def compute_confidence(
     ref_wind_dir = ref.get("wind_direction")
     ref_wind_kt = ref.get("wind_speed_kt", 0) or 0
 
-    if ref_wind_dir is not None:
-        onshore = 270 <= ref_wind_dir <= 340
+    # Onshore bearing is city-specific (City.onshore_wind_dir, via signals).
+    # Skipped entirely when not configured — the old hardcoded 270-340° was
+    # only correct for the US west coast and scored east-coast/international
+    # cities in the wrong direction.
+    onshore_center = signals.get("_onshore_wind_dir")
+    if ref_wind_dir is not None and onshore_center is not None:
+        from app.analyzers.probability_estimator import _is_onshore
+        onshore = _is_onshore(float(ref_wind_dir), float(onshore_center))
         if onshore and ref_wind_kt > 8:
             if not bucket_requires_warmth:
                 score += 15

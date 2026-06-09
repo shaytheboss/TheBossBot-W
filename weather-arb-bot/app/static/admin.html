@@ -300,6 +300,7 @@
           <th>Poly slug</th>
           <th>Lat</th>
           <th>Lon</th>
+          <th title="Compass bearing (0-359°) of the onshore sea→land wind, e.g. ~300 for LA, ~110 for Miami. Empty disables the sea-breeze heuristics for this city.">Onshore°</th>
           <th>Active</th>
           <th title="Blacklisted cities still alert but never open a virtual buy">Blacklist</th>
           <th></th>
@@ -1211,6 +1212,7 @@ async function loadCities() {
       <td><input style="width:130px;" value="${escapeHtml(c.polymarket_slug || '')}" id="city-slug-${c.id}"/></td>
       <td><input style="width:82px;" type="number" step="0.0001" value="${c.nws_lat != null ? c.nws_lat.toFixed(4) : ''}" id="city-lat-${c.id}"/></td>
       <td><input style="width:88px;" type="number" step="0.0001" value="${c.nws_lon != null ? c.nws_lon.toFixed(4) : ''}" id="city-lon-${c.id}"/></td>
+      <td><input style="width:58px;" type="number" min="0" max="359" step="1" value="${c.onshore_wind_dir != null ? c.onshore_wind_dir : ''}" id="city-onshore-${c.id}" title="Onshore wind bearing 0-359°; empty = sea-breeze heuristics off"/></td>
       <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
       <td title="When checked: still alerts, but never opens a virtual buy"><input type="checkbox" ${c.blacklisted ? 'checked' : ''} id="city-blacklist-${c.id}"/></td>
       <td>
@@ -1224,6 +1226,7 @@ async function loadCities() {
 async function saveCity(id) {
   const latVal = document.getElementById('city-lat-'+id).value;
   const lonVal = document.getElementById('city-lon-'+id).value;
+  const onshoreVal = document.getElementById('city-onshore-'+id).value;
   const payload = {
     name: document.getElementById('city-name-'+id).value.trim() || null,
     primary_icao: document.getElementById('city-picao-'+id).value.trim().toUpperCase() || null,
@@ -1231,6 +1234,7 @@ async function saveCity(id) {
     polymarket_slug: document.getElementById('city-slug-'+id).value.trim() || null,
     nws_lat: latVal !== '' ? parseFloat(latVal) : null,
     nws_lon: lonVal !== '' ? parseFloat(lonVal) : null,
+    onshore_wind_dir: onshoreVal !== '' ? parseInt(onshoreVal) : null,
     active: document.getElementById('city-active-'+id).checked,
     blacklisted: document.getElementById('city-blacklist-'+id).checked,
   };

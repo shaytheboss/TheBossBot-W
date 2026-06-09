@@ -134,7 +134,15 @@ def _parse_date(text: str) -> Optional[date]:
         try:
             day = int(day_str)
             year = int(year_str) if year_str else date.today().year
-            return date(year, month, day)
+            parsed = date(year, month, day)
+            # Year rollover: a "january-2" slug discovered in late December has
+            # no explicit year and would default to the CURRENT year — ~12
+            # months in the past — and get discarded. Markets are never listed
+            # more than a few weeks out, so a far-past date with an assumed
+            # year means the event is actually next year.
+            if not year_str and parsed < date.today() - timedelta(days=180):
+                parsed = date(year + 1, month, day)
+            return parsed
         except ValueError:
             continue
     return None
@@ -622,6 +630,13 @@ async def job_fetch_models():
                     await gfs_col.collect_ensemble_and_store(city.id, lat, lon, d, db)
                 except Exception as e:
                     logger.error(f"GFS ensemble job failed for {city.name} {d}: {e}")
+                try:
+                    await gfs_col.collect_ensemble_and_store(
+                        city.id, lat, lon, d, db,
+                        model="ecmwf_ifs025", source="ecmwf_ensemble",
+                    )
+                except Exception as e:
+                    logger.error(f"ECMWF ensemble job failed for {city.name} {d}: {e}")
 
 
 async def job_fetch_external_forecasts():
@@ -702,9 +717,11 @@ async def _fetch_polymarket_winning_outcomes(
 
     Returns (winning_outcome_ids, poly_resolved, note_str).
     winning_outcome_ids is the set of MarketOutcome.id records that Polymarket
-    says won (i.e. their YES token resolved to 1.0). poly_resolved=True means
-    Polymarket has marked at least one sub-market as resolved; False means the
-    event hasn't settled on their side yet (fall back to METAR).
+    says won (i.e. their YES token resolved to 1.0). poly_resolved=True is
+    only returned when a winning bucket was both found AND matched to a DB
+    outcome — partial resolutions (loser buckets settled early, winner still
+    open) and unmatched winners report False so callers retry later instead
+    of settling positions against an empty winner set.
     """
     token_id_to_outcome_id: dict[str, int] = {
         o.token_id: o.id for o in outcomes if o.token_id
@@ -795,12 +812,15 @@ async def _fetch_polymarket_winning_outcomes(
             # CRITICAL: never assume index 0 == Yes. Polymarket orders
             # outcomePrices / clobTokenIds to match the outcomes array, which
             # may be ["No", "Yes"]. Indexing [0] blindly mis-reads the Yes
-            # price for those markets and flips the winner.
-            def _yes_index(outcomes_arr: list) -> int:
+            # price for those markets and flips the winner. When no "Yes"
+            # label exists at all (malformed/missing outcomes array) we return
+            # None and let the explicit tokens[] fallback below decide —
+            # guessing index 0 could read the No price as Yes.
+            def _yes_index(outcomes_arr: list) -> Optional[int]:
                 for i, lbl in enumerate(outcomes_arr):
                     if str(lbl).strip().lower() == "yes":
                         return i
-                return 0  # fall back to first outcome (Polymarket default order)
+                return None
 
             any_resolved = False
             resolved_flags: list = []
@@ -827,7 +847,7 @@ async def _fetch_polymarket_winning_outcomes(
 
                 # Determine if YES won using the correctly-located Yes price.
                 yes_won = False
-                if yes_idx < len(prices_arr):
+                if yes_idx is not None and yes_idx < len(prices_arr):
                     try:
                         yes_won = float(prices_arr[yes_idx]) >= 0.99
                     except (ValueError, TypeError):
@@ -855,7 +875,7 @@ async def _fetch_polymarket_winning_outcomes(
                 # Match the winning bucket back to our MarketOutcome record.
                 # Strategy 1: YES token_id (located via the same yes_idx).
                 yes_token: Optional[str] = None
-                if yes_idx < len(tokens_arr) and tokens_arr[yes_idx]:
+                if yes_idx is not None and yes_idx < len(tokens_arr) and tokens_arr[yes_idx]:
                     yes_token = str(tokens_arr[yes_idx])
                 if not yes_token:
                     for tok in (m.get("tokens") or []):
@@ -890,6 +910,21 @@ async def _fetch_polymarket_winning_outcomes(
                     notes.append(f"{bucket_label} YES=1.0 (unmatched)")
 
             note = "Polymarket: " + (", ".join(notes) if notes else "resolved (no match)")
+
+            # SAFETY: never report "resolved" without an identified winning
+            # bucket. Polymarket sometimes resolves sub-markets at different
+            # times (impossible buckets settle early, the winner later) — and
+            # a winner may also fail to match a DB outcome. Settling positions
+            # against an EMPTY winner set would mark every YES as LOSS and
+            # every NO as WIN while the market is not actually decided. Treat
+            # such states as "not yet resolved" and retry on the next run.
+            if not winning_outcome_ids:
+                logger.info(
+                    f"_fetch_polymarket_winning_outcomes: {event_slug} has resolved "
+                    f"sub-markets but no identified winning bucket — deferring ({note})"
+                )
+                return frozenset(), False, note
+
             return frozenset(winning_outcome_ids), True, note
 
     except Exception as e:
@@ -1042,11 +1077,17 @@ async def job_check_resolutions():
                 continue
 
             # Always try to fetch METAR high (needed for alert display even when
-            # resolution source is Polymarket).
-            day_start = datetime(
+            # resolution source is Polymarket). The day window is the CITY'S
+            # LOCAL day — a UTC window includes the previous local evening and
+            # can show a contaminated "high" in the alert.
+            import pytz as _pytz
+            try:
+                _tz = _pytz.timezone(city.timezone) if city.timezone else _pytz.utc
+            except Exception:
+                _tz = _pytz.utc
+            day_start = _tz.localize(datetime(
                 market.event_date.year, market.event_date.month, market.event_date.day,
-                tzinfo=timezone.utc,
-            )
+            )).astimezone(timezone.utc)
             day_end = day_start + timedelta(days=1)
             temp_result = await db.execute(
                 select(sqlfunc.max(MetarObservation.temperature_f)).where(
@@ -1103,12 +1144,16 @@ async def job_check_resolutions():
             market.resolution_value = res_val
             _mark_outcome_winners(outcomes, winning_outcome_ids)
 
+            # Settle ALL unsettled opportunities on this market — not only the
+            # alerted ones. The detector records (and can open virtual buys on)
+            # every qualifying bucket while alerting only the best one; with an
+            # alert_sent filter the non-alerted positions stayed "open" forever
+            # until a manual "Resolve pending" sweep.
             opps_result = await db.execute(
                 select(Opportunity)
                 .join(MarketOutcome)
                 .where(
                     MarketOutcome.market_id == market.id,
-                    Opportunity.alert_sent == True,
                     Opportunity.outcome == None,
                 )
             )
