@@ -72,6 +72,7 @@ class CityCreateIn(BaseModel):
     wunderground_url: Optional[str] = None
     timezone: str = "America/Los_Angeles"
     buoy_id: Optional[str] = None
+    onshore_wind_dir: Optional[int] = None
     active: bool = True
 
 
@@ -824,6 +825,9 @@ async def admin_model_accuracy(
         .join(Market, Market.id == MarketOutcome.market_id)
         .join(City, City.id == Market.city_id)
         .where(Market.resolved == True, Opportunity.outcome.in_(["WIN", "LOSS"]))
+        # Ordered so the per-(market, model, day) dedup below keeps the LATEST
+        # forecast captured that day.
+        .order_by(Opportunity.detected_at)
     )
     if by_event:
         if from_dt is not None:
@@ -841,26 +845,35 @@ async def admin_model_accuracy(
     rows = (await db.execute(q)).all()
     winners_map = await _winning_bounds_map(db, {mid for _o, mid, _c in rows})
 
-    # tally[label] = [correct, total]; city_tally[city][label] = [correct, total]
-    tally: dict = {}
-    city_tally: dict = {}
+    # Dedupe per (market, model, detection-day): a market re-detected many
+    # times would otherwise be counted once per opportunity row and dominate
+    # the accuracy ranking. Rows are ordered by detected_at, so later
+    # detections of the same day overwrite earlier ones (latest forecast wins).
+    dedup: dict = {}
     for opp, mid, city_name in rows:
         winners = winners_map.get(mid, [])
         if not winners:
             continue  # market resolved but winner bucket not recorded yet
+        day = opp.detected_at.date() if opp.detected_at else None
         model_fc = _extract_model_forecasts(opp.signals)
         for label, high_f in model_fc.items():
-            correct = _forecast_f_in_bucket(high_f, winners)
-            if correct is None:
-                continue
-            t = tally.setdefault(label, [0, 0])
-            t[1] += 1
-            if correct:
-                t[0] += 1
-            ct = city_tally.setdefault(city_name or "—", {}).setdefault(label, [0, 0])
-            ct[1] += 1
-            if correct:
-                ct[0] += 1
+            dedup[(mid, label, day)] = (label, high_f, winners, city_name)
+
+    # tally[label] = [correct, total]; city_tally[city][label] = [correct, total]
+    tally: dict = {}
+    city_tally: dict = {}
+    for label, high_f, winners, city_name in dedup.values():
+        correct = _forecast_f_in_bucket(high_f, winners)
+        if correct is None:
+            continue
+        t = tally.setdefault(label, [0, 0])
+        t[1] += 1
+        if correct:
+            t[0] += 1
+        ct = city_tally.setdefault(city_name or "—", {}).setdefault(label, [0, 0])
+        ct[1] += 1
+        if correct:
+            ct[0] += 1
 
     def _rank(d: dict) -> list:
         items = [
@@ -1250,6 +1263,7 @@ async def admin_cities(_: str = Depends(require_admin), db: AsyncSession = Depen
             "buoy_id": c.buoy_id,
             "nws_lat": float(c.nws_lat) if c.nws_lat else None,
             "nws_lon": float(c.nws_lon) if c.nws_lon else None,
+            "onshore_wind_dir": getattr(c, "onshore_wind_dir", None),
             "active": c.active,
             "blacklisted": bool(getattr(c, "blacklisted", False)),
         }
@@ -1317,6 +1331,15 @@ async def admin_city_update(
         city.active = bool(payload["active"])
     if "blacklisted" in payload:
         city.blacklisted = bool(payload["blacklisted"])
+    if "onshore_wind_dir" in payload:
+        v = payload["onshore_wind_dir"]
+        if v is None or v == "":
+            city.onshore_wind_dir = None
+        else:
+            v = int(v)
+            if not (0 <= v <= 359):
+                raise HTTPException(400, "onshore_wind_dir must be 0-359 (compass degrees)")
+            city.onshore_wind_dir = v
     for k in ("nws_lat", "nws_lon"):
         if k in payload and payload[k] is not None:
             setattr(city, k, float(payload[k]))

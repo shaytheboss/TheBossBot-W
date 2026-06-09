@@ -82,6 +82,77 @@ STRADDLE_EXTRA_BLEND = 0.10
 _SPARSE_SOURCE_BASELINE = 5
 _SPARSE_SOURCE_SHRINK_PER_MISSING = 0.08   # 8pp per missing global source
 
+# Maps a signals forecast key to its source name in the forecasts table, so the
+# per-source bias learned by bias_estimator can be applied to the right model.
+_KEY_TO_BIAS_SOURCE: dict[str, str] = {
+    "gfs_forecast": "gfs",
+    "ecmwf_forecast": "ecmwf",
+    "hrrr_forecast": "hrrr",
+    "nws_forecast": "nws",
+    "tomorrowio_forecast": "tomorrowio",
+    "meteosource_forecast": "meteosource",
+    "icon_forecast": "icon",
+    "wunderground_forecast": "wunderground",
+}
+
+# Ensemble-spread sigma bounds: the blended sigma is clamped to this range so a
+# freak ensemble (collapsed or exploded) can't push the CDF into nonsense.
+_SIGMA_BLEND_MIN_F = 2.0
+_SIGMA_BLEND_MAX_F = 7.0
+# Raw ensembles systematically under-disperse vs realized error; standard
+# practice is to inflate the spread before using it as a sigma estimate.
+_ENSEMBLE_STD_INFLATION = 1.3
+_ENSEMBLE_MIN_FOR_SIGMA = 10   # need at least this many members to trust the spread
+
+# Per-city model weights are clamped so one hot streak can't dominate the blend.
+_MODEL_WEIGHT_MIN = 0.5
+_MODEL_WEIGHT_MAX = 1.5
+
+# Onshore wind tolerance: a reference-station wind within ±55° of the city's
+# configured onshore bearing counts as onshore (sea→land flow).
+_ONSHORE_TOLERANCE_DEG = 55
+
+
+def _source_bias(station_bias: dict, signals_key: str) -> float:
+    """Bias (°F) to add to this source's forecast before the CDF.
+
+    Prefers the per-source bias learned by bias_estimator; falls back to the
+    overall station bias, then to the +1.5°F prior.
+    """
+    overall = float((station_bias or {}).get("bias_f") or 1.5)
+    per_source = (station_bias or {}).get("per_source") or {}
+    src = _KEY_TO_BIAS_SOURCE.get(signals_key)
+    if src and src in per_source:
+        try:
+            return float(per_source[src])
+        except (TypeError, ValueError):
+            return overall
+    return overall
+
+
+def _effective_sigma(sigma_lead: float, ensemble_vals: list) -> tuple[float, Optional[float]]:
+    """Blend the lead-time sigma table with the actual ensemble spread.
+
+    On a synoptically quiet day the ensemble is tight and the fixed table is
+    too wide (under-confident); on a volatile day it's too narrow. When enough
+    members report, average the two estimates (with standard spread inflation)
+    and clamp. Returns (sigma, ensemble_std or None).
+    """
+    n = len(ensemble_vals)
+    if n < _ENSEMBLE_MIN_FOR_SIGMA:
+        return sigma_lead, None
+    mean_v = sum(ensemble_vals) / n
+    var = sum((v - mean_v) ** 2 for v in ensemble_vals) / (n - 1)
+    ens_std = math.sqrt(var)
+    blended = 0.5 * sigma_lead + 0.5 * (_ENSEMBLE_STD_INFLATION * ens_std)
+    return max(_SIGMA_BLEND_MIN_F, min(_SIGMA_BLEND_MAX_F, blended)), round(ens_std, 2)
+
+
+def _is_onshore(wind_dir: float, onshore_center_deg: float) -> bool:
+    """True when wind_dir is within ±_ONSHORE_TOLERANCE_DEG of the onshore bearing."""
+    diff = abs((wind_dir - onshore_center_deg + 180.0) % 360.0 - 180.0)
+    return diff <= _ONSHORE_TOLERANCE_DEG
+
 
 def _parse_coord(val) -> Optional[float]:
     if val is None:
@@ -341,30 +412,53 @@ def estimate_with_breakdown(
     is_low_market = signals.get("is_low_market", False)
     fc_key = "predicted_low_f" if is_low_market else "predicted_high_f"
     ensemble_key = "ensemble_lows" if is_low_market else "ensemble_highs"
-    p50_key = "p50_low_f" if is_low_market else "p50_high_f"
 
-    sigma = forecast_sigma_for_lead(days_ahead)
     observation_skipped = days_ahead is not None and days_ahead >= 1
-
-    # Open-ended buckets ("X or higher" / "X or lower") represent tail events where
-    # forecast errors are systematically larger than for bounded ranges.
-    # Apply a 1.5x sigma multiplier so the model is appropriately less certain.
     is_open_ended = (bucket_min is None) != (bucket_max is None)
-    if is_open_ended:
-        sigma = sigma * 1.5
 
     # Airport warm-bias correction: actual METAR daily highs are systematically
     # warmer than gridded NWP point forecasts (runway/urban heat island effect).
-    # We shift every model's point forecast UP by bias_f before computing P(in
-    # bucket), so the system doesn't overestimate the probability that the
-    # temperature stays below an upper bucket bound.
+    # Each model's point forecast is shifted UP by that model's learned bias
+    # (falling back to the overall station bias) before entering the CDF, so the
+    # system doesn't overestimate the probability that the temperature stays
+    # below an upper bucket bound.
     station_bias = signals.get("station_bias") or {}
     bias_f = float(station_bias.get("bias_f") or 1.5)
+
+    # Pool ensemble members from every available ensemble (GFS + ECMWF), each
+    # member shifted by its parent model's learned bias. Pooling reduces
+    # dependence on a single modelling centre and gives a larger sample for
+    # both the empirical bucket probability and the spread-based sigma below.
+    ensemble_key_pairs = (
+        ("gfs_ensemble", "gfs_forecast"),
+        ("ecmwf_ensemble", "ecmwf_forecast"),
+    )
+    ensemble_vals: list = []
+    ensemble_models: list[str] = []
+    for ens_key, parent_key in ensemble_key_pairs:
+        fc = signals.get(ens_key) or {}
+        members = fc.get(ensemble_key) or []
+        if members:
+            b = _source_bias(station_bias, parent_key)
+            ensemble_vals.extend(float(v) + b for v in members)
+            ensemble_models.append(ens_key)
+
+    # Sigma: start from the lead-time table, then blend in the actual ensemble
+    # spread when enough members report — a tight ensemble narrows sigma, a
+    # volatile one widens it. Open-ended buckets ("X or higher"/"X or lower")
+    # are tail events with systematically larger errors → 1.5x multiplier.
+    sigma_lead = forecast_sigma_for_lead(days_ahead)
+    sigma, ensemble_std_f = _effective_sigma(sigma_lead, ensemble_vals)
+    if is_open_ended:
+        sigma = sigma * 1.5
 
     breakdown: dict = {
         "is_low_market": bool(is_low_market),
         "days_ahead": int(days_ahead) if days_ahead is not None else None,
         "sigma_used": float(sigma),
+        "sigma_lead": float(sigma_lead),
+        "ensemble_std_f": ensemble_std_f,
+        "ensemble_models": ensemble_models,
         "is_open_ended": is_open_ended,
         "student_t_df": _STUDENT_T_DF,
         "observation_skipped": bool(observation_skipped),
@@ -394,8 +488,14 @@ def estimate_with_breakdown(
     # Which sources have no API key (passed in via signals from signal_aggregator)
     unavailable_api: set[str] = set(signals.get("_unavailable_api") or [])
 
+    # Per-city model weights learned from realized accuracy (signals key → weight,
+    # neutral 1.0). Clamped so one model's hot streak can't dominate the blend.
+    model_weights: dict = signals.get("model_weights") or {}
+
     det_probs: list[float] = []
     det_vals: list[float] = []
+    det_wp_sum = 0.0          # weighted sum of per-source probabilities
+    det_w_sum = 0.0           # sum of weights
     n_global_det = 0          # count of global (non-CONUS-only) sources with data
     missing_sources: list[str] = []        # global sources with no data
     missing_no_key: list[str] = []         # global sources whose API key is unconfigured
@@ -412,7 +512,7 @@ def estimate_with_breakdown(
             else:
                 missing_sources.append(label)
             continue
-        corrected_val = float(val) + bias_f
+        corrected_val = float(val) + _source_bias(station_bias, key)
         p = _student_t_bucket_prob(corrected_val, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
         if p is None:
             if not is_global:
@@ -422,13 +522,21 @@ def estimate_with_breakdown(
             continue
         if is_global:
             n_global_det += 1
+        try:
+            w = float(model_weights.get(key, 1.0))
+        except (TypeError, ValueError):
+            w = 1.0
+        w = max(_MODEL_WEIGHT_MIN, min(_MODEL_WEIGHT_MAX, w))
         det_probs.append(p)
         det_vals.append(float(corrected_val))
+        det_wp_sum += w * p
+        det_w_sum += w
         det_entry: dict = {
             "source": label,
             "value_f": float(corrected_val),
             "raw_value_f": float(val),
             "p_in_bucket": float(p),
+            "weight": round(w, 3),
         }
         lat_val = _parse_coord(src_data.get("used_lat"))
         if lat_val is not None:
@@ -437,20 +545,15 @@ def estimate_with_breakdown(
         if lon_val is not None:
             det_entry["used_lon"] = lon_val
         breakdown["deterministic"].append(det_entry)
-    det_p = sum(det_probs) / len(det_probs) if det_probs else None
+    det_p = (det_wp_sum / det_w_sum) if det_w_sum > 0 else None
     n_det = len(det_probs)
     breakdown["det_avg"] = float(det_p) if det_p is not None else None
     breakdown["missing_sources"] = missing_sources          # global, no data
     breakdown["missing_no_key"] = missing_no_key            # global, API key not configured
     breakdown["missing_conus_only"] = missing_conus_only    # CONUS-only, N/A for intl cities
 
-    ensemble_fc = signals.get("gfs_ensemble") or {}
-    raw_ensemble_vals = ensemble_fc.get(ensemble_key) or []
-    # Shift all ensemble members by the same bias — they have the same systematic
-    # cold bias as the deterministic GFS run.
-    ensemble_vals = [v + bias_f for v in raw_ensemble_vals] if raw_ensemble_vals else []
-    raw_p50 = ensemble_fc.get(p50_key)
-    biased_p50 = (float(raw_p50) + bias_f) if raw_p50 is not None else None
+    # ensemble_vals was pooled (and bias-shifted per parent model) above, before
+    # sigma was derived from its spread.
     ens_p = _ensemble_bucket_prob(ensemble_vals, bucket_min, bucket_max, unit=bucket_unit)
     if ens_p is not None:
         hits = sum(
@@ -458,18 +561,27 @@ def estimate_with_breakdown(
             if _bucket_contains(v, bucket_min, bucket_max, unit=bucket_unit)
         )
         n = len(ensemble_vals)
+        pooled_sorted = sorted(ensemble_vals)
+        pooled_median = pooled_sorted[n // 2] if n else None
         breakdown["ensemble"] = {
             "n": n,
             "hits": hits,
-            "median_f": biased_p50,
+            "median_f": round(pooled_median, 1) if pooled_median is not None else None,
             "raw_pct": round(100 * hits / n, 1) if n else None,
             "smoothed_pct": round(100 * ens_p, 1),
+            "models": ensemble_models,
         }
     breakdown["ens_p"] = float(ens_p) if ens_p is not None else None
 
     wg_src = signals.get("wunderground_forecast") or {}
     wg_val = wg_src.get(fc_key)
-    wg_corrected = (float(wg_val) + bias_f) if wg_val is not None else None
+    # Wunderground gets its own learned bias: it is station-anchored (often the
+    # airport itself) so its bias is naturally near zero — the generic NWP warm
+    # bias would over-correct it.
+    wg_corrected = (
+        (float(wg_val) + _source_bias(station_bias, "wunderground_forecast"))
+        if wg_val is not None else None
+    )
     wg_p = _student_t_bucket_prob(wg_corrected, bucket_min, bucket_max, sigma=sigma, unit=bucket_unit)
     if wg_val is not None:
         wg_entry: dict = {
@@ -616,9 +728,19 @@ def estimate_with_breakdown(
             })
 
     if not observation_skipped:
-        # F-equivalent bucket floor for warm-bucket checks
-        f_lo_w, _ = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
-        bucket_requires_warmth = f_lo_w is not None and f_lo_w >= 66
+        # Warm-bucket check uses the NATIVE bucket floor converted to °F — NOT
+        # the half-bin-shifted CDF bound from _bucket_to_f_bounds. The half-bin
+        # turns a "≥66°F" floor into 65.5, which fails the >=66 test and flips
+        # the wind heuristic (an onshore cool wind then BOOSTS the warm bucket
+        # instead of dampening it).
+        if bucket_min is not None:
+            native_floor_f = (
+                bucket_min * 9.0 / 5.0 + 32.0 if bucket_unit == "C"
+                else float(bucket_min)
+            )
+        else:
+            native_floor_f = None
+        bucket_requires_warmth = native_floor_f is not None and native_floor_f >= 66
 
         p_before = p
         trend = signals.get("metar_trend") or {}
@@ -637,8 +759,17 @@ def estimate_with_breakdown(
         ref = signals.get("reference_metar") or {}
         ref_wind_dir = ref.get("wind_direction")
         ref_wind_kt = ref.get("wind_speed_kt", 0) or 0
-        if ref_wind_dir is not None and ref_wind_kt > 8:
-            onshore = 270 <= ref_wind_dir <= 340
+        # Onshore (sea→land) wind suppresses the daytime max. The onshore
+        # bearing is city-specific (west coast ≈ 270-340°, Miami ≈ east, etc.)
+        # and comes from City.onshore_wind_dir via signals. When the city has
+        # no configured bearing the heuristic is skipped entirely — a wrong
+        # hardcoded direction is worse than no adjustment.
+        onshore_center = signals.get("_onshore_wind_dir")
+        if (
+            ref_wind_dir is not None and ref_wind_kt > 8
+            and onshore_center is not None
+        ):
+            onshore = _is_onshore(float(ref_wind_dir), float(onshore_center))
             if onshore and bucket_requires_warmth:
                 p *= 0.85
             elif onshore and not bucket_requires_warmth:

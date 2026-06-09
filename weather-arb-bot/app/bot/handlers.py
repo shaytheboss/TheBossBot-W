@@ -95,7 +95,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from app.models.market import Market, MarketOutcome
     from app.analyzers.signal_aggregator import SignalAggregator
     from app.analyzers.probability_estimator import estimate_true_probability
-    from app.analyzers.confidence_scorer import compute_confidence
 
     await update.message.reply_text(
         "\U0001f50d Scanning Polymarket… building candidate slugs and querying Gamma."
@@ -177,7 +176,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     price_info = signals.get("market_price")
                     true_prob = estimate_true_probability(signals, outcome.bucket_min, outcome.bucket_max)
-                    confidence = compute_confidence(signals, outcome.bucket_min, outcome.bucket_max)
+                    # Unified with the detector/dashboard: confidence is the
+                    # certainty of the better side from the probability
+                    # estimate, not the legacy heuristic score.
+                    confidence = int(round(max(true_prob, 1.0 - true_prob) * 100))
                     label = outcome.bucket_label[:32]
 
                     if price_info:

@@ -6,7 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.analyzers.signal_aggregator import SignalAggregator
-from app.analyzers.probability_estimator import estimate_with_breakdown
+from app.analyzers.probability_estimator import (
+    estimate_with_breakdown,
+    _clip as _prob_clip,
+)
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.config import settings
 from app.models.city import City
@@ -25,14 +28,39 @@ SHARES_PER_BUY = 5
 
 def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
     fallback = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
+
+    def _or_fallback(name: str) -> float:
+        # `is None` (not `or`) so an explicit 0.0 threshold is respected.
+        v = getattr(settings, name, None)
+        return fallback if v is None else float(v)
+
     if days_ahead is not None and days_ahead >= 2:
-        alert_t = getattr(settings, "min_confidence_alert_far", None) or fallback
-        buy_t = getattr(settings, "min_confidence_buy_far", None) or fallback
+        alert_t = _or_fallback("min_confidence_alert_far")
+        buy_t = _or_fallback("min_confidence_buy_far")
     else:
-        alert_t = getattr(settings, "min_confidence_alert_near", None) or fallback
-        buy_t = getattr(settings, "min_confidence_buy_near", None) or fallback
+        alert_t = _or_fallback("min_confidence_alert_near")
+        buy_t = _or_fallback("min_confidence_buy_near")
     buy_t = max(buy_t, alert_t)
     return alert_t, buy_t
+
+
+def normalization_scale(raw_probs: list, n_market_outcomes: int) -> Optional[float]:
+    """Scale factor that makes the market's bucket probabilities sum to 1.
+
+    Returns None (= skip normalization) when:
+    - some of the market's buckets are missing from raw_probs (no price or no
+      forecast data). Rescaling a PARTIAL set inflates the surviving buckets'
+      probabilities — the missing buckets' probability mass gets redistributed
+      to buckets it doesn't belong to.
+    - the total is implausibly small (< 0.1), which signals a data problem
+      rather than a distribution to renormalize.
+    """
+    if len(raw_probs) != n_market_outcomes:
+        return None
+    total = sum(raw_probs)
+    if total <= 0.1:
+        return None
+    return 1.0 / total
 
 
 SKIP_QUESTION_KEYWORDS = ("lowest", "daily low", "low temperature", "minimum temp")
@@ -46,11 +74,12 @@ def _should_skip_market(question: Optional[str]) -> bool:
 
 
 async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -> bool:
-    """True if any opportunity was already created for this outcome today."""
+    """True if an opportunity for this outcome AND side was already created today."""
     today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
     q = await db.execute(
         select(Opportunity.id).where(
             Opportunity.outcome_id == outcome_id,
+            Opportunity.side == side,
             Opportunity.detected_at >= today_start,
         ).limit(1)
     )
@@ -153,6 +182,8 @@ async def _collect_outcome_data(
         is_low_market=is_low_market,
         city_lat=city_lat,
         city_lon=city_lon,
+        city_tz=city.timezone,
+        onshore_wind_dir=getattr(city, "onshore_wind_dir", None),
     )
 
     price_info = signals.get("market_price")
@@ -354,13 +385,23 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         if not outcome_data:
             continue
 
-        # Phase 2: C -- normalize so all bucket probabilities sum to 1
-        total_raw = sum(d["raw_prob"] for d in outcome_data)
-        if total_raw > 0.1:
-            scale = 1.0 / total_raw
+        # Phase 2: normalize so all bucket probabilities sum to 1 — but ONLY
+        # when every bucket of the market produced data. Normalizing a partial
+        # set redistributes the missing buckets' probability mass to the wrong
+        # buckets and inflates confidence artificially.
+        scale = normalization_scale(
+            [d["raw_prob"] for d in outcome_data], len(outcomes)
+        )
+        if scale is not None:
             for d in outcome_data:
-                d["normalized_prob"] = d["raw_prob"] * scale
+                # Re-clip AFTER scaling: normalization with scale > 1 can push
+                # a probability past the 92% cap the estimator enforces; the
+                # cap is a hard "no signal may claim more" rule, so re-apply.
+                d["normalized_prob"] = _prob_clip(d["raw_prob"] * scale)
                 d["breakdown"]["normalization_scale"] = round(scale, 4)
+        else:
+            for d in outcome_data:
+                d["breakdown"]["normalization_scale"] = None
         # Record the post-normalization probability so the alert's math
         # walkthrough shows the same final number as the headline estimate.
         for d in outcome_data:

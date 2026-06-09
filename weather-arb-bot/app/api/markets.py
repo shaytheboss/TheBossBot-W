@@ -10,7 +10,6 @@ from app.database import get_db
 from app.models.market import Market, MarketOutcome, MarketPrice
 from app.analyzers.signal_aggregator import SignalAggregator
 from app.analyzers.probability_estimator import estimate_true_probability
-from app.analyzers.confidence_scorer import compute_confidence
 from app.models.city import City
 from app.utils.units import resolve_bucket_unit
 
@@ -87,9 +86,11 @@ async def market_analysis(market_id: int, db: AsyncSession = Depends(get_db)):
         true_prob = estimate_true_probability(
             signals, outcome.bucket_min, outcome.bucket_max, bucket_unit=bucket_unit
         )
-        confidence = compute_confidence(
-            signals, outcome.bucket_min, outcome.bucket_max, bucket_unit=bucket_unit
-        )
+        # Same definition the detector and dashboard use: certainty of the
+        # better side, derived from the probability estimate. The legacy
+        # heuristic compute_confidence() produced a different number under
+        # the same "confidence" name.
+        confidence = int(round(max(true_prob, 1.0 - true_prob) * 100))
         market_price = (signals.get("market_price") or {}).get("yes_price")
         edge = (true_prob - market_price) if market_price is not None else None
         analysis.append({

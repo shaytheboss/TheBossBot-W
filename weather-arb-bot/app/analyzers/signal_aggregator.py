@@ -31,6 +31,7 @@ from app.models.pirep import Pirep
 from app.models.market import MarketPrice, MarketOutcome
 from app.utils.units import resolve_bucket_unit
 from app.analyzers.bias_estimator import get_station_bias
+from app.analyzers.model_weights import get_city_model_weights
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -62,13 +63,15 @@ class SignalAggregator:
         is_low_market: bool = False,
         city_lat: Optional[float] = None,
         city_lon: Optional[float] = None,
+        city_tz: Optional[str] = None,
+        onshore_wind_dir: Optional[int] = None,
     ) -> dict:
         signals = {}
         signals["primary_metar"] = await self._latest_metar(db, primary_icao)
         if reference_icao:
             signals["reference_metar"] = await self._latest_metar(db, reference_icao)
         signals["metar_trend"] = await self._metar_trend(db, primary_icao, hours=3)
-        signals["metar_today_max_f"] = await self._today_max_temp(db, primary_icao)
+        signals["metar_today_max_f"] = await self._today_max_temp(db, primary_icao, city_tz)
         signals["wunderground_forecast"] = await self._latest_forecast(db, city_id, "wunderground", forecast_date)
         signals["gfs_forecast"] = await self._latest_forecast(db, city_id, "gfs", forecast_date)
         signals["ecmwf_forecast"] = await self._latest_forecast(db, city_id, "ecmwf", forecast_date)
@@ -78,8 +81,15 @@ class SignalAggregator:
         signals["meteosource_forecast"] = await self._latest_forecast(db, city_id, "meteosource", forecast_date)
         signals["icon_forecast"] = await self._latest_forecast(db, city_id, "icon", forecast_date)
         signals["gfs_ensemble"] = await self._latest_forecast(db, city_id, "gfs_ensemble", forecast_date)
+        signals["ecmwf_ensemble"] = await self._latest_forecast(db, city_id, "ecmwf_ensemble", forecast_date)
         signals["pireps"] = await self._recent_pireps(db, primary_icao, hours=2)
-        signals["station_bias"] = await get_station_bias(db, city_id, primary_icao)
+        signals["station_bias"] = await get_station_bias(
+            db, city_id, primary_icao, tz_name=city_tz or "UTC"
+        )
+        signals["model_weights"] = await get_city_model_weights(db, city_id)
+        # City-specific onshore (sea→land) wind bearing; None disables the
+        # wind heuristics in the estimator and confidence scorer.
+        signals["_onshore_wind_dir"] = onshore_wind_dir
 
         # Tell the probability estimator which global sources have no API key configured.
         # These are shown differently in alerts ("API key not configured") vs genuinely
@@ -138,17 +148,30 @@ class SignalAggregator:
             .order_by(MetarObservation.observed_at)
         )
         rows = result.scalars().all()
-        if len(rows) < 2:
+        # Rate must be computed over the SAME rows the endpoint values come
+        # from — pairing filtered temps with the unfiltered rows' timestamps
+        # skews the rate whenever some observations are missing a temperature.
+        temp_rows = [r for r in rows if r.temperature_f is not None]
+        if len(temp_rows) < 2:
             return None
-        temps = [float(r.temperature_f) for r in rows if r.temperature_f is not None]
-        dews = [float(r.dew_point_f) for r in rows if r.dew_point_f is not None]
-        if len(temps) < 2:
-            return None
-        hours_span = (rows[-1].observed_at - rows[0].observed_at).total_seconds() / 3600
+        temps = [float(r.temperature_f) for r in temp_rows]
+        hours_span = (
+            temp_rows[-1].observed_at - temp_rows[0].observed_at
+        ).total_seconds() / 3600
         if hours_span == 0:
             return None
         temp_rate = (temps[-1] - temps[0]) / hours_span
-        dew_rate = (dews[-1] - dews[0]) / hours_span if len(dews) >= 2 else None
+
+        dew_rows = [r for r in rows if r.dew_point_f is not None]
+        dew_rate = None
+        if len(dew_rows) >= 2:
+            dew_span = (
+                dew_rows[-1].observed_at - dew_rows[0].observed_at
+            ).total_seconds() / 3600
+            if dew_span > 0:
+                dew_rate = (
+                    float(dew_rows[-1].dew_point_f) - float(dew_rows[0].dew_point_f)
+                ) / dew_span
         return {
             "temp_rate_per_hour": round(temp_rate, 2),
             "dew_rate_per_hour": round(dew_rate, 2) if dew_rate is not None else None,
@@ -157,14 +180,27 @@ class SignalAggregator:
             "span_hours": round(hours_span, 2),
         }
 
-    async def _today_max_temp(self, db, icao) -> Optional[float]:
-        """Running maximum of today's METAR observations (UTC day)."""
-        today = date.today()
-        day_start = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+    async def _today_max_temp(self, db, icao, tz_name: Optional[str] = None) -> Optional[float]:
+        """Running maximum of today's METAR observations.
+
+        "Today" is the CITY'S LOCAL day (City.timezone) — a UTC day window
+        includes the previous local evening for US cities, contaminating the
+        running max with yesterday's late-afternoon warmth.
+        """
+        import pytz
+        try:
+            tz = pytz.timezone(tz_name) if tz_name else pytz.utc
+        except Exception:
+            tz = pytz.utc
+        now_local = datetime.now(tz)
+        day_start_local = tz.localize(
+            datetime(now_local.year, now_local.month, now_local.day)
+        )
+        day_start_utc = day_start_local.astimezone(timezone.utc)
         result = await db.execute(
             select(sqlfunc.max(MetarObservation.temperature_f)).where(
                 MetarObservation.icao == icao,
-                MetarObservation.observed_at >= day_start,
+                MetarObservation.observed_at >= day_start_utc,
             )
         )
         val = result.scalar_one_or_none()

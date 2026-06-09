@@ -35,13 +35,27 @@ def _base_signals(**overrides) -> dict:
 
 
 def test_forecast_in_bucket_raises_prob():
-    signals = _base_signals(
+    # Relative assertion: forecasts inside the bucket must yield a clearly
+    # higher probability than forecasts outside it. (The old absolute p > 0.5
+    # check predates the recalibrated sigma table and bias correction — a
+    # 2°F-wide bucket can't reach 50% under an honest ~4°F sigma.)
+    base = dict(station_bias={"bias_f": 0.0, "is_default": False, "samples": 14})
+    signals_in = _base_signals(
         wunderground_forecast={"predicted_high_f": 65},
         gfs_forecast={"predicted_high_f": 64},
         ecmwf_forecast={"predicted_high_f": 65},
+        **base,
     )
-    p = estimate_true_probability(signals, bucket_min=64, bucket_max=65)
-    assert p > 0.50
+    p_in = estimate_true_probability(signals_in, bucket_min=64, bucket_max=65)
+    signals_out = _base_signals(
+        wunderground_forecast={"predicted_high_f": 72},
+        gfs_forecast={"predicted_high_f": 73},
+        ecmwf_forecast={"predicted_high_f": 72},
+        **base,
+    )
+    p_out = estimate_true_probability(signals_out, bucket_min=64, bucket_max=65)
+    assert p_in > p_out
+    assert p_in > 1.5 * p_out
 
 
 def test_forecast_outside_bucket_lowers_prob():
@@ -55,17 +69,37 @@ def test_forecast_outside_bucket_lowers_prob():
 
 
 def test_coastal_wind_dampens_warm_bucket():
+    # The onshore bearing is per-city (City.onshore_wind_dir → signals);
+    # 305° matches the 310° reference wind here (west-coast configuration).
     signals = _base_signals(
         reference_metar={"temperature_f": 58.0, "wind_direction": 310, "wind_speed_kt": 18},
         wunderground_forecast={"predicted_high_f": 67},
+        _onshore_wind_dir=305,
     )
     p_with_wind = estimate_true_probability(signals, bucket_min=66, bucket_max=None)
     signals_no_wind = _base_signals(
         reference_metar={"temperature_f": 65.0, "wind_direction": 180, "wind_speed_kt": 5},
         wunderground_forecast={"predicted_high_f": 67},
+        _onshore_wind_dir=305,
     )
     p_no_wind = estimate_true_probability(signals_no_wind, bucket_min=66, bucket_max=None)
     assert p_with_wind < p_no_wind
+
+
+def test_wind_heuristic_skipped_without_onshore_config():
+    # Without City.onshore_wind_dir the wind adjustment must not run at all —
+    # a hardcoded direction acts in the WRONG direction for east-coast and
+    # international cities.
+    kw = dict(
+        reference_metar={"temperature_f": 58.0, "wind_direction": 310, "wind_speed_kt": 18},
+        wunderground_forecast={"predicted_high_f": 67},
+    )
+    p_no_cfg = estimate_true_probability(_base_signals(**kw), bucket_min=66, bucket_max=None)
+    p_cfg = estimate_true_probability(
+        _base_signals(_onshore_wind_dir=305, **kw), bucket_min=66, bucket_max=None
+    )
+    # Configured onshore wind dampens; unconfigured leaves p untouched (higher).
+    assert p_cfg < p_no_cfg
 
 
 def test_probability_always_in_range():
