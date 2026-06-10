@@ -26,6 +26,23 @@ _poly_col = PolymarketCollector()
 MAX_BOOK_SPREAD = 0.10
 SHARES_PER_BUY = 5
 
+# ── Side-alert dedup (in-memory, cleared daily) ──────────────────────────────
+# Side alerts (open-position and bucket-switch) have no DB record, so without
+# dedup they fire on every analyzer cycle (~5 min) for the rest of the day.
+# We track sent keys per calendar day and skip repeats.
+_side_alert_date: Optional[date] = None
+_open_position_alerts_sent: set[tuple] = set()   # (outcome_id, side)
+_bucket_switch_alerts_sent: set[tuple] = set()   # (market_id, new_outcome_id, old_ids_frozenset)
+
+
+def _reset_side_dedup_if_new_day() -> None:
+    global _side_alert_date, _open_position_alerts_sent, _bucket_switch_alerts_sent
+    today = date.today()
+    if _side_alert_date != today:
+        _side_alert_date = today
+        _open_position_alerts_sent.clear()
+        _bucket_switch_alerts_sent.clear()
+
 
 def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
     fallback = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
@@ -381,23 +398,27 @@ async def _evaluate_opportunity(
     create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted and not is_suspended
 
     # Dedup: if a same-day opportunity for this outcome+side already exists,
-    # skip creating a new record — but emit a side alert when the signal is
-    # high-confidence so the user knows it's still firing.
+    # skip creating a new record — but emit a side alert (once per day) when the
+    # signal is high-confidence so the user knows it's still firing.
     if await _has_opportunity_today(db, outcome.id, side):
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} today")
         if certainty >= buy_thresh:
-            return None, {
-                "type": "open_position",
-                "city_name": city.name,
-                "bucket_label": outcome.bucket_label,
-                "market_question": market.question,
-                "side": side,
-                "certainty": round(certainty, 4),
-                "calibrated_certainty": round(calibrated_certainty, 4),
-                "edge": round(edge, 4),
-                "entry_cost": round(entry_cost, 4),
-                "event_date": market.event_date,
-            }
+            _reset_side_dedup_if_new_day()
+            key = (outcome.id, side)
+            if key not in _open_position_alerts_sent:
+                _open_position_alerts_sent.add(key)
+                return None, {
+                    "type": "open_position",
+                    "city_name": city.name,
+                    "bucket_label": outcome.bucket_label,
+                    "market_question": market.question,
+                    "side": side,
+                    "certainty": round(certainty, 4),
+                    "calibrated_certainty": round(calibrated_certainty, 4),
+                    "edge": round(edge, 4),
+                    "entry_cost": round(entry_cost, 4),
+                    "event_date": market.event_date,
+                }
         return None, None
 
     prior_opp = await _get_prior_opportunity(db, outcome.id, side)
@@ -562,13 +583,19 @@ async def detect_opportunities(
 
         # Bucket-switch detection: if any new opportunity targets a different
         # bucket than an already-open virtual position on the same market,
-        # emit a side alert suggesting the switch.
+        # emit a side alert (once per day per unique switch) suggesting the switch.
+        _reset_side_dedup_if_new_day()
         for opp in new_opps_this_market:
             try:
                 siblings = await _get_open_sibling_positions(
                     db, market.id, opp.outcome_id
                 )
                 if siblings:
+                    old_ids = frozenset(row.mo_id for row in siblings)
+                    switch_key = (market.id, opp.outcome_id, old_ids)
+                    if switch_key in _bucket_switch_alerts_sent:
+                        continue
+                    _bucket_switch_alerts_sent.add(switch_key)
                     old_labels = [row.bucket_label for row in siblings]
                     old_entry_prices = [
                         float(row.Opportunity.virtual_entry_price or 0)
