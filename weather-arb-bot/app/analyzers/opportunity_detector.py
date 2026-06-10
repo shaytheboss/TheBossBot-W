@@ -26,6 +26,51 @@ _poly_col = PolymarketCollector()
 MAX_BOOK_SPREAD = 0.10
 SHARES_PER_BUY = 5
 
+# ── Side-alert dedup (in-memory, cleared daily) ────────────────────────────────────────────
+# Open-position alerts re-fire whenever confidence changes by >= 1pp since
+# the last sent alert. Entry price is NOT a trigger — it fluctuates many
+# times a day and doesn’t warrant a new notification on its own.
+# Bucket-switch alerts fire once per unique (market, new-bucket, old-buckets) per day.
+_side_alert_date: Optional[date] = None
+# (outcome_id, side) -> last sent certainty (float 0-1)
+_open_position_last_sent: dict[tuple, float] = {}
+_bucket_switch_alerts_sent: set[tuple] = set()   # (market_id, new_outcome_id, old_ids_frozenset)
+
+OPEN_POS_REALERT_CONF_DELTA = 0.01    # 1 percentage point
+
+
+def _reset_side_dedup_if_new_day() -> None:
+    global _side_alert_date
+    today = date.today()
+    if _side_alert_date != today:
+        _side_alert_date = today
+        _open_position_last_sent.clear()
+        _bucket_switch_alerts_sent.clear()
+
+
+def _open_position_alert_due(
+    outcome_id: int, side: str, certainty: float
+) -> tuple[bool, Optional[str]]:
+    """Decide whether to (re-)send the open-position alert.
+
+    Returns (should_send, change_note). First occurrence today always sends
+    (change_note=None). Re-fires whenever confidence moves >= 1pp since the
+    last alert; the note states direction and magnitude clearly.
+    """
+    key = (outcome_id, side)
+    last_cert = _open_position_last_sent.get(key)
+    if last_cert is None:
+        _open_position_last_sent[key] = certainty
+        return True, None
+
+    conf_delta = certainty - last_cert
+    if abs(conf_delta) < OPEN_POS_REALERT_CONF_DELTA - 1e-9:
+        return False, None
+
+    _open_position_last_sent[key] = certainty
+    arrow = "↑" if conf_delta > 0 else "↓"
+    return True, f"confidence {arrow}{abs(round(conf_delta * 100))}pp"
+
 
 def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
     fallback = max(0.0, min(1.0, settings.min_confidence_for_alert / 100.0))
@@ -382,22 +427,29 @@ async def _evaluate_opportunity(
 
     # Dedup: if a same-day opportunity for this outcome+side already exists,
     # skip creating a new record — but emit a side alert when the signal is
-    # high-confidence so the user knows it's still firing.
+    # high-confidence. First occurrence today sends; later cycles re-send only
+    # on a material change (confidence >= 3pp or entry price >= 5¢ movement).
     if await _has_opportunity_today(db, outcome.id, side):
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} today")
         if certainty >= buy_thresh:
-            return None, {
-                "type": "open_position",
-                "city_name": city.name,
-                "bucket_label": outcome.bucket_label,
-                "market_question": market.question,
-                "side": side,
-                "certainty": round(certainty, 4),
-                "calibrated_certainty": round(calibrated_certainty, 4),
-                "edge": round(edge, 4),
-                "entry_cost": round(entry_cost, 4),
-                "event_date": market.event_date,
-            }
+            _reset_side_dedup_if_new_day()
+            should_send, change_note = _open_position_alert_due(
+                outcome.id, side, certainty
+            )
+            if should_send:
+                return None, {
+                    "type": "open_position",
+                    "city_name": city.name,
+                    "bucket_label": outcome.bucket_label,
+                    "market_question": market.question,
+                    "side": side,
+                    "certainty": round(certainty, 4),
+                    "calibrated_certainty": round(calibrated_certainty, 4),
+                    "edge": round(edge, 4),
+                    "entry_cost": round(entry_cost, 4),
+                    "event_date": market.event_date,
+                    "change_note": change_note,
+                }
         return None, None
 
     prior_opp = await _get_prior_opportunity(db, outcome.id, side)
@@ -562,13 +614,19 @@ async def detect_opportunities(
 
         # Bucket-switch detection: if any new opportunity targets a different
         # bucket than an already-open virtual position on the same market,
-        # emit a side alert suggesting the switch.
+        # emit a side alert (once per day per unique switch) suggesting the switch.
+        _reset_side_dedup_if_new_day()
         for opp in new_opps_this_market:
             try:
                 siblings = await _get_open_sibling_positions(
                     db, market.id, opp.outcome_id
                 )
                 if siblings:
+                    old_ids = frozenset(row.mo_id for row in siblings)
+                    switch_key = (market.id, opp.outcome_id, old_ids)
+                    if switch_key in _bucket_switch_alerts_sent:
+                        continue
+                    _bucket_switch_alerts_sent.add(switch_key)
                     old_labels = [row.bucket_label for row in siblings]
                     old_entry_prices = [
                         float(row.Opportunity.virtual_entry_price or 0)

@@ -112,13 +112,30 @@ def _fmt_open_position_alert(alert: dict) -> str:
     edge_cents = int(round(alert["edge"] * 100))
     entry_cents = int(round(alert["entry_cost"] * 100))
     calib_note = f" (calibrated: {cal_conf}%)" if cal_conf != conf else ""
+    change_note = alert.get("change_note")
+    if change_note:
+        headline = "🔁 *SIGNAL UPDATE — BUY ALREADY OPEN*"
+        change_line = f"\n📊 *What changed:* {change_note}\n"
+        footer = (
+            "_The numbers moved materially since the last alert on this outcome. "
+            "Not entering a new trade — a virtual buy is already open. "
+            "Review if manually trading._"
+        )
+    else:
+        headline = "🔁 *SIGNAL STILL FIRING — BUY ALREADY OPEN*"
+        change_line = ""
+        footer = (
+            "_The signal has not changed direction. "
+            "Monitor or consider scaling if manually trading._"
+        )
     return (
-        f"🔁 *SIGNAL STILL FIRING — BUY ALREADY OPEN*\n\n"
+        f"{headline}\n\n"
         f"📍 *{alert['city_name']}* — {alert['side']} on _{alert['bucket_label']}_\n"
-        f"📅 {alert['event_date'].strftime('%b %d')}\n\n"
+        f"📅 {alert['event_date'].strftime('%b %d')}\n"
+        f"{change_line}\n"
         f"Confidence: *{conf}%*{calib_note}  |  Edge: +{edge_cents}¢  |  Entry: {entry_cents}¢\n\n"
         f"A virtual buy is already open on this outcome today — no new position was created.\n"
-        f"_The signal has not changed direction. Monitor or consider scaling if manually trading._"
+        f"{footer}"
     )
 
 
