@@ -29,19 +29,60 @@ SHARES_PER_BUY = 5
 # ── Side-alert dedup (in-memory, cleared daily) ──────────────────────────────
 # Side alerts (open-position and bucket-switch) have no DB record, so without
 # dedup they fire on every analyzer cycle (~5 min) for the rest of the day.
-# We track sent keys per calendar day and skip repeats.
+# Open-position alerts re-fire only on a MATERIAL change since the last sent
+# alert (confidence moved >= 3pp or entry price moved >= 5 cents) — stable
+# signals stay quiet, moving ones surface. Bucket-switch alerts fire once per
+# unique switch per day.
 _side_alert_date: Optional[date] = None
-_open_position_alerts_sent: set[tuple] = set()   # (outcome_id, side)
+# (outcome_id, side) -> (certainty, entry_cost) at last sent alert
+_open_position_last_sent: dict[tuple, tuple] = {}
 _bucket_switch_alerts_sent: set[tuple] = set()   # (market_id, new_outcome_id, old_ids_frozenset)
+
+OPEN_POS_REALERT_CONF_DELTA = 0.03    # 3 percentage points
+OPEN_POS_REALERT_PRICE_DELTA = 0.05   # 5 cents
 
 
 def _reset_side_dedup_if_new_day() -> None:
-    global _side_alert_date, _open_position_alerts_sent, _bucket_switch_alerts_sent
+    global _side_alert_date
     today = date.today()
     if _side_alert_date != today:
         _side_alert_date = today
-        _open_position_alerts_sent.clear()
+        _open_position_last_sent.clear()
         _bucket_switch_alerts_sent.clear()
+
+
+def _open_position_alert_due(
+    outcome_id: int, side: str, certainty: float, entry_cost: float
+) -> tuple[bool, Optional[str]]:
+    """Decide whether to (re-)send the open-position alert.
+
+    Returns (should_send, change_note). First occurrence today always sends
+    (change_note=None). Re-sends only when confidence or entry price moved
+    materially, with a short human-readable note describing what changed.
+    """
+    key = (outcome_id, side)
+    last = _open_position_last_sent.get(key)
+    if last is None:
+        _open_position_last_sent[key] = (certainty, entry_cost)
+        return True, None
+
+    last_cert, last_cost = last
+    conf_delta = certainty - last_cert
+    cost_delta = entry_cost - last_cost
+    # epsilon guards float artifacts (0.94 - 0.91 == 0.0299999…)
+    eps = 1e-9
+    changes = []
+    if abs(conf_delta) >= OPEN_POS_REALERT_CONF_DELTA - eps:
+        arrow = "↑" if conf_delta > 0 else "↓"
+        changes.append(f"confidence {arrow}{abs(round(conf_delta * 100))}pp")
+    if abs(cost_delta) >= OPEN_POS_REALERT_PRICE_DELTA - eps:
+        arrow = "↑" if cost_delta > 0 else "↓"
+        changes.append(f"entry price {arrow}{abs(round(cost_delta * 100))}¢")
+    if not changes:
+        return False, None
+
+    _open_position_last_sent[key] = (certainty, entry_cost)
+    return True, " | ".join(changes)
 
 
 def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
@@ -398,15 +439,17 @@ async def _evaluate_opportunity(
     create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted and not is_suspended
 
     # Dedup: if a same-day opportunity for this outcome+side already exists,
-    # skip creating a new record — but emit a side alert (once per day) when the
-    # signal is high-confidence so the user knows it's still firing.
+    # skip creating a new record — but emit a side alert when the signal is
+    # high-confidence. First occurrence today sends; later cycles re-send only
+    # on a material change (confidence >= 3pp or entry price >= 5¢ movement).
     if await _has_opportunity_today(db, outcome.id, side):
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} today")
         if certainty >= buy_thresh:
             _reset_side_dedup_if_new_day()
-            key = (outcome.id, side)
-            if key not in _open_position_alerts_sent:
-                _open_position_alerts_sent.add(key)
+            should_send, change_note = _open_position_alert_due(
+                outcome.id, side, certainty, entry_cost
+            )
+            if should_send:
                 return None, {
                     "type": "open_position",
                     "city_name": city.name,
@@ -418,6 +461,7 @@ async def _evaluate_opportunity(
                     "edge": round(edge, 4),
                     "entry_cost": round(entry_cost, 4),
                     "event_date": market.event_date,
+                    "change_note": change_note,
                 }
         return None, None
 
