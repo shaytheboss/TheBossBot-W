@@ -26,20 +26,17 @@ _poly_col = PolymarketCollector()
 MAX_BOOK_SPREAD = 0.10
 SHARES_PER_BUY = 5
 
-# ── Side-alert dedup (in-memory, cleared daily) ──────────────────────────────
-# Side alerts (open-position and bucket-switch) have no DB record, so without
-# dedup they fire on every analyzer cycle (~5 min) for the rest of the day.
-# Open-position alerts re-fire only on a MATERIAL change since the last sent
-# alert (confidence moved >= 3pp or entry price moved >= 5 cents) — stable
-# signals stay quiet, moving ones surface. Bucket-switch alerts fire once per
-# unique switch per day.
+# ── Side-alert dedup (in-memory, cleared daily) ────────────────────────────────────────────
+# Open-position alerts re-fire whenever confidence changes by >= 1pp since
+# the last sent alert. Entry price is NOT a trigger — it fluctuates many
+# times a day and doesn’t warrant a new notification on its own.
+# Bucket-switch alerts fire once per unique (market, new-bucket, old-buckets) per day.
 _side_alert_date: Optional[date] = None
-# (outcome_id, side) -> (certainty, entry_cost) at last sent alert
-_open_position_last_sent: dict[tuple, tuple] = {}
+# (outcome_id, side) -> last sent certainty (float 0-1)
+_open_position_last_sent: dict[tuple, float] = {}
 _bucket_switch_alerts_sent: set[tuple] = set()   # (market_id, new_outcome_id, old_ids_frozenset)
 
-OPEN_POS_REALERT_CONF_DELTA = 0.03    # 3 percentage points
-OPEN_POS_REALERT_PRICE_DELTA = 0.05   # 5 cents
+OPEN_POS_REALERT_CONF_DELTA = 0.01    # 1 percentage point
 
 
 def _reset_side_dedup_if_new_day() -> None:
@@ -52,37 +49,27 @@ def _reset_side_dedup_if_new_day() -> None:
 
 
 def _open_position_alert_due(
-    outcome_id: int, side: str, certainty: float, entry_cost: float
+    outcome_id: int, side: str, certainty: float
 ) -> tuple[bool, Optional[str]]:
     """Decide whether to (re-)send the open-position alert.
 
     Returns (should_send, change_note). First occurrence today always sends
-    (change_note=None). Re-sends only when confidence or entry price moved
-    materially, with a short human-readable note describing what changed.
+    (change_note=None). Re-fires whenever confidence moves >= 1pp since the
+    last alert; the note states direction and magnitude clearly.
     """
     key = (outcome_id, side)
-    last = _open_position_last_sent.get(key)
-    if last is None:
-        _open_position_last_sent[key] = (certainty, entry_cost)
+    last_cert = _open_position_last_sent.get(key)
+    if last_cert is None:
+        _open_position_last_sent[key] = certainty
         return True, None
 
-    last_cert, last_cost = last
     conf_delta = certainty - last_cert
-    cost_delta = entry_cost - last_cost
-    # epsilon guards float artifacts (0.94 - 0.91 == 0.0299999…)
-    eps = 1e-9
-    changes = []
-    if abs(conf_delta) >= OPEN_POS_REALERT_CONF_DELTA - eps:
-        arrow = "↑" if conf_delta > 0 else "↓"
-        changes.append(f"confidence {arrow}{abs(round(conf_delta * 100))}pp")
-    if abs(cost_delta) >= OPEN_POS_REALERT_PRICE_DELTA - eps:
-        arrow = "↑" if cost_delta > 0 else "↓"
-        changes.append(f"entry price {arrow}{abs(round(cost_delta * 100))}¢")
-    if not changes:
+    if abs(conf_delta) < OPEN_POS_REALERT_CONF_DELTA - 1e-9:
         return False, None
 
-    _open_position_last_sent[key] = (certainty, entry_cost)
-    return True, " | ".join(changes)
+    _open_position_last_sent[key] = certainty
+    arrow = "↑" if conf_delta > 0 else "↓"
+    return True, f"confidence {arrow}{abs(round(conf_delta * 100))}pp"
 
 
 def _alert_and_buy_thresholds(days_ahead: Optional[int]) -> tuple[float, float]:
@@ -447,7 +434,7 @@ async def _evaluate_opportunity(
         if certainty >= buy_thresh:
             _reset_side_dedup_if_new_day()
             should_send, change_note = _open_position_alert_due(
-                outcome.id, side, certainty, entry_cost
+                outcome.id, side, certainty
             )
             if should_send:
                 return None, {
