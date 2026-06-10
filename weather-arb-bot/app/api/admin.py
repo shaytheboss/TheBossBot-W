@@ -1266,6 +1266,8 @@ async def admin_cities(_: str = Depends(require_admin), db: AsyncSession = Depen
             "onshore_wind_dir": getattr(c, "onshore_wind_dir", None),
             "active": c.active,
             "blacklisted": bool(getattr(c, "blacklisted", False)),
+            "suspended_until": c.suspended_until.isoformat() if getattr(c, "suspended_until", None) else None,
+            "suspension_reason": getattr(c, "suspension_reason", None),
         }
         for c in rows
     ]
@@ -1340,6 +1342,21 @@ async def admin_city_update(
             if not (0 <= v <= 359):
                 raise HTTPException(400, "onshore_wind_dir must be 0-359 (compass degrees)")
             city.onshore_wind_dir = v
+    if "suspended_until" in payload:
+        v = payload["suspended_until"]
+        if v is None or v == "":
+            city.suspended_until = None
+            city.suspension_reason = None
+        else:
+            from datetime import datetime, timezone
+            try:
+                city.suspended_until = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+                if city.suspended_until.tzinfo is None:
+                    city.suspended_until = city.suspended_until.replace(tzinfo=timezone.utc)
+            except ValueError:
+                raise HTTPException(400, "suspended_until must be an ISO-8601 datetime")
+    if "suspension_reason" in payload:
+        city.suspension_reason = payload["suspension_reason"] or None
     for k in ("nws_lat", "nws_lon"):
         if k in payload and payload[k] is not None:
             setattr(city, k, float(payload[k]))

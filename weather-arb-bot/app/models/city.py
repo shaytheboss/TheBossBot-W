@@ -27,6 +27,11 @@ class City(Base):
     # probability estimator / confidence scorer. NULL disables those heuristics
     # for the city — a wrong direction is worse than no adjustment.
     onshore_wind_dir = Column(Integer, nullable=True, default=None)
+    # Temporary suspension: city continues to alert but won't open new virtual
+    # positions until suspended_until expires. Auto-set after N consecutive
+    # high-confidence losses; auto-clears when the timestamp passes.
+    suspended_until = Column(TIMESTAMP(timezone=True), nullable=True, default=None)
+    suspension_reason = Column(Text, nullable=True, default=None)
     polymarket_slug = Column(String(60))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 

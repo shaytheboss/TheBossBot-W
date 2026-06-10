@@ -26,7 +26,7 @@ from app.collectors.meteosource_collector import MeteosourceCollector
 from app.collectors.pirep_collector import PirepCollector
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.analyzers.opportunity_detector import detect_opportunities
-from app.bot.telegram_bot import send_opportunity_alert
+from app.bot.telegram_bot import send_opportunity_alert, send_side_alert
 from app.utils.units import resolve_bucket_unit, temp_in_bucket
 from app.utils.polymarket_discovery import (
     build_all_candidates,
@@ -697,14 +697,21 @@ async def job_fetch_polymarket():
 async def job_run_analyzer():
     async with AsyncSessionLocal() as db:
         try:
-            opportunities = await detect_opportunities(db)
+            opportunities, side_alerts = await detect_opportunities(db)
             if opportunities:
                 logger.info(f"job_run_analyzer: {len(opportunities)} opportunities found")
+            if side_alerts:
+                logger.info(f"job_run_analyzer: {len(side_alerts)} side alerts")
             for opp in opportunities:
                 try:
                     await send_opportunity_alert(opp, db)
                 except Exception as e:
                     logger.error(f"Failed to send alert for opportunity {opp.id}: {e}")
+            for alert in side_alerts:
+                try:
+                    await send_side_alert(alert, db)
+                except Exception as e:
+                    logger.error(f"Failed to send side alert ({alert.get('type')}): {e}")
         except Exception as e:
             logger.error(f"Analyzer job failed: {e}", exc_info=True)
 

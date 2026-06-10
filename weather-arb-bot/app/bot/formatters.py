@@ -681,6 +681,12 @@ def fmt_opportunity(
             f"= ${cost_v:.2f} cost\n"
             f"   If WIN: +${if_win_pnl:.2f} P&L  |  If LOSS: -${cost_v:.2f} P&L"
         )
+    elif signals.get("_city_suspended"):
+        reason = signals.get("_suspension_reason") or "auto-suspended"
+        virtual_section = (
+            f"\n\n\U000023f8 *No virtual buy* — *{city_name} is temporarily suspended*. "
+            f"({reason}. Suspension lifts automatically — alerts continue for tracking.)"
+        )
     elif is_blacklisted:
         # City is blacklisted: even if confidence cleared the buy threshold, no
         # money is committed. Make the reason explicit so it isn't mistaken for
@@ -1066,8 +1072,13 @@ def fmt_opportunity(
             hours_left = f"\n⏰ Closes in ~{h}h"
 
     link_line = f"\n[Polymarket]({market_url})" if market_url else ""
+    calibrated_conf = signals.get("_calibrated_confidence")
+    calib_note = ""
+    if calibrated_conf is not None and abs(calibrated_conf - confidence) >= 2:
+        direction = "↓" if calibrated_conf < confidence else "↑"
+        calib_note = f" → calibrated {direction}{calibrated_conf}%"
     certainty_note = (
-        f"\n⚠️ Certainty: {confidence}% "
+        f"\n⚠️ Certainty: {confidence}%{calib_note} "
         f"(directional confidence = max(P(YES), P(NO)) of our blend)"
     )
 
