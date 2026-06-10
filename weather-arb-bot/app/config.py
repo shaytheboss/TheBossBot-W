@@ -52,6 +52,19 @@ class Settings(BaseSettings):
     # 0 = same-day only, 1 = today+tomorrow, 3 = default.
     # Markets further out have less reliable forecasts and wider spreads.
     max_days_ahead_for_alert: int = 3
+    # ── Intraday subsystem (same-day, hours-scale; see INTRADAY.md) ─────────
+    intraday_enabled: bool = True
+    intraday_run_interval: int = 300          # seconds
+    intraday_start_hour_local: float = 10.0   # don't run before this local hour
+    intraday_peak_start_hour: float = 14.0    # climatological peak window
+    intraday_peak_end_hour: float = 17.0
+    intraday_min_certainty_alert: float = 0.90
+    intraday_min_certainty_buy: float = 0.94
+    intraday_min_edge: float = 0.05           # near-certainty makes 5c worthwhile
+    intraday_max_edge: float = 0.40
+    intraday_max_book_spread: float = 0.10
+    intraday_shares_per_buy: int = 5
+
     # Auto-suspend a city after this many consecutive high-conf (≥90%) losses.
     # Set to 0 to disable auto-suspension entirely.
     suspension_consecutive_losses: int = 3

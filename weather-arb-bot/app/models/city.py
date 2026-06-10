@@ -32,6 +32,8 @@ class City(Base):
     # high-confidence losses; auto-clears when the timestamp passes.
     suspended_until = Column(TIMESTAMP(timezone=True), nullable=True, default=None)
     suspension_reason = Column(Text, nullable=True, default=None)
+    # Per-city opt-in for the intraday (same-day, hours-scale) subsystem.
+    intraday_enabled = Column(Boolean, default=True, nullable=False, server_default="true")
     polymarket_slug = Column(String(60))
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 

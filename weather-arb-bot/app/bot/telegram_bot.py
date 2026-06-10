@@ -189,3 +189,132 @@ async def send_side_alert(alert: dict, db) -> None:
         except Exception as e:
             logger.error(f"Failed to send side alert to {user.chat_id}: {e}")
     await db.commit()
+
+
+# ── Intraday (⚡) alerts — separate format so the two strategies are
+#    instantly distinguishable in Telegram. See INTRADAY.md. ──────────────────
+
+def _fmt_intraday_alert(opp, city_name: str, bucket_label: str, market_question: str) -> str:
+    sig = opp.signals or {}
+    bd = sig.get("_intraday") or {}
+    conf = opp.confidence_score
+    edge_c = int(round(float(opp.edge) * 100))
+    entry_c = int(round(float(sig.get("_entry_cost") or 0) * 100))
+    running = bd.get("running_max_f")
+    expected = bd.get("expected_final_max_f")
+    hours_left = bd.get("hours_to_peak_end")
+    lock = bd.get("lock_state")
+    peak_passed = bd.get("peak_passed")
+
+    if lock == "yes_impossible":
+        lock_line = "🔒 *LOCK*: the running max is already ABOVE this bucket — its YES is mathematically dead."
+    elif lock == "yes_locked":
+        lock_line = "🔒 *LOCK*: the bucket floor was already touched — its YES is mathematically secured."
+    elif peak_passed:
+        lock_line = "🌡 Peak has passed (temp falling) — residual uncertainty is minimal."
+    else:
+        lock_line = f"⏳ ~{hours_left}h to end of peak window."
+
+    buy_line = ""
+    if sig.get("_create_virtual_buy"):
+        shares = opp.virtual_shares or 0
+        cost = float(opp.virtual_cost or 0)
+        buy_line = (
+            f"\n🛒 *Virtual buy*: {shares} × {entry_c}¢ = ${cost:.2f}\n#INTRADAY_BUY"
+        )
+
+    return (
+        f"⚡ *INTRADAY — {opp.side} {bucket_label}* ({city_name})\n#INTRADAY\n\n"
+        f"📊 {market_question}\n\n"
+        f"🌡 Running max: *{running}°F*  →  expected final: *{expected}°F*\n"
+        f"{lock_line}\n\n"
+        f"Certainty: *{conf}%*  |  Edge: +{edge_c}¢  |  Entry: {entry_c}¢"
+        f"{buy_line}"
+    )
+
+
+async def send_intraday_alert(opportunity, db) -> None:
+    if not settings.telegram_bot_token:
+        return
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser, Alert
+    from app.models.market import MarketOutcome, Market
+    from app.models.city import City
+
+    outcome_result = await db.execute(
+        select(MarketOutcome).where(MarketOutcome.id == opportunity.outcome_id))
+    outcome = outcome_result.scalar_one_or_none()
+    if not outcome:
+        return
+    market_result = await db.execute(select(Market).where(Market.id == outcome.market_id))
+    market = market_result.scalar_one_or_none()
+    if not market:
+        return
+    city_result = await db.execute(select(City).where(City.id == market.city_id))
+    city = city_result.scalar_one_or_none()
+
+    text = _fmt_intraday_alert(
+        opportunity,
+        city_name=city.name if city else "Unknown",
+        bucket_label=outcome.bucket_label,
+        market_question=market.question or "",
+    )
+    if market.external_id:
+        text += f"\n[Polymarket](https://polymarket.com/event/{market.external_id})"
+
+    users_result = await db.execute(
+        select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score)
+    )
+    users = users_result.scalars().all()
+    bot = Bot(token=settings.telegram_bot_token)
+    for user in users:
+        if user.cities_watched and city and city.id not in user.cities_watched:
+            continue
+        try:
+            msg = await bot.send_message(
+                chat_id=user.chat_id, text=text, parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+            alert = Alert(
+                alert_type="INTRADAY_OPPORTUNITY",
+                city_id=city.id if city else None,
+                market_id=market.id,
+                priority="HIGH",
+                message_text=text,
+                telegram_message_id=msg.message_id,
+            )
+            db.add(alert)
+        except Exception as e:
+            logger.error(f"Failed to send intraday alert to {user.chat_id}: {e}")
+    opportunity.alert_sent = True
+    await db.commit()
+
+
+async def send_intraday_realert(ra: dict, db) -> None:
+    """Lightweight ⚡ update — certainty moved >=1pp on an already-recorded signal."""
+    if not settings.telegram_bot_token:
+        return
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser
+
+    conf = int(round(ra["certainty"] * 100))
+    edge_c = int(round(ra["edge"] * 100))
+    entry_c = int(round(ra["entry_cost"] * 100))
+    bd = ra.get("breakdown") or {}
+    text = (
+        f"⚡ *INTRADAY UPDATE* — {ra['side']} on _{ra['bucket_label']}_ ({ra['city_name']})\n"
+        f"📊 What changed: {ra['change_note']}\n"
+        f"🌡 Running max: {bd.get('running_max_f')}°F → expected {bd.get('expected_final_max_f')}°F\n"
+        f"Certainty: *{conf}%*  |  Edge: +{edge_c}¢  |  Entry: {entry_c}¢\n"
+        f"_Already recorded today — tracking continues on the original position._"
+    )
+    users_result = await db.execute(
+        select(TelegramUser).where(TelegramUser.min_confidence <= conf)
+    )
+    users = users_result.scalars().all()
+    bot = Bot(token=settings.telegram_bot_token)
+    for user in users:
+        try:
+            await bot.send_message(chat_id=user.chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send intraday realert to {user.chat_id}: {e}")
