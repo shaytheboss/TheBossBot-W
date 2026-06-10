@@ -194,42 +194,209 @@ async def send_side_alert(alert: dict, db) -> None:
 # ── Intraday (⚡) alerts — separate format so the two strategies are
 #    instantly distinguishable in Telegram. See INTRADAY.md. ──────────────────
 
-def _fmt_intraday_alert(opp, city_name: str, bucket_label: str, market_question: str) -> str:
+def _sigma_context(hours_left, peak_passed: bool) -> str:
+    if peak_passed:
+        return "post-peak — temperature falling"
+    if hours_left is None:
+        return "schedule-based"
+    h = float(hours_left)
+    if h >= 6.0:
+        return f"{h:.1f}h to peak — high early-day uncertainty"
+    if h >= 4.0:
+        return f"{h:.1f}h to peak — moderate uncertainty"
+    if h >= 2.0:
+        return f"{h:.1f}h to peak — uncertainty shrinking"
+    if h >= 1.0:
+        return f"{h:.1f}h to peak — near-locked"
+    return "<1h to peak — almost certain"
+
+
+def _fmt_intraday_alert(
+    opp,
+    city_name: str,
+    bucket_label: str,
+    market_question: str,
+    station_icao: str = "",
+    event_date=None,
+    market_url: str = "",
+) -> str:
     sig = opp.signals or {}
     bd = sig.get("_intraday") or {}
+    book = sig.get("_book") or {}
     conf = opp.confidence_score
+    side = opp.side
+    is_no = (side == "NO")
+
     edge_c = int(round(float(opp.edge) * 100))
     entry_c = int(round(float(sig.get("_entry_cost") or 0) * 100))
+
+    # ── Intraday model fields ─────────────────────────────────────────────
     running = bd.get("running_max_f")
+    current = bd.get("current_temp_f")
     expected = bd.get("expected_final_max_f")
+    forecast_high = bd.get("forecast_high_f")
     hours_left = bd.get("hours_to_peak_end")
+    gain_w = bd.get("gain_weight")
+    sigma = bd.get("sigma_used")
     lock = bd.get("lock_state")
-    peak_passed = bd.get("peak_passed")
+    peak_passed = bd.get("peak_passed", False)
+    local_hour = bd.get("local_hour")
+    f_lo = bd.get("f_lo")
+    f_hi = bd.get("f_hi")
+    prob_yes = bd.get("probability")
 
-    if lock == "yes_impossible":
-        lock_line = "🔒 *LOCK*: the running max is already ABOVE this bucket — its YES is mathematically dead."
-    elif lock == "yes_locked":
-        lock_line = "🔒 *LOCK*: the bucket floor was already touched — its YES is mathematically secured."
-    elif peak_passed:
-        lock_line = "🌡 Peak has passed (temp falling) — residual uncertainty is minimal."
+    # ── Local time string ─────────────────────────────────────────────────
+    if local_hour is not None:
+        h_int = int(local_hour)
+        m_int = int(round((local_hour - h_int) * 60))
+        local_time_str = f"{h_int:02d}:{m_int:02d}"
     else:
-        lock_line = f"⏳ ~{hours_left}h to end of peak window."
+        local_time_str = "--:--"
 
+    # ── Location / date line ──────────────────────────────────────────────
+    from datetime import date as _date
+    icao_part = f" ({station_icao})" if station_icao else ""
+    date_str = ""
+    if event_date and isinstance(event_date, _date):
+        date_str = f" | {event_date.strftime('%b %d, %Y')}"
+    loc_line = f"📍 {city_name}{icao_part}{date_str}"
+
+    # ── Headline ──────────────────────────────────────────────────────────
+    if sig.get("_create_virtual_buy"):
+        headline = f"⚡ *INTRADAY BUY — {side} {bucket_label}* ({city_name})\n#INTRADAY"
+    else:
+        headline = f"⚡ *INTRADAY — {side} {bucket_label}* ({city_name})\n#INTRADAY"
+
+    # ── Lock / peak status ────────────────────────────────────────────────
+    if lock == "yes_impossible":
+        status_block = (
+            "🔒 *LOCK — YES IMPOSSIBLE*\n"
+            f"Running max *{running}°F* already exceeds this bucket's ceiling *{f_hi}°F*. "
+            "The daily max can only increase, so this bucket can never be the final answer.\n"
+            "→ NO is mathematically guaranteed."
+        )
+    elif lock == "yes_locked":
+        status_block = (
+            "🔒 *LOCK — YES SECURED*\n"
+            f"Running max *{running}°F* has already crossed the open-ended bucket floor *{f_lo}°F*. "
+            "→ YES is mathematically guaranteed regardless of remaining heating."
+        )
+    elif peak_passed:
+        sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
+        status_block = (
+            f"🌡 *Peak passed* — temperature is now falling.\n"
+            f"Today's max is almost certainly set at *{running}°F*. "
+            f"Residual σ = {sigma_str}."
+        )
+    else:
+        heating_pct = int(round((gain_w or 0) * 100))
+        sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
+        status_block = (
+            f"⏳ Local time *{local_time_str}*  |  *{hours_left:.1f}h* to peak window end\n"
+            f"Remaining heating: *{heating_pct}%* of today's potential still ahead (gain weight = {gain_w:.2f})"
+        )
+
+    # ── Current conditions ────────────────────────────────────────────────
+    current_str = f"*{current:.1f}°F*" if current is not None else "N/A"
+    cond_lines = [
+        f"  Now: {current_str}  |  Running max today: *{running}°F*  |  Expected final: *{expected}°F*"
+    ]
+    if forecast_high is not None and running is not None:
+        gap = round(float(forecast_high) - float(running), 1)
+        gap_str = f"+{gap}°F" if gap >= 0 else f"{gap}°F"
+        cond_lines.append(f"  Forecast high – running max gap: *{gap_str}* (what remains to be gained)")
+    conditions_block = "\n".join(cond_lines)
+
+    # ── Per-source forecast table ─────────────────────────────────────────
+    fc_sources = sig.get("_forecast_sources") or {}
+    fc_lines = []
+    for label, val in fc_sources.items():
+        fc_lines.append(f"  • {label}: *{val:.1f}°F*")
+    if forecast_high is not None:
+        if fc_lines:
+            fc_vals = list(fc_sources.values())
+            lo_f = min(fc_vals)
+            hi_f = max(fc_vals)
+            spread = round(hi_f - lo_f, 1)
+            if spread <= 2:
+                agree = "✅ strong agreement"
+            elif spread <= 4:
+                agree = "⚠️ moderate spread"
+            else:
+                agree = "🚨 HIGH spread — models disagree"
+            fc_lines.append(f"  ↳ Blended high: *{forecast_high:.1f}°F*  |  Range: {lo_f:.1f}–{hi_f:.1f}°F (Δ{spread:.1f}°F) — {agree}")
+        else:
+            fc_lines.append(f"  ↳ Blended high: *{forecast_high:.1f}°F* (single source)")
+    else:
+        fc_lines = ["  • No forecast data available"]
+    forecasts_block = "\n".join(fc_lines)
+
+    # ── Probability model math ────────────────────────────────────────────
+    sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
+    bucket_lo_str = f"{f_lo:.1f}°F" if f_lo is not None else "−∞"
+    bucket_hi_str = f"{f_hi:.1f}°F" if f_hi is not None else "+∞"
+    yes_pct = round((prob_yes or 0) * 100, 1)
+    no_pct = round(100 - yes_pct, 1)
+    sigma_ctx = _sigma_context(hours_left, bool(peak_passed))
+    math_lines = [
+        f"_max(M, X) model: final max = max(running max, X),  X ~ N(μ, σ)_",
+        f"  • Bucket bounds: [{bucket_lo_str}, {bucket_hi_str})",
+        f"  • M (running max) = *{running}°F*  |  μ (expected final max) = *{expected}°F*",
+        f"  • σ = {sigma_str}  ({sigma_ctx})",
+        f"  • P(YES) = {yes_pct}%  ⇒  P(NO) = {no_pct}%  →  *{side}*",
+    ]
+    math_block = "\n".join(math_lines)
+
+    # ── Pricing / book ────────────────────────────────────────────────────
+    if book.get("bid") is not None and book.get("ask") is not None:
+        if is_no:
+            side_bid_c = round((1.0 - book["ask"]) * 100)
+            side_ask_c = round((1.0 - book["bid"]) * 100)
+        else:
+            side_bid_c = round(book["bid"] * 100)
+            side_ask_c = round(book["ask"] * 100)
+        spread_c = round(book.get("spread", 0) * 100)
+        price_line = (
+            f"💰 Buy *{side}* at ≈{entry_c}¢ "
+            f"(bid {side_bid_c}¢ / ask {side_ask_c}¢, spread {spread_c}¢)"
+        )
+    else:
+        price_line = f"💰 Market *{side}* price: {entry_c}¢"
+
+    # ── Virtual buy ───────────────────────────────────────────────────────
     buy_line = ""
     if sig.get("_create_virtual_buy"):
         shares = opp.virtual_shares or 0
         cost = float(opp.virtual_cost or 0)
+        win_pnl = shares * 1.0 - cost
         buy_line = (
-            f"\n🛒 *Virtual buy*: {shares} × {entry_c}¢ = ${cost:.2f}\n#INTRADAY_BUY"
+            f"\n🛒 *Virtual buy*: {shares} × {entry_c}¢ = ${cost:.2f}\n"
+            f"   If WIN: +${win_pnl:.2f}  |  If LOSS: −${cost:.2f}\n"
+            f"#INTRADAY_BUY"
         )
+    else:
+        buy_thresh = sig.get("_buy_threshold")
+        if buy_thresh is not None:
+            buy_line = (
+                f"\n_No virtual buy — certainty {conf}% below buy threshold "
+                f"{int(round(float(buy_thresh) * 100))}%._"
+            )
+
+    # ── Polymarket link ───────────────────────────────────────────────────
+    link_line = f"\n[Polymarket]({market_url})" if market_url else ""
 
     return (
-        f"⚡ *INTRADAY — {opp.side} {bucket_label}* ({city_name})\n#INTRADAY\n\n"
+        f"{headline}\n\n"
+        f"{loc_line}\n"
         f"📊 {market_question}\n\n"
-        f"🌡 Running max: *{running}°F*  →  expected final: *{expected}°F*\n"
-        f"{lock_line}\n\n"
-        f"Certainty: *{conf}%*  |  Edge: +{edge_c}¢  |  Entry: {entry_c}¢"
+        f"{status_block}\n\n"
+        f"🌡 *Current conditions*\n{conditions_block}\n\n"
+        f"📡 *Forecast highs (same-day models)*\n{forecasts_block}\n\n"
+        f"🎯 *Probability model*\n{math_block}\n\n"
+        f"{price_line}\n"
+        f"📈 Edge: +{edge_c}¢  |  Certainty: *{conf}%*"
         f"{buy_line}"
+        f"{link_line}"
     )
 
 
@@ -253,14 +420,18 @@ async def send_intraday_alert(opportunity, db) -> None:
     city_result = await db.execute(select(City).where(City.id == market.city_id))
     city = city_result.scalar_one_or_none()
 
+    market_url = (
+        f"https://polymarket.com/event/{market.external_id}" if market.external_id else ""
+    )
     text = _fmt_intraday_alert(
         opportunity,
         city_name=city.name if city else "Unknown",
         bucket_label=outcome.bucket_label,
         market_question=market.question or "",
+        station_icao=city.primary_icao if city else "",
+        event_date=market.event_date,
+        market_url=market_url,
     )
-    if market.external_id:
-        text += f"\n[Polymarket](https://polymarket.com/event/{market.external_id})"
 
     users_result = await db.execute(
         select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score)
@@ -301,11 +472,30 @@ async def send_intraday_realert(ra: dict, db) -> None:
     edge_c = int(round(ra["edge"] * 100))
     entry_c = int(round(ra["entry_cost"] * 100))
     bd = ra.get("breakdown") or {}
+    running = bd.get("running_max_f")
+    expected = bd.get("expected_final_max_f")
+    current = bd.get("current_temp_f")
+    lock = bd.get("lock_state")
+    peak_passed = bd.get("peak_passed", False)
+    hours_left = bd.get("hours_to_peak_end")
+    sigma = bd.get("sigma_used")
+
+    if lock == "yes_impossible":
+        state_line = f"🔒 LOCKED — YES IMPOSSIBLE (running max {running}°F above bucket ceiling)"
+    elif lock == "yes_locked":
+        state_line = f"🔒 LOCKED — YES SECURED (running max {running}°F crossed bucket floor)"
+    elif peak_passed:
+        state_line = f"🌡 Peak passed — temp now falling, max set at {running}°F"
+    else:
+        sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
+        state_line = f"⏳ {hours_left:.1f}h to peak end | running max {running}°F → expected {expected}°F | σ={sigma_str}"
+
+    current_str = f" | now {current:.1f}°F" if current is not None else ""
     text = (
-        f"⚡ *INTRADAY UPDATE* — {ra['side']} on _{ra['bucket_label']}_ ({ra['city_name']})\n"
-        f"📊 What changed: {ra['change_note']}\n"
-        f"🌡 Running max: {bd.get('running_max_f')}°F → expected {bd.get('expected_final_max_f')}°F\n"
-        f"Certainty: *{conf}%*  |  Edge: +{edge_c}¢  |  Entry: {entry_c}¢\n"
+        f"⚡ *INTRADAY UPDATE* — {ra['side']} _{ra['bucket_label']}_ ({ra['city_name']})\n"
+        f"📊 {ra['change_note']}\n\n"
+        f"{state_line}{current_str}\n\n"
+        f"💰 Entry: {entry_c}¢  |  Edge: +{edge_c}¢  |  Certainty: *{conf}%*\n"
         f"_Already recorded today — tracking continues on the original position._"
     )
     users_result = await db.execute(
