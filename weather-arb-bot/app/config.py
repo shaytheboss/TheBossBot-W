@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     # 0 = same-day only, 1 = today+tomorrow, 3 = default.
     # Markets further out have less reliable forecasts and wider spreads.
     max_days_ahead_for_alert: int = 3
+    # Auto-suspend a city after this many consecutive high-conf (≥90%) losses.
+    # Set to 0 to disable auto-suspension entirely.
+    suspension_consecutive_losses: int = 3
+    # How many days to suspend. City resumes automatically when the timer expires.
+    suspension_days: int = 7
     sentry_dsn: str = ""
 
     @property

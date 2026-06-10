@@ -303,6 +303,7 @@
           <th title="Compass bearing (0-359°) of the onshore sea→land wind, e.g. ~300 for LA, ~110 for Miami. Empty disables the sea-breeze heuristics for this city.">Onshore°</th>
           <th>Active</th>
           <th title="Blacklisted cities still alert but never open a virtual buy">Blacklist</th>
+          <th title="Auto-suspended until this date — no virtual buys during suspension. Click × to clear.">Suspended Until</th>
           <th></th>
         </tr></thead>
         <tbody id="citiesBody"></tbody>
@@ -1215,6 +1216,12 @@ async function loadCities() {
       <td><input style="width:58px;" type="number" min="0" max="359" step="1" value="${c.onshore_wind_dir != null ? c.onshore_wind_dir : ''}" id="city-onshore-${c.id}" title="Onshore wind bearing 0-359°; empty = sea-breeze heuristics off"/></td>
       <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
       <td title="When checked: still alerts, but never opens a virtual buy"><input type="checkbox" ${c.blacklisted ? 'checked' : ''} id="city-blacklist-${c.id}"/></td>
+      <td style="font-size:12px;white-space:nowrap;" title="${c.suspension_reason || ''}">
+        ${c.suspended_until
+            ? `<span style="color:#e67e22">${c.suspended_until.slice(0,10)}</span>
+               <button class="btn" style="padding:1px 4px;font-size:11px;" onclick="clearSuspension(${c.id})" title="Clear suspension">×</button>`
+            : '<span style="color:#aaa">—</span>'}
+      </td>
       <td>
         <button class="btn primary" onclick="saveCity(${c.id})">Save</button>
         <button class="btn danger" onclick="deleteCity(${c.id}, ${JSON.stringify(c.name || '').replace(/'/g,"\\'")})">מחק</button>
@@ -1240,6 +1247,12 @@ async function saveCity(id) {
   };
   const r = await api('/cities/'+id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { loadCities(); } else { alert('Save failed'); }
+}
+
+async function clearSuspension(id) {
+  if (!confirm('Clear suspension for this city? It will resume opening virtual buys immediately.')) return;
+  const r = await api('/cities/'+id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({suspended_until: null}) });
+  if (r.ok) { loadCities(); } else { alert('Failed to clear suspension'); }
 }
 
 async function deleteCity(id, name) {

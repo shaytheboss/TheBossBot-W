@@ -10,6 +10,7 @@ from app.analyzers.probability_estimator import (
     estimate_with_breakdown,
     _clip as _prob_clip,
 )
+from app.analyzers.calibrator import get_calibration_table, calibrate
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.config import settings
 from app.models.city import City
@@ -73,6 +74,70 @@ def _should_skip_market(question: Optional[str]) -> bool:
     return any(kw in lo for kw in SKIP_QUESTION_KEYWORDS)
 
 
+def _city_is_suspended(city: City) -> bool:
+    """True if the city's suspension timer is still active."""
+    if not getattr(city, "suspended_until", None):
+        return False
+    return city.suspended_until > datetime.now(timezone.utc)
+
+
+async def _auto_suspend_check(db: AsyncSession, city: City) -> None:
+    """Auto-suspend city after N consecutive high-confidence losses.
+
+    Reads the last (threshold + 2) settled high-confidence opportunities for
+    the city.  If the tail is all losses, sets suspended_until and logs.
+    Clears an expired suspension silently.
+    """
+    threshold = int(getattr(settings, "suspension_consecutive_losses", 0))
+    if threshold <= 0:
+        return
+
+    # Clear an expired suspension
+    if getattr(city, "suspended_until", None) and not _city_is_suspended(city):
+        city.suspended_until = None
+        city.suspension_reason = None
+        await db.commit()
+        logger.info(f"City {city.name} suspension expired — resumed.")
+        return
+
+    if _city_is_suspended(city):
+        return  # still suspended, nothing to do
+
+    # Count consecutive losses at the tail (most-recent first)
+    result = await db.execute(
+        select(Opportunity.virtual_status)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .where(
+            Market.city_id == city.id,
+            Opportunity.virtual_status.in_(["win", "loss"]),
+            Opportunity.confidence_score >= 90,
+        )
+        .order_by(Opportunity.detected_at.desc())
+        .limit(threshold + 2)
+    )
+    statuses = [r.virtual_status for r in result.all()]
+
+    streak = 0
+    for s in statuses:
+        if s == "loss":
+            streak += 1
+        else:
+            break
+
+    if streak >= threshold:
+        days = int(getattr(settings, "suspension_days", 7))
+        city.suspended_until = datetime.now(timezone.utc) + timedelta(days=days)
+        city.suspension_reason = (
+            f"Auto-suspended: {streak} consecutive high-confidence losses"
+        )
+        await db.commit()
+        logger.warning(
+            f"City {city.name} auto-suspended for {days} days "
+            f"({streak} consecutive high-conf losses)."
+        )
+
+
 async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -> bool:
     """True if an opportunity for this outcome AND side was already created today."""
     today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
@@ -116,6 +181,22 @@ async def _get_prior_opportunity(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def _get_open_sibling_positions(
+    db: AsyncSession, market_id: int, exclude_outcome_id: int
+) -> list[Opportunity]:
+    """Return open virtual positions on outcomes of the same market (excluding this one)."""
+    result = await db.execute(
+        select(Opportunity, MarketOutcome.bucket_label, MarketOutcome.id.label("mo_id"))
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .where(
+            MarketOutcome.market_id == market_id,
+            MarketOutcome.id != exclude_outcome_id,
+            Opportunity.virtual_status == "open",
+        )
+    )
+    return result.all()
 
 
 def _compute_why_now(
@@ -237,19 +318,26 @@ async def _evaluate_opportunity(
     signals: dict,
     book: Optional[dict],
     days_ahead: int,
-) -> Optional[Opportunity]:
-    """Given a (possibly normalized) probability, decide whether to create an Opportunity."""
+    calibration_table: dict,
+) -> tuple[Optional[Opportunity], Optional[dict]]:
+    """Decide whether to create an Opportunity.
+
+    Returns (opp, side_alert_dict).
+    - opp is not None when a new DB record was created and an alert should fire.
+    - side_alert_dict is not None when the signal is strong but was suppressed
+      (dedup, blacklist, suspension) — the caller sends a lightweight alert.
+    """
     if book is None:
         logger.debug(f"Skipping outcome {outcome.id}: no two-sided orderbook")
-        return None
+        return None, None
     if book["bid"] == 0 and book["ask"] == 0:
         logger.debug(f"Skipping outcome {outcome.id}: market closed (bid=ask=0)")
-        return None
+        return None, None
     if book["spread"] > MAX_BOOK_SPREAD:
         logger.debug(
             f"Skipping outcome {outcome.id}: spread {book['spread']:.2f} > {MAX_BOOK_SPREAD:.2f}"
         )
-        return None
+        return None, None
 
     price_info = signals.get("market_price") or {}
     yes_price_mid = price_info.get("yes_price", 0.5)
@@ -270,9 +358,9 @@ async def _evaluate_opportunity(
 
     alert_thresh, buy_thresh = _alert_and_buy_thresholds(days_ahead)
     if certainty < alert_thresh:
-        return None
+        return None, None
     if edge < settings.min_edge_for_alert:
-        return None
+        return None, None
 
     max_edge = float(getattr(settings, "max_edge_for_alert", 1.0))
     if edge > max_edge:
@@ -280,17 +368,37 @@ async def _evaluate_opportunity(
             f"Skipping outcome {outcome.id} ({outcome.bucket_label}): "
             f"edge {edge:.2f} > max_edge {max_edge:.2f} -- market strongly disagrees"
         )
-        return None
+        return None, None
 
-    # Blacklisted cities still alert (so we keep tracking and learning) but never
-    # commit a virtual-buy position, no matter how high the confidence. The alert
-    # explains that the city's blacklist status — not the model — blocked the buy.
+    # Calibrated confidence: stored for display only; threshold decisions use
+    # raw certainty to preserve virtual-buy tracking at 90–92%.
+    calibrated_certainty = calibrate(certainty, calibration_table)
+
     is_blacklisted = bool(getattr(city, "blacklisted", False))
-    create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted
+    is_suspended = _city_is_suspended(city)
 
+    # Virtual buy is suppressed during suspension or blacklist.
+    create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted and not is_suspended
+
+    # Dedup: if a same-day opportunity for this outcome+side already exists,
+    # skip creating a new record — but emit a side alert when the signal is
+    # high-confidence so the user knows it's still firing.
     if await _has_opportunity_today(db, outcome.id, side):
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} today")
-        return None
+        if certainty >= buy_thresh:
+            return None, {
+                "type": "open_position",
+                "city_name": city.name,
+                "bucket_label": outcome.bucket_label,
+                "market_question": market.question,
+                "side": side,
+                "certainty": round(certainty, 4),
+                "calibrated_certainty": round(calibrated_certainty, 4),
+                "edge": round(edge, 4),
+                "entry_cost": round(entry_cost, 4),
+                "event_date": market.event_date,
+            }
+        return None, None
 
     prior_opp = await _get_prior_opportunity(db, outcome.id, side)
     why_now = _compute_why_now(signals, breakdown, prior_opp)
@@ -303,7 +411,10 @@ async def _evaluate_opportunity(
     signals["_buy_threshold"] = float(buy_thresh)
     signals["_create_virtual_buy"] = bool(create_virtual_buy)
     signals["_city_blacklisted"] = is_blacklisted
+    signals["_city_suspended"] = is_suspended
+    signals["_suspension_reason"] = getattr(city, "suspension_reason", None) if is_suspended else None
     signals["_why_now"] = why_now
+    signals["_calibrated_confidence"] = int(round(calibrated_certainty * 100))
 
     opp = Opportunity(
         outcome_id=outcome.id,
@@ -324,11 +435,22 @@ async def _evaluate_opportunity(
     db.add(opp)
     await db.commit()
     await db.refresh(opp)
-    return opp
+    return opp, None
 
 
-async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
+async def detect_opportunities(
+    db: AsyncSession,
+) -> tuple[List[Opportunity], List[dict]]:
+    """Scan all unresolved markets and return qualifying opportunities.
+
+    Returns (opportunities, side_alerts) where side_alerts are lightweight
+    dicts describing signals that fired but were suppressed (dedup, suspension,
+    blacklist, bucket-switch suggestions). The caller sends them via a
+    dedicated Telegram formatter so they reach the user without creating
+    duplicate DB records.
+    """
     found: List[Opportunity] = []
+    side_alerts: List[dict] = []
 
     result = await db.execute(
         select(Market).where(Market.resolved == False).order_by(Market.event_date)
@@ -336,6 +458,9 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
     markets: List[Market] = result.scalars().all()
 
     cooldown_minutes = int(getattr(settings, "alert_dedup_minutes", 0) or 0)
+
+    # Load calibration table once per detection cycle (30-min cache)
+    calibration_table = await get_calibration_table(db)
 
     for market in markets:
         if _should_skip_market(market.question):
@@ -360,6 +485,9 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         city: Optional[City] = city_result.scalar_one_or_none()
         if not city:
             continue
+
+        # Smart suspension: auto-suspend after N consecutive high-conf losses.
+        await _auto_suspend_check(db, city)
 
         outcomes_result = await db.execute(
             select(MarketOutcome).where(MarketOutcome.market_id == market.id)
@@ -407,11 +535,13 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
         for d in outcome_data:
             d["breakdown"]["normalized_final"] = round(float(d["normalized_prob"]), 4)
 
-        # Phase 3: evaluate each outcome, pick best edge
-        best_opp: Optional[Opportunity] = None
+        # Phase 3: evaluate ALL qualifying outcomes for this market.
+        # Multiple buckets can fire simultaneously — alerting only the
+        # best edge would miss profitable adjacent positions.
+        new_opps_this_market: List[Opportunity] = []
         for d in outcome_data:
             try:
-                opp = await _evaluate_opportunity(
+                opp, sa = await _evaluate_opportunity(
                     db=db,
                     city=city,
                     outcome=d["outcome"],
@@ -421,14 +551,46 @@ async def detect_opportunities(db: AsyncSession) -> List[Opportunity]:
                     signals=d["signals"],
                     book=d["book"],
                     days_ahead=days_ahead,
+                    calibration_table=calibration_table,
                 )
                 if opp is not None:
-                    if best_opp is None or opp.edge > best_opp.edge:
-                        best_opp = opp
+                    new_opps_this_market.append(opp)
+                if sa is not None:
+                    side_alerts.append(sa)
             except Exception as e:
                 logger.error(f"Error evaluating outcome {d['outcome'].id}: {e}", exc_info=True)
 
-        if best_opp is not None:
-            found.append(best_opp)
+        # Bucket-switch detection: if any new opportunity targets a different
+        # bucket than an already-open virtual position on the same market,
+        # emit a side alert suggesting the switch.
+        for opp in new_opps_this_market:
+            try:
+                siblings = await _get_open_sibling_positions(
+                    db, market.id, opp.outcome_id
+                )
+                if siblings:
+                    old_labels = [row.bucket_label for row in siblings]
+                    old_entry_prices = [
+                        float(row.Opportunity.virtual_entry_price or 0)
+                        for row in siblings
+                    ]
+                    side_alerts.append({
+                        "type": "bucket_switch",
+                        "city_name": city.name,
+                        "market_question": market.question,
+                        "event_date": market.event_date,
+                        "new_bucket_label": opp.outcome_ref.bucket_label
+                            if opp.outcome_ref else str(opp.outcome_id),
+                        "new_side": opp.side,
+                        "new_confidence": opp.confidence_score,
+                        "new_edge": float(opp.edge),
+                        "new_entry_cost": float(opp.virtual_entry_price or 0),
+                        "old_buckets": old_labels,
+                        "old_entry_prices": old_entry_prices,
+                    })
+            except Exception as e:
+                logger.error(f"Bucket-switch check failed for opp {opp.id}: {e}", exc_info=True)
 
-    return found
+        found.extend(new_opps_this_market)
+
+    return found, side_alerts
