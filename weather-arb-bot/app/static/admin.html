@@ -102,6 +102,7 @@
       <button class="active" data-tab="stats">Stats</button>
       <button data-tab="opps">Opportunities</button>
       <button data-tab="positions">Positions</button>
+      <button data-tab="intraday">⚡ Intraday</button>
       <button data-tab="lessons">Lessons</button>
       <button data-tab="cities">Cities</button>
       <button data-tab="settings">Settings</button>
@@ -195,6 +196,34 @@
           <th>Details</th>
         </tr></thead>
         <tbody id="positionsBody"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-intraday" class="hidden">
+      <div class="toolbar">
+        <label class="row small">From <input type="date" id="idFrom" /></label>
+        <label class="row small">To <input type="date" id="idTo" /></label>
+        <label class="row small">City <select id="idCity"><option value="">All</option></select></label>
+        <button class="btn" onclick="loadIntraday()">Refresh</button>
+      </div>
+      <p class="small">⚡ Same-day, hours-scale strategy — fully separate tracking from the daily bot. The breakdowns below are the calibration dials: by detection hour, certainty band, lock state and city. See INTRADAY.md.</p>
+      <div class="cards" id="intradayCards"></div>
+      <h3>By detection hour (local)</h3>
+      <div id="intradayByHour"></div>
+      <h3>By certainty band</h3>
+      <div id="intradayByConf"></div>
+      <h3>By lock state</h3>
+      <div id="intradayByLock"></div>
+      <h3>By city</h3>
+      <div id="intradayByCity"></div>
+      <h3>Positions</h3>
+      <table>
+        <thead><tr>
+          <th>Detected</th><th>City</th><th>Bucket</th><th>Side</th><th>Conf</th>
+          <th>Hour</th><th>Run max</th><th>Exp final</th><th>σ</th><th>Lock</th>
+          <th>Entry</th><th>P&amp;L</th><th>Status</th>
+        </tr></thead>
+        <tbody id="intradayBody"></tbody>
       </table>
     </section>
 
@@ -303,6 +332,7 @@
           <th title="Compass bearing (0-359°) of the onshore sea→land wind, e.g. ~300 for LA, ~110 for Miami. Empty disables the sea-breeze heuristics for this city.">Onshore°</th>
           <th>Active</th>
           <th title="Blacklisted cities still alert but never open a virtual buy">Blacklist</th>
+          <th title="Include this city in the ⚡ intraday (same-day) strategy">⚡ Intraday</th>
           <th title="Auto-suspended until this date — no virtual buys during suspension. Click × to clear.">Suspended Until</th>
           <th></th>
         </tr></thead>
@@ -504,6 +534,7 @@ function bindTabs() {
       if (tab === 'stats') loadStats();
       if (tab === 'opps') loadOpps();
       if (tab === 'positions') loadPositions();
+      if (tab === 'intraday') loadIntraday();
       if (tab === 'lessons') loadLessons();
       if (tab === 'cities') loadCities();
       if (tab === 'settings') loadSettings();
@@ -533,7 +564,7 @@ async function ensureCitiesLoaded() {
   if (!r.ok) return [];
   const rows = await r.json();
   window._citiesCache = rows;
-  ['statsCity','posCity','lesCity','oppCity'].forEach(id => {
+  ['statsCity','posCity','lesCity','oppCity','idCity'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel || sel.dataset.populated === '1') return;
     rows.forEach(c => {
@@ -806,6 +837,75 @@ function _lessonTable(title, mapObj) {
       <th>Group</th><th>Bets</th><th>Win%</th><th>Avg pred%</th>
       <th>Calib gap</th><th>Brier</th><th>Avg entry</th><th>Real edge%</th><th>Net P&amp;L</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function _intradayBreakdownTable(obj) {
+  const keys = Object.keys(obj || {});
+  if (!keys.length) return '<p class="small">No data yet.</p>';
+  const rows = keys.map(k => {
+    const s = obj[k];
+    const wr = s.win_rate != null ? s.win_rate + '%' : '—';
+    const roi = s.roi_pct != null ? (s.roi_pct >= 0 ? '+' : '') + s.roi_pct + '%' : '—';
+    const pnl = (s.pnl >= 0 ? '+$' : '-$') + Math.abs(s.pnl).toFixed(2);
+    return `<tr><td>${k}</td><td>${s.positions}</td><td>${s.settled}</td><td>${s.wins}</td>
+      <td>${wr}</td><td>$${s.invested.toFixed(2)}</td><td>${pnl}</td><td>${roi}</td></tr>`;
+  }).join('');
+  return `<table><thead><tr><th></th><th>Pos</th><th>Settled</th><th>Wins</th>
+    <th>Win rate</th><th>Invested</th><th>P&amp;L</th><th>ROI</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+async function loadIntraday() {
+  await ensureCitiesLoaded();
+  _initFilterDefaults('idFrom', 'idTo');
+  const p = new URLSearchParams();
+  const f = document.getElementById('idFrom').value;
+  const t = document.getElementById('idTo').value;
+  const c = document.getElementById('idCity').value;
+  if (f) p.set('from_date', f);
+  if (t) p.set('to_date', t);
+  if (c) p.set('city_id', c);
+
+  const [statsR, posR] = await Promise.all([
+    api('/intraday/stats?' + p.toString()),
+    api('/intraday/positions?' + p.toString()),
+  ]);
+  if (statsR.ok) {
+    const s = await statsR.json();
+    const tot = s.totals;
+    const pnlStr = (tot.pnl >= 0 ? '+$' : '-$') + Math.abs(tot.pnl).toFixed(2);
+    document.getElementById('intradayCards').innerHTML =
+      card('Alerts', s.alerts_total) +
+      card('Buys', tot.positions) +
+      card('Open', s.open_positions) +
+      card('Settled', tot.settled) +
+      card('Win rate', tot.win_rate != null ? tot.win_rate + '%' : '—') +
+      card('Net P&L', pnlStr) +
+      card('ROI', tot.roi_pct != null ? tot.roi_pct + '%' : '—');
+    document.getElementById('intradayByHour').innerHTML = _intradayBreakdownTable(s.by_hour);
+    document.getElementById('intradayByConf').innerHTML = _intradayBreakdownTable(s.by_confidence);
+    document.getElementById('intradayByLock').innerHTML = _intradayBreakdownTable(s.by_lock);
+    document.getElementById('intradayByCity').innerHTML = _intradayBreakdownTable(s.by_city);
+  }
+  if (posR.ok) {
+    const rows = await posR.json();
+    document.getElementById('intradayBody').innerHTML = rows.map(r => {
+      const pnl = r.pnl != null ? ((r.pnl >= 0 ? '+$' : '-$') + Math.abs(r.pnl).toFixed(2)) : '';
+      const cls = r.status === 'win' ? 'win' : (r.status === 'loss' ? 'loss' : '');
+      return `<tr class="${cls}">
+        <td>${(r.detected_at || '').slice(5, 16).replace('T', ' ')}</td>
+        <td>${r.city}</td><td>${r.bucket}</td><td>${r.side}</td>
+        <td>${r.confidence}%</td>
+        <td>${r.local_hour != null ? r.local_hour.toFixed(1) : ''}</td>
+        <td>${r.running_max_f != null ? r.running_max_f.toFixed(1) : ''}</td>
+        <td>${r.expected_final_max_f != null ? r.expected_final_max_f.toFixed(1) : ''}</td>
+        <td>${r.sigma_used != null ? r.sigma_used.toFixed(1) : ''}</td>
+        <td>${r.lock_state || ''}</td>
+        <td>${r.entry_price != null ? Math.round(r.entry_price * 100) + '¢' : ''}</td>
+        <td>${pnl}</td><td>${r.status || r.outcome || 'alert'}</td>
+      </tr>`;
+    }).join('');
+  }
 }
 
 async function loadLessons() {
@@ -1216,6 +1316,7 @@ async function loadCities() {
       <td><input style="width:58px;" type="number" min="0" max="359" step="1" value="${c.onshore_wind_dir != null ? c.onshore_wind_dir : ''}" id="city-onshore-${c.id}" title="Onshore wind bearing 0-359°; empty = sea-breeze heuristics off"/></td>
       <td><input type="checkbox" ${c.active ? 'checked' : ''} id="city-active-${c.id}"/></td>
       <td title="When checked: still alerts, but never opens a virtual buy"><input type="checkbox" ${c.blacklisted ? 'checked' : ''} id="city-blacklist-${c.id}"/></td>
+      <td title="Include in ⚡ intraday strategy"><input type="checkbox" ${c.intraday_enabled !== false ? 'checked' : ''} id="city-intraday-${c.id}"/></td>
       <td style="font-size:12px;white-space:nowrap;" title="${c.suspension_reason || ''}">
         ${c.suspended_until
             ? `<span style="color:#e67e22">${c.suspended_until.slice(0,10)}</span>
@@ -1244,6 +1345,7 @@ async function saveCity(id) {
     onshore_wind_dir: onshoreVal !== '' ? parseInt(onshoreVal) : null,
     active: document.getElementById('city-active-'+id).checked,
     blacklisted: document.getElementById('city-blacklist-'+id).checked,
+    intraday_enabled: document.getElementById('city-intraday-'+id).checked,
   };
   const r = await api('/cities/'+id, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { loadCities(); } else { alert('Save failed'); }

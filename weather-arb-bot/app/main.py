@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
             job_fetch_metars, job_fetch_wunderground, job_fetch_nws,
             job_fetch_models, job_fetch_pireps, job_fetch_polymarket,
             job_run_analyzer, job_check_resolutions,
-            job_fetch_external_forecasts,
+            job_fetch_external_forecasts, job_run_intraday,
         )
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
@@ -79,6 +79,10 @@ async def lifespan(app: FastAPI):
                            id="analyzer", next_run_time=now, max_instances=1, misfire_grace_time=60)
         _scheduler.add_job(job_check_resolutions, IntervalTrigger(seconds=86400),
                            id="resolutions", next_run_time=now, max_instances=1, misfire_grace_time=3600)
+        if getattr(settings, "intraday_enabled", True):
+            _scheduler.add_job(job_run_intraday,
+                               IntervalTrigger(seconds=getattr(settings, "intraday_run_interval", 300)),
+                               id="intraday", next_run_time=now, max_instances=1, misfire_grace_time=60)
 
         _scheduler.start()
         logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))

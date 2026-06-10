@@ -4,6 +4,7 @@ from app.models.forecast import Forecast
 from app.models.pirep import Pirep
 from app.models.market import Market, MarketOutcome, MarketPrice
 from app.models.opportunity import Opportunity
+from app.models.intraday import IntradayOpportunity
 from app.models.alert import Alert, TelegramUser
 from app.models.forecast_accuracy import ForecastAccuracy
 
@@ -16,6 +17,7 @@ __all__ = [
     "MarketOutcome",
     "MarketPrice",
     "Opportunity",
+    "IntradayOpportunity",
     "Alert",
     "TelegramUser",
     "ForecastAccuracy",

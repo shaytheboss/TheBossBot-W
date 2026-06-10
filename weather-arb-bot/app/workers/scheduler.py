@@ -20,6 +20,7 @@ from app.workers.jobs import (
     job_fetch_pireps,
     job_fetch_polymarket,
     job_run_analyzer,
+    job_run_intraday,
 )
 from app.workers.icon_job import job_fetch_icon
 
@@ -117,6 +118,16 @@ def build_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         misfire_grace_time=60,
     )
+    if getattr(settings, "intraday_enabled", True):
+        scheduler.add_job(
+            job_run_intraday,
+            IntervalTrigger(seconds=getattr(settings, "intraday_run_interval", 300)),
+            id="intraday",
+            name="Run intraday analyzer",
+            next_run_time=now,
+            max_instances=1,
+            misfire_grace_time=60,
+        )
 
     return scheduler
 

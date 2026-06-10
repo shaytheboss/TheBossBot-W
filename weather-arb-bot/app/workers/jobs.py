@@ -694,6 +694,30 @@ async def job_fetch_polymarket():
                 logger.error(f"Polymarket job failed for outcome {outcome.id}: {e}")
 
 
+async def job_run_intraday():
+    """Intraday (same-day, hours-scale) detection cycle. Fully isolated from
+    the daily analyzer — see INTRADAY.md."""
+    from app.intraday.detector import detect_intraday
+    from app.bot.telegram_bot import send_intraday_alert, send_intraday_realert
+    async with AsyncSessionLocal() as db:
+        try:
+            opportunities, realerts = await detect_intraday(db)
+            if opportunities:
+                logger.info(f"job_run_intraday: {len(opportunities)} intraday opportunities")
+            for opp in opportunities:
+                try:
+                    await send_intraday_alert(opp, db)
+                except Exception as e:
+                    logger.error(f"Failed to send intraday alert for {opp.id}: {e}")
+            for ra in realerts:
+                try:
+                    await send_intraday_realert(ra, db)
+                except Exception as e:
+                    logger.error(f"Failed to send intraday realert: {e}")
+        except Exception as e:
+            logger.error(f"Intraday job failed: {e}", exc_info=True)
+
+
 async def job_run_analyzer():
     async with AsyncSessionLocal() as db:
         try:
@@ -1065,6 +1089,45 @@ async def _send_resolution_alert(
             logger.error(f"Failed to send resolution alert to {user.chat_id}: {e}")
 
 
+async def _settle_intraday_for_market(db, market, winning_outcome_ids: set) -> int:
+    """Settle intraday positions for a resolved market.
+
+    Separate from (and called after) the daily settlement so an intraday
+    failure can never affect the daily flow. Returns rows settled.
+    """
+    from app.models.intraday import IntradayOpportunity
+    opps_result = await db.execute(
+        select(IntradayOpportunity)
+        .join(MarketOutcome, MarketOutcome.id == IntradayOpportunity.outcome_id)
+        .where(
+            MarketOutcome.market_id == market.id,
+            IntradayOpportunity.outcome == None,
+        )
+    )
+    iopps = opps_result.scalars().all()
+    now = datetime.now(timezone.utc)
+    for opp in iopps:
+        bucket_won = opp.outcome_id in winning_outcome_ids
+        if opp.side == "YES":
+            opp.outcome = "WIN" if bucket_won else "LOSS"
+        else:
+            opp.outcome = "WIN" if not bucket_won else "LOSS"
+        opp.closed_at = now
+        if opp.virtual_status == "open" and opp.virtual_shares:
+            cost = float(opp.virtual_cost or 0.0)
+            if opp.outcome == "WIN":
+                payout = float(opp.virtual_shares) * 1.00
+                opp.virtual_status = "win"
+            else:
+                payout = 0.0
+                opp.virtual_status = "loss"
+            opp.virtual_payout = payout
+            opp.virtual_pnl = payout - cost
+    if iopps:
+        await db.commit()
+    return len(iopps)
+
+
 async def job_check_resolutions():
     today = date.today()
     async with AsyncSessionLocal() as db:
@@ -1186,6 +1249,18 @@ async def job_check_resolutions():
                         opp.virtual_status = "loss"
                     opp.virtual_pnl = payout - cost
             await db.commit()
+
+            # Intraday settlement — separate flow, own try/except so it can
+            # never break the daily settlement above.
+            try:
+                n_intraday = await _settle_intraday_for_market(db, market, winning_outcome_ids)
+                if n_intraday:
+                    logger.info(
+                        f"job_check_resolutions: settled {n_intraday} intraday "
+                        f"positions for {market.external_id}"
+                    )
+            except Exception as e:
+                logger.error(f"Intraday settlement failed for {market.external_id}: {e}", exc_info=True)
 
             if opps:
                 try:

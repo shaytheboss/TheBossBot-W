@@ -1248,6 +1248,153 @@ async def admin_opportunity_alert(
     }
 
 
+# ── ⚡ Intraday subsystem (separate table, separate stats; see INTRADAY.md) ──
+
+@router.get("/intraday/positions")
+async def admin_intraday_positions(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+    city_id: Optional[int] = Query(default=None),
+    limit: int = Query(default=2000, le=5000),
+):
+    from app.models.intraday import IntradayOpportunity
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+
+    q = (
+        select(IntradayOpportunity, MarketOutcome, Market, City)
+        .join(MarketOutcome, MarketOutcome.id == IntradayOpportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+        .order_by(desc(IntradayOpportunity.detected_at))
+        .limit(limit)
+    )
+    if from_dt is not None:
+        q = q.where(IntradayOpportunity.detected_at >= from_dt)
+    if to_dt is not None:
+        q = q.where(IntradayOpportunity.detected_at < to_dt)
+    if city_id is not None:
+        q = q.where(Market.city_id == city_id)
+
+    rows = (await db.execute(q)).all()
+    out = []
+    for opp, oc, market, city in rows:
+        out.append({
+            "id": opp.id,
+            "detected_at": opp.detected_at.isoformat() if opp.detected_at else None,
+            "event_date": market.event_date.isoformat() if market.event_date else None,
+            "city": city.name,
+            "bucket": oc.bucket_label,
+            "side": opp.side,
+            "confidence": opp.confidence_score,
+            "edge": float(opp.edge) if opp.edge is not None else None,
+            "local_hour": opp.local_hour,
+            "hours_to_peak_end": opp.hours_to_peak_end,
+            "running_max_f": opp.running_max_f,
+            "expected_final_max_f": opp.expected_final_max_f,
+            "sigma_used": opp.sigma_used,
+            "lock_state": opp.lock_state,
+            "shares": opp.virtual_shares,
+            "entry_price": opp.virtual_entry_price,
+            "cost": opp.virtual_cost,
+            "pnl": opp.virtual_pnl,
+            "status": opp.virtual_status,
+            "outcome": opp.outcome,
+        })
+    return out
+
+
+@router.get("/intraday/stats")
+async def admin_intraday_stats(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+    city_id: Optional[int] = Query(default=None),
+):
+    """Headline numbers + the four learning-loop breakdowns:
+    by detection hour, by certainty band, by lock state, by city."""
+    from app.models.intraday import IntradayOpportunity
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+
+    q = (
+        select(IntradayOpportunity, City.name.label("city_name"))
+        .join(MarketOutcome, MarketOutcome.id == IntradayOpportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+    )
+    if from_dt is not None:
+        q = q.where(IntradayOpportunity.detected_at >= from_dt)
+    if to_dt is not None:
+        q = q.where(IntradayOpportunity.detected_at < to_dt)
+    if city_id is not None:
+        q = q.where(Market.city_id == city_id)
+
+    rows = (await db.execute(q)).all()
+
+    def _bucket_stats(items):
+        n = len(items)
+        settled = [o for o in items if o.virtual_status in ("win", "loss")]
+        wins = sum(1 for o in settled if o.virtual_status == "win")
+        invested = sum(float(o.virtual_cost or 0) for o in settled)
+        pnl = sum(float(o.virtual_pnl or 0) for o in settled)
+        return {
+            "positions": n,
+            "settled": len(settled),
+            "wins": wins,
+            "win_rate": round(100.0 * wins / len(settled), 1) if settled else None,
+            "invested": round(invested, 2),
+            "pnl": round(pnl, 2),
+            "roi_pct": round(100.0 * pnl / invested, 1) if invested > 0 else None,
+        }
+
+    opps = [r.IntradayOpportunity for r in rows]
+    buys = [o for o in opps if o.virtual_shares]
+    open_pos = [o for o in buys if o.virtual_status == "open"]
+
+    # by detection hour (2-hour bands of local time)
+    by_hour = {}
+    for o in buys:
+        if o.local_hour is None:
+            continue
+        band = f"{int(o.local_hour // 2) * 2:02d}-{int(o.local_hour // 2) * 2 + 2:02d}"
+        by_hour.setdefault(band, []).append(o)
+
+    # by certainty band (2-point)
+    by_conf = {}
+    for o in buys:
+        band_lo = (o.confidence_score // 2) * 2
+        by_conf.setdefault(f"{band_lo}-{band_lo + 1}", []).append(o)
+
+    # by lock state
+    by_lock = {}
+    for o in buys:
+        key = o.lock_state or "no_lock"
+        by_lock.setdefault(key, []).append(o)
+
+    # by city
+    by_city = {}
+    for r in rows:
+        o = r.IntradayOpportunity
+        if o.virtual_shares:
+            by_city.setdefault(r.city_name, []).append(o)
+
+    return {
+        "totals": _bucket_stats(buys),
+        "alerts_total": len(opps),
+        "open_positions": len(open_pos),
+        "by_hour": {k: _bucket_stats(v) for k, v in sorted(by_hour.items())},
+        "by_confidence": {k: _bucket_stats(v) for k, v in sorted(by_conf.items())},
+        "by_lock": {k: _bucket_stats(v) for k, v in sorted(by_lock.items())},
+        "by_city": {k: _bucket_stats(v) for k, v in sorted(by_city.items())},
+    }
+
+
 @router.get("/cities")
 async def admin_cities(_: str = Depends(require_admin), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(City).order_by(City.name))).scalars().all()
@@ -1268,6 +1415,7 @@ async def admin_cities(_: str = Depends(require_admin), db: AsyncSession = Depen
             "blacklisted": bool(getattr(c, "blacklisted", False)),
             "suspended_until": c.suspended_until.isoformat() if getattr(c, "suspended_until", None) else None,
             "suspension_reason": getattr(c, "suspension_reason", None),
+            "intraday_enabled": bool(getattr(c, "intraday_enabled", True)),
         }
         for c in rows
     ]
@@ -1357,6 +1505,8 @@ async def admin_city_update(
                 raise HTTPException(400, "suspended_until must be an ISO-8601 datetime")
     if "suspension_reason" in payload:
         city.suspension_reason = payload["suspension_reason"] or None
+    if "intraday_enabled" in payload:
+        city.intraday_enabled = bool(payload["intraday_enabled"])
     for k in ("nws_lat", "nws_lon"):
         if k in payload and payload[k] is not None:
             setattr(city, k, float(payload[k]))
