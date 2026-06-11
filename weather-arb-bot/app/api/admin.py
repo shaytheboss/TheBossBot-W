@@ -1257,12 +1257,14 @@ async def admin_intraday_positions(
     from_date: Optional[str] = Query(default=None),
     to_date: Optional[str] = Query(default=None),
     city_id: Optional[int] = Query(default=None),
-    limit: int = Query(default=2000, le=5000),
+    date_field: str = Query(default="detected", description="'detected' or 'event'"),
+    limit: int = Query(default=5000, le=5000),
 ):
     from app.models.intraday import IntradayOpportunity
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
     to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+    by_event = date_field == "event"
 
     q = (
         select(IntradayOpportunity, MarketOutcome, Market, City)
@@ -1272,10 +1274,16 @@ async def admin_intraday_positions(
         .order_by(desc(IntradayOpportunity.detected_at))
         .limit(limit)
     )
-    if from_dt is not None:
-        q = q.where(IntradayOpportunity.detected_at >= from_dt)
-    if to_dt is not None:
-        q = q.where(IntradayOpportunity.detected_at < to_dt)
+    if by_event:
+        if from_dt is not None:
+            q = q.where(Market.event_date >= from_dt.date())
+        if to_dt_inc is not None:
+            q = q.where(Market.event_date <= to_dt_inc.date())
+    else:
+        if from_dt is not None:
+            q = q.where(IntradayOpportunity.detected_at >= from_dt)
+        if to_dt is not None:
+            q = q.where(IntradayOpportunity.detected_at < to_dt)
     if city_id is not None:
         q = q.where(Market.city_id == city_id)
 
@@ -1287,9 +1295,11 @@ async def admin_intraday_positions(
             "detected_at": opp.detected_at.isoformat() if opp.detected_at else None,
             "event_date": market.event_date.isoformat() if market.event_date else None,
             "city": city.name,
+            "market": market.question,
             "bucket": oc.bucket_label,
             "side": opp.side,
             "confidence": opp.confidence_score,
+            "true_prob": float(opp.estimated_true_prob) if opp.estimated_true_prob is not None else None,
             "edge": float(opp.edge) if opp.edge is not None else None,
             "local_hour": opp.local_hour,
             "hours_to_peak_end": opp.hours_to_peak_end,
@@ -1300,9 +1310,14 @@ async def admin_intraday_positions(
             "shares": opp.virtual_shares,
             "entry_price": opp.virtual_entry_price,
             "cost": opp.virtual_cost,
+            "payout": opp.virtual_payout,
             "pnl": opp.virtual_pnl,
             "status": opp.virtual_status,
             "outcome": opp.outcome,
+            "market_url": (
+                f"https://polymarket.com/event/{market.external_id}"
+                if market.external_id else None
+            ),
         })
     return out
 

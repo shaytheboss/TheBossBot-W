@@ -102,7 +102,8 @@
       <button class="active" data-tab="stats">Stats</button>
       <button data-tab="opps">Opportunities</button>
       <button data-tab="positions">Positions</button>
-      <button data-tab="intraday">⚡ Intraday</button>
+      <button data-tab="intraday">⚡ Intraday Stats</button>
+      <button data-tab="intradaypos">⚡ Intraday Positions</button>
       <button data-tab="lessons">Lessons</button>
       <button data-tab="cities">Cities</button>
       <button data-tab="settings">Settings</button>
@@ -204,9 +205,10 @@
         <label class="row small">From <input type="date" id="idFrom" /></label>
         <label class="row small">To <input type="date" id="idTo" /></label>
         <label class="row small">City <select id="idCity"><option value="">All</option></select></label>
-        <button class="btn" onclick="loadIntraday()">Refresh</button>
+        <button class="btn primary" onclick="loadIntraday()">Apply Filter</button>
+        <button class="btn" onclick="resetIntradayFilter()">Reset</button>
       </div>
-      <p class="small">⚡ Same-day, hours-scale strategy — fully separate tracking from the daily bot. The breakdowns below are the calibration dials: by detection hour, certainty band, lock state and city. See INTRADAY.md.</p>
+      <p class="small">⚡ Same-day, hours-scale strategy — fully separate tracking from the daily bot. The breakdowns below are the calibration dials: by detection hour, certainty band, lock state and city. See INTRADAY.md. The full position list lives in the <strong>⚡ Intraday Positions</strong> tab.</p>
       <div class="cards" id="intradayCards"></div>
       <h3>By detection hour (local)</h3>
       <div id="intradayByHour"></div>
@@ -216,12 +218,61 @@
       <div id="intradayByLock"></div>
       <h3>By city</h3>
       <div id="intradayByCity"></div>
-      <h3>Positions</h3>
-      <table>
+    </section>
+
+    <section id="tab-intradaypos" class="hidden">
+      <div class="toolbar">
+        <label class="row small">Date by
+          <select id="idpDateField">
+            <option value="detected">Detected date</option>
+            <option value="event">Event date</option>
+          </select>
+        </label>
+        <label class="row small">From <input type="date" id="idpFrom" /></label>
+        <label class="row small">To <input type="date" id="idpTo" /></label>
+        <label class="row small">City
+          <select id="idpCity"><option value="">All cities</option></select>
+        </label>
+        <select id="idpSide" onchange="applyIdpClientFilter()" title="Filter by YES/NO side">
+          <option value="">All sides</option>
+          <option value="YES">YES</option>
+          <option value="NO">NO</option>
+        </select>
+        <select id="idpStatus" onchange="applyIdpClientFilter()" title="Filter by status">
+          <option value="">All statuses</option>
+          <option value="win">WIN</option>
+          <option value="loss">LOSS</option>
+          <option value="open">Open</option>
+          <option value="alert">Alert only (no buy)</option>
+        </select>
+        <label class="row small" title="Minimum model confidence (0-100)">Min conf <input type="number" id="idpMinConf" min="0" max="100" step="1" style="width:46px;" oninput="applyIdpClientFilter()" /></label>
+        <button class="btn primary" onclick="loadIntradayPos()">Apply Filter</button>
+        <button class="btn" onclick="resetIdpFilter()">Reset</button>
+        <button class="btn" onclick="exportCsv('intradayBody', 'intraday-positions')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
+        <span id="idpCapWarn" class="small" style="color:var(--warn);"></span>
+      </div>
+      <table id="intradayPosTable">
         <thead><tr>
-          <th>Detected</th><th>City</th><th>Bucket</th><th>Side</th><th>Conf</th>
-          <th>Hour</th><th>Run max</th><th>Exp final</th><th>σ</th><th>Lock</th>
-          <th>Entry</th><th>P&amp;L</th><th>Status</th>
+          <th data-sort-key="detected_at" data-sort-type="date">Detected</th>
+          <th data-sort-key="event_date" data-sort-type="date">Event date</th>
+          <th data-sort-key="city" data-sort-type="str">City</th>
+          <th data-sort-key="bucket" data-sort-type="str">Bucket</th>
+          <th data-sort-key="side" data-sort-type="str">Side</th>
+          <th data-sort-key="_display_prob" data-sort-type="num">Est P(side)</th>
+          <th data-sort-key="edge" data-sort-type="num">Edge</th>
+          <th data-sort-key="confidence" data-sort-type="num">Conf</th>
+          <th data-sort-key="local_hour" data-sort-type="num">Hour</th>
+          <th data-sort-key="running_max_f" data-sort-type="num">Run max</th>
+          <th data-sort-key="expected_final_max_f" data-sort-type="num">Exp final</th>
+          <th data-sort-key="sigma_used" data-sort-type="num">σ</th>
+          <th data-sort-key="lock_state" data-sort-type="str">Lock</th>
+          <th data-sort-key="shares" data-sort-type="num">Shares</th>
+          <th data-sort-key="entry_price" data-sort-type="num">Entry</th>
+          <th data-sort-key="cost" data-sort-type="num">Cost</th>
+          <th data-sort-key="payout" data-sort-type="num">Payout</th>
+          <th data-sort-key="pnl" data-sort-type="num">P&amp;L</th>
+          <th data-sort-key="_display_status" data-sort-type="str">Status</th>
+          <th>Link</th>
         </tr></thead>
         <tbody id="intradayBody"></tbody>
       </table>
@@ -535,6 +586,7 @@ function bindTabs() {
       if (tab === 'opps') loadOpps();
       if (tab === 'positions') loadPositions();
       if (tab === 'intraday') loadIntraday();
+      if (tab === 'intradaypos') loadIntradayPos();
       if (tab === 'lessons') loadLessons();
       if (tab === 'cities') loadCities();
       if (tab === 'settings') loadSettings();
@@ -564,7 +616,7 @@ async function ensureCitiesLoaded() {
   if (!r.ok) return [];
   const rows = await r.json();
   window._citiesCache = rows;
-  ['statsCity','posCity','lesCity','oppCity','idCity'].forEach(id => {
+  ['statsCity','posCity','lesCity','oppCity','idCity','idpCity'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel || sel.dataset.populated === '1') return;
     rows.forEach(c => {
@@ -855,6 +907,13 @@ function _intradayBreakdownTable(obj) {
     <tbody>${rows}</tbody></table>`;
 }
 
+function resetIntradayFilter() {
+  document.getElementById('idFrom').value = '';
+  document.getElementById('idTo').value = '';
+  document.getElementById('idCity').value = '';
+  loadIntraday();
+}
+
 async function loadIntraday() {
   await ensureCitiesLoaded();
   _initFilterDefaults('idFrom', 'idTo');
@@ -866,10 +925,7 @@ async function loadIntraday() {
   if (t) p.set('to_date', t);
   if (c) p.set('city_id', c);
 
-  const [statsR, posR] = await Promise.all([
-    api('/intraday/stats?' + p.toString()),
-    api('/intraday/positions?' + p.toString()),
-  ]);
+  const statsR = await api('/intraday/stats?' + p.toString());
   if (statsR.ok) {
     const s = await statsR.json();
     const tot = s.totals;
@@ -887,25 +943,95 @@ async function loadIntraday() {
     document.getElementById('intradayByLock').innerHTML = _intradayBreakdownTable(s.by_lock);
     document.getElementById('intradayByCity').innerHTML = _intradayBreakdownTable(s.by_city);
   }
-  if (posR.ok) {
-    const rows = await posR.json();
-    document.getElementById('intradayBody').innerHTML = rows.map(r => {
-      const pnl = r.pnl != null ? ((r.pnl >= 0 ? '+$' : '-$') + Math.abs(r.pnl).toFixed(2)) : '';
-      const cls = r.status === 'win' ? 'win' : (r.status === 'loss' ? 'loss' : '');
-      return `<tr class="${cls}">
-        <td>${(r.detected_at || '').slice(5, 16).replace('T', ' ')}</td>
-        <td>${r.city}</td><td>${r.bucket}</td><td>${r.side}</td>
-        <td>${r.confidence}%</td>
-        <td>${r.local_hour != null ? r.local_hour.toFixed(1) : ''}</td>
-        <td>${r.running_max_f != null ? r.running_max_f.toFixed(1) : ''}</td>
-        <td>${r.expected_final_max_f != null ? r.expected_final_max_f.toFixed(1) : ''}</td>
-        <td>${r.sigma_used != null ? r.sigma_used.toFixed(1) : ''}</td>
-        <td>${r.lock_state || ''}</td>
-        <td>${r.entry_price != null ? Math.round(r.entry_price * 100) + '¢' : ''}</td>
-        <td>${pnl}</td><td>${r.status || r.outcome || 'alert'}</td>
-      </tr>`;
-    }).join('');
-  }
+}
+
+// --- ⚡ Intraday Positions (separate screen, mirrors the daily Positions UX) --
+
+function resetIdpFilter() {
+  document.getElementById('idpFrom').value = '';
+  document.getElementById('idpTo').value = '';
+  document.getElementById('idpCity').value = '';
+  document.getElementById('idpSide').value = '';
+  document.getElementById('idpStatus').value = '';
+  document.getElementById('idpMinConf').value = '';
+  document.getElementById('idpDateField').value = 'detected';
+  _clientFilters['intradayBody'] = null;
+  loadIntradayPos();
+}
+
+function applyIdpClientFilter() {
+  const side = document.getElementById('idpSide').value;
+  const minConf = parseFloat(document.getElementById('idpMinConf').value) || 0;
+  const st = document.getElementById('idpStatus').value;
+  _clientFilters['intradayBody'] = (side || minConf > 0 || st) ? (o => {
+    if (side && o.side !== side) return false;
+    // 'alert' = tracked without a virtual buy (whatever its settled outcome);
+    // win/loss/open refer to actual virtual-money positions.
+    if (st === 'alert' && o.shares) return false;
+    if (st && st !== 'alert' && (o.status || '') !== st) return false;
+    if (minConf > 0 && (o.confidence || 0) < minConf) return false;
+    return true;
+  }) : null;
+  _rerenderTable('intradayBody');
+}
+
+function _renderIntradayPos(rows) {
+  const fmtMoney = v => (v == null ? '—' : (v >= 0 ? '$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)));
+  document.getElementById('intradayBody').innerHTML = rows.map(r => {
+    const pnlStr = r.pnl != null ? ((r.pnl >= 0 ? '+$' : '-$') + Math.abs(r.pnl).toFixed(2)) : '—';
+    const cls = r._display_status === 'win' ? 'win' : (r._display_status === 'loss' ? 'loss' : '');
+    return `<tr class="${cls}">
+      <td class="small">${r.detected_at ? r.detected_at.slice(0,16).replace('T',' ') : ''}</td>
+      <td>${r.event_date || ''}</td>
+      <td>${escapeHtml(r.city || '')}</td>
+      <td>${escapeHtml(r.bucket || '')}</td>
+      <td>${r.side}</td>
+      <td>${r._display_prob != null ? Math.round(r._display_prob*100) + '%' : ''}</td>
+      <td>${r.edge != null ? (r.edge*100).toFixed(0) + 'pp' : ''}</td>
+      <td>${r.confidence ?? ''}</td>
+      <td>${r.local_hour != null ? r.local_hour.toFixed(1) : ''}</td>
+      <td>${r.running_max_f != null ? r.running_max_f.toFixed(1) : ''}</td>
+      <td>${r.expected_final_max_f != null ? r.expected_final_max_f.toFixed(1) : ''}</td>
+      <td>${r.sigma_used != null ? r.sigma_used.toFixed(1) : ''}</td>
+      <td>${escapeHtml(r.lock_state || '')}</td>
+      <td>${r.shares ?? ''}</td>
+      <td>${r.entry_price != null ? Math.round(r.entry_price*100) + '¢' : ''}</td>
+      <td>${fmtMoney(r.cost)}</td>
+      <td>${fmtMoney(r.payout)}</td>
+      <td style="color:${(r.pnl||0) >= 0 ? 'var(--win)' : 'var(--loss)'}">${pnlStr}</td>
+      <td>${escapeHtml(r._display_status)}</td>
+      <td>${r.market_url ? `<a href="${r.market_url}" target="_blank">Poly</a>` : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadIntradayPos() {
+  await ensureCitiesLoaded();
+  _initFilterDefaults('idpFrom', 'idpTo');
+  const p = new URLSearchParams();
+  const f = document.getElementById('idpFrom').value;
+  const t = document.getElementById('idpTo').value;
+  const c = document.getElementById('idpCity').value;
+  const df = document.getElementById('idpDateField').value;
+  if (f) p.set('from_date', f);
+  if (t) p.set('to_date', t);
+  if (c) p.set('city_id', c);
+  if (df) p.set('date_field', df);
+  const LIMIT = 5000;
+  p.set('limit', String(LIMIT));
+  const r = await api('/intraday/positions?' + p); if (!r.ok) return;
+  const rows = await r.json();
+  _setCapWarning('idpCapWarn', rows.length, LIMIT);
+  rows.forEach(o => {
+    o._display_prob = (o.true_prob == null)
+      ? null
+      : ((o.side === 'NO') ? (1 - o.true_prob) : o.true_prob);
+    // Rows without a virtual buy are tracked alerts; if they settled, keep
+    // the outcome visible (model accuracy) while staying distinct from
+    // actual virtual-money win/loss rows.
+    o._display_status = o.status || (o.outcome ? 'alert (' + o.outcome + ')' : 'alert');
+  });
+  _registerTable('intradayBody', rows, _renderIntradayPos, { key: 'detected_at', dir: 'desc', type: 'date' });
 }
 
 async function loadLessons() {
