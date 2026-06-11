@@ -324,6 +324,19 @@ async def _evaluate_intraday_outcome(
 
     create_buy = certainty >= buy_thresh and not bool(getattr(city, "blacklisted", False))
 
+    # Collect per-source forecast highs for the alert display table.
+    _SRC_LABELS = {
+        "hrrr_forecast": "HRRR", "nws_forecast": "NWS",
+        "gfs_forecast": "GFS", "ecmwf_forecast": "ECMWF",
+        "icon_forecast": "ICON", "wunderground_forecast": "Wunderground",
+        "tomorrowio_forecast": "Tomorrow.io", "meteosource_forecast": "Meteosource",
+    }
+    forecast_sources: dict[str, float] = {}
+    for key, label in _SRC_LABELS.items():
+        val = (signals.get(key) or {}).get("predicted_high_f")
+        if val is not None:
+            forecast_sources[label] = round(float(val), 1)
+
     intraday_signals = {
         "_intraday": breakdown,
         "_book": book,
@@ -333,6 +346,7 @@ async def _evaluate_intraday_outcome(
         "_buy_threshold": buy_thresh,
         "_create_virtual_buy": bool(create_buy),
         "_bucket_unit": bucket_unit,
+        "_forecast_sources": forecast_sources,
     }
 
     opp = IntradayOpportunity(
