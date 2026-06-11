@@ -1089,11 +1089,11 @@ async def _send_resolution_alert(
             logger.error(f"Failed to send resolution alert to {user.chat_id}: {e}")
 
 
-async def _settle_intraday_for_market(db, market, winning_outcome_ids: set) -> int:
+async def _settle_intraday_for_market(db, market, winning_outcome_ids: set) -> list:
     """Settle intraday positions for a resolved market.
 
     Separate from (and called after) the daily settlement so an intraday
-    failure can never affect the daily flow. Returns rows settled.
+    failure can never affect the daily flow. Returns the settled rows.
     """
     from app.models.intraday import IntradayOpportunity
     opps_result = await db.execute(
@@ -1125,7 +1125,88 @@ async def _settle_intraday_for_market(db, market, winning_outcome_ids: set) -> i
             opp.virtual_pnl = payout - cost
     if iopps:
         await db.commit()
-    return len(iopps)
+    return list(iopps)
+
+
+async def _send_intraday_resolution_alert(
+    city: City, market: Market, iopps: list, winning_outcome_ids: set, db,
+) -> None:
+    """⚡ settlement summary for intraday positions — without this the intraday
+    learning loop settles silently and the user never sees WIN/LOSS."""
+    from app.models.alert import TelegramUser
+    from telegram import Bot
+
+    if not settings.telegram_bot_token or not iopps:
+        return
+
+    wins = [o for o in iopps if o.outcome == "WIN"]
+    losses = [o for o in iopps if o.outcome == "LOSS"]
+    if len(wins) > len(losses):
+        header = "⚡✅ *Intraday settlement — WIN*"
+    elif len(losses) > len(wins):
+        header = "⚡❌ *Intraday settlement — LOSS*"
+    else:
+        header = "⚡🤝 *Intraday settlement*"
+
+    winning_labels_q = await db.execute(
+        select(MarketOutcome.bucket_label).where(
+            MarketOutcome.id.in_(winning_outcome_ids)
+        )
+    ) if winning_outcome_ids else None
+    winning_labels = (
+        [r[0] for r in winning_labels_q.all()] if winning_labels_q is not None else []
+    )
+
+    lines = [
+        header + "\n#INTRADAY",
+        f"📍 {city.name} — {market.event_date.strftime('%b %d, %Y')}",
+    ]
+    if winning_labels:
+        lines.append(f"🏆 Winning bucket: *{', '.join(winning_labels)}*")
+    lines.append("")
+
+    total_pnl = 0.0
+    pnl_rows = 0
+    for opp in iopps:
+        oc_res = await db.execute(
+            select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id)
+        )
+        oc = oc_res.scalar_one_or_none()
+        label = oc.bucket_label if oc else f"outcome #{opp.outcome_id}"
+        emoji = "✅" if opp.outcome == "WIN" else "❌"
+        entry_c = (
+            round(float(opp.virtual_entry_price) * 100)
+            if opp.virtual_entry_price is not None
+            else round(float(opp.signals.get("_entry_cost") or 0) * 100)
+            if opp.signals else 0
+        )
+        line = f"{emoji} {label[:35]} {opp.side} @ {entry_c}¢ → {opp.outcome}"
+        if opp.virtual_pnl is not None and opp.virtual_shares:
+            pnl = float(opp.virtual_pnl)
+            total_pnl += pnl
+            pnl_rows += 1
+            pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+            line += f" | {opp.virtual_shares} sh → {pnl_str} P&L"
+        else:
+            line += " | tracked only (no virtual buy)"
+        lines.append(line)
+
+    if pnl_rows:
+        pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+        lines.append("")
+        lines.append(f"📊 Intraday P&L: {pnl_str} ({len(wins)}W / {len(losses)}L)")
+
+    text = "\n".join(lines)
+    users_result = await db.execute(select(TelegramUser))
+    users = users_result.scalars().all()
+    bot = Bot(token=settings.telegram_bot_token)
+    for user in users:
+        if user.cities_watched and city.id not in user.cities_watched:
+            continue
+        try:
+            await bot.send_message(chat_id=user.chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send intraday resolution alert to {user.chat_id}: {e}")
 
 
 async def job_check_resolutions():
@@ -1253,11 +1334,14 @@ async def job_check_resolutions():
             # Intraday settlement — separate flow, own try/except so it can
             # never break the daily settlement above.
             try:
-                n_intraday = await _settle_intraday_for_market(db, market, winning_outcome_ids)
-                if n_intraday:
+                intraday_settled = await _settle_intraday_for_market(db, market, winning_outcome_ids)
+                if intraday_settled:
                     logger.info(
-                        f"job_check_resolutions: settled {n_intraday} intraday "
+                        f"job_check_resolutions: settled {len(intraday_settled)} intraday "
                         f"positions for {market.external_id}"
+                    )
+                    await _send_intraday_resolution_alert(
+                        city, market, intraday_settled, winning_outcome_ids, db,
                     )
             except Exception as e:
                 logger.error(f"Intraday settlement failed for {market.external_id}: {e}", exc_info=True)

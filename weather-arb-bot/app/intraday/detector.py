@@ -70,13 +70,21 @@ def _params_from_settings() -> IntradayParams:
 
 
 def blended_forecast_high(signals: dict) -> Optional[float]:
-    """Weighted mean of today's available deterministic forecast highs."""
+    """Weighted mean of today's bias-corrected deterministic forecast highs.
+
+    The same airport warm-bias correction the daily estimator applies: METAR
+    daily highs run warmer than gridded NWP (tarmac + urban heat island), and
+    the intraday model compares this blend directly against the METAR running
+    max — so the forecasts must live on the METAR scale.
+    """
+    from app.analyzers.probability_estimator import _source_bias
+    station_bias = signals.get("station_bias") or {}
     total_w = 0.0
     acc = 0.0
     for key, w in _BLEND_WEIGHTS.items():
         val = (signals.get(key) or {}).get("predicted_high_f")
         if val is not None:
-            acc += w * float(val)
+            acc += w * (float(val) + _source_bias(station_bias, key))
             total_w += w
     return acc / total_w if total_w > 0 else None
 
@@ -112,13 +120,23 @@ async def _minutes_since_running_max(
     return (now_utc - max_ts).total_seconds() / 60.0
 
 
-async def _has_intraday_today(db: AsyncSession, outcome_id: int, side: str) -> bool:
-    today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+async def _has_intraday_today(db: AsyncSession, outcome_id: int, side: str, tz) -> bool:
+    """One record per (outcome, side) per CITY-LOCAL day.
+
+    Must use the city's local midnight, not UTC: UTC midnight falls in the
+    late afternoon for US cities, so a UTC window would reset mid-session and
+    allow a duplicate record (and duplicate virtual buy) the same local day.
+    """
+    now_utc = datetime.now(timezone.utc)
+    local_midnight = now_utc.astimezone(tz).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    day_start = local_midnight.astimezone(timezone.utc)
     q = await db.execute(
         select(IntradayOpportunity.id).where(
             IntradayOpportunity.outcome_id == outcome_id,
             IntradayOpportunity.side == side,
-            IntradayOpportunity.detected_at >= today_start,
+            IntradayOpportunity.detected_at >= day_start,
         ).limit(1)
     )
     return q.scalar_one_or_none() is not None
@@ -302,7 +320,7 @@ async def _evaluate_intraday_outcome(
     if certainty < alert_thresh or edge < min_edge or edge > max_edge:
         return None, None
 
-    if await _has_intraday_today(db, outcome.id, side):
+    if await _has_intraday_today(db, outcome.id, side, tz):
         # Already recorded today — only a lightweight re-alert on >= 1pp move.
         should, note = _realert_due(outcome.id, side, certainty)
         if should and note is not None:
@@ -319,12 +337,12 @@ async def _evaluate_intraday_outcome(
             }
         return None, None
 
-    # First record today — register baseline for future re-alerts.
-    _realert_due(outcome.id, side, certainty)
-
     create_buy = certainty >= buy_thresh and not bool(getattr(city, "blacklisted", False))
 
-    # Collect per-source forecast highs for the alert display table.
+    # Collect per-source forecast highs (bias-corrected — the same values the
+    # blend actually used) for the alert display table.
+    from app.analyzers.probability_estimator import _source_bias
+    station_bias = signals.get("station_bias") or {}
     _SRC_LABELS = {
         "hrrr_forecast": "HRRR", "nws_forecast": "NWS",
         "gfs_forecast": "GFS", "ecmwf_forecast": "ECMWF",
@@ -335,7 +353,7 @@ async def _evaluate_intraday_outcome(
     for key, label in _SRC_LABELS.items():
         val = (signals.get(key) or {}).get("predicted_high_f")
         if val is not None:
-            forecast_sources[label] = round(float(val), 1)
+            forecast_sources[label] = round(float(val) + _source_bias(station_bias, key), 1)
 
     intraday_signals = {
         "_intraday": breakdown,
@@ -347,6 +365,8 @@ async def _evaluate_intraday_outcome(
         "_create_virtual_buy": bool(create_buy),
         "_bucket_unit": bucket_unit,
         "_forecast_sources": forecast_sources,
+        "_forecast_bias_f": round(float(station_bias.get("bias_f") or 1.5), 2),
+        "_forecast_bias_is_default": bool(station_bias.get("is_default", True)),
     }
 
     opp = IntradayOpportunity(
@@ -374,4 +394,8 @@ async def _evaluate_intraday_outcome(
     db.add(opp)
     await db.commit()
     await db.refresh(opp)
+    # Register the re-alert baseline only after the record actually exists —
+    # registering before the commit would suppress today's re-alerts if the
+    # insert failed.
+    _realert_due(outcome.id, side, certainty)
     return opp, None
