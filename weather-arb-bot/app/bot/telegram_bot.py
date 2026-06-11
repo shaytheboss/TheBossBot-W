@@ -268,8 +268,11 @@ def _fmt_intraday_alert(
         headline = f"⚡ *INTRADAY — {side} {bucket_label}* ({city_name})\n#INTRADAY"
 
     # ── Lock / peak status ────────────────────────────────────────────────
+    hours_left_str = f"{float(hours_left):.1f}h" if hours_left is not None else "?h"
+    time_line = f"⏳ Local time *{local_time_str}*  |  *{hours_left_str}* to peak window end"
     if lock == "yes_impossible":
         status_block = (
+            f"{time_line}\n"
             "🔒 *LOCK — YES IMPOSSIBLE*\n"
             f"Running max *{running}°F* already exceeds this bucket's ceiling *{f_hi}°F*. "
             "The daily max can only increase, so this bucket can never be the final answer.\n"
@@ -277,6 +280,7 @@ def _fmt_intraday_alert(
         )
     elif lock == "yes_locked":
         status_block = (
+            f"{time_line}\n"
             "🔒 *LOCK — YES SECURED*\n"
             f"Running max *{running}°F* has already crossed the open-ended bucket floor *{f_lo}°F*. "
             "→ YES is mathematically guaranteed regardless of remaining heating."
@@ -284,22 +288,26 @@ def _fmt_intraday_alert(
     elif peak_passed:
         sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
         status_block = (
+            f"{time_line}\n"
             f"🌡 *Peak passed* — temperature is now falling.\n"
             f"Today's max is almost certainly set at *{running}°F*. "
             f"Residual σ = {sigma_str}."
         )
     else:
         heating_pct = int(round((gain_w or 0) * 100))
-        sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
+        gain_w_str = f"{float(gain_w):.2f}" if gain_w is not None else "?"
         status_block = (
-            f"⏳ Local time *{local_time_str}*  |  *{hours_left:.1f}h* to peak window end\n"
-            f"Remaining heating: *{heating_pct}%* of today's potential still ahead (gain weight = {gain_w:.2f})"
+            f"{time_line}\n"
+            f"Remaining heating: *{heating_pct}%* of today's potential still ahead "
+            f"(gain weight = {gain_w_str})"
         )
 
     # ── Current conditions ────────────────────────────────────────────────
     current_str = f"*{current:.1f}°F*" if current is not None else "N/A"
+    running_str = f"*{running}°F*" if running is not None else "N/A"
+    expected_str = f"*{expected}°F*" if expected is not None else "N/A"
     cond_lines = [
-        f"  Now: {current_str}  |  Running max today: *{running}°F*  |  Expected final: *{expected}°F*"
+        f"  Now: {current_str}  |  Running max today: {running_str}  |  Expected final: {expected_str}"
     ]
     if forecast_high is not None and running is not None:
         gap = round(float(forecast_high) - float(running), 1)
@@ -329,6 +337,17 @@ def _fmt_intraday_alert(
             fc_lines.append(f"  ↳ Blended high: *{forecast_high:.1f}°F* (single source)")
     else:
         fc_lines = ["  • No forecast data available"]
+    bias_f = sig.get("_forecast_bias_f")
+    if fc_sources and bias_f is not None and abs(float(bias_f)) >= 0.1:
+        bias_src = (
+            "default prior" if sig.get("_forecast_bias_is_default", True)
+            else "learned from history"
+        )
+        sign = "+" if float(bias_f) >= 0 else ""
+        fc_lines.append(
+            f"  ↳ 🌡️ Airport bias {sign}{float(bias_f):.1f}°F included "
+            f"({bias_src}) — METAR highs run warmer than gridded models"
+        )
     forecasts_block = "\n".join(fc_lines)
 
     # ── Probability model math ────────────────────────────────────────────
@@ -341,7 +360,7 @@ def _fmt_intraday_alert(
     math_lines = [
         f"_max(M, X) model: final max = max(running max, X),  X ~ N(μ, σ)_",
         f"  • Bucket bounds: [{bucket_lo_str}, {bucket_hi_str})",
-        f"  • M (running max) = *{running}°F*  |  μ (expected final max) = *{expected}°F*",
+        f"  • M (running max) = {running_str}  |  μ (expected final max) = {expected_str}",
         f"  • σ = {sigma_str}  ({sigma_ctx})",
         f"  • P(YES) = {yes_pct}%  ⇒  P(NO) = {no_pct}%  →  *{side}*",
     ]
@@ -461,13 +480,7 @@ async def send_intraday_alert(opportunity, db) -> None:
     await db.commit()
 
 
-async def send_intraday_realert(ra: dict, db) -> None:
-    """Lightweight ⚡ update — certainty moved >=1pp on an already-recorded signal."""
-    if not settings.telegram_bot_token:
-        return
-    from sqlalchemy import select
-    from app.models.alert import TelegramUser
-
+def _fmt_intraday_realert(ra: dict) -> str:
     conf = int(round(ra["certainty"] * 100))
     edge_c = int(round(ra["edge"] * 100))
     entry_c = int(round(ra["entry_cost"] * 100))
@@ -488,16 +501,28 @@ async def send_intraday_realert(ra: dict, db) -> None:
         state_line = f"🌡 Peak passed — temp now falling, max set at {running}°F"
     else:
         sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
-        state_line = f"⏳ {hours_left:.1f}h to peak end | running max {running}°F → expected {expected}°F | σ={sigma_str}"
+        hours_str = f"{float(hours_left):.1f}h" if hours_left is not None else "?h"
+        state_line = f"⏳ {hours_str} to peak end | running max {running}°F → expected {expected}°F | σ={sigma_str}"
 
     current_str = f" | now {current:.1f}°F" if current is not None else ""
-    text = (
+    return (
         f"⚡ *INTRADAY UPDATE* — {ra['side']} _{ra['bucket_label']}_ ({ra['city_name']})\n"
         f"📊 {ra['change_note']}\n\n"
         f"{state_line}{current_str}\n\n"
         f"💰 Entry: {entry_c}¢  |  Edge: +{edge_c}¢  |  Certainty: *{conf}%*\n"
         f"_Already recorded today — tracking continues on the original position._"
     )
+
+
+async def send_intraday_realert(ra: dict, db) -> None:
+    """Lightweight ⚡ update — certainty moved >=1pp on an already-recorded signal."""
+    if not settings.telegram_bot_token:
+        return
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser
+
+    conf = int(round(ra["certainty"] * 100))
+    text = _fmt_intraday_realert(ra)
     users_result = await db.execute(
         select(TelegramUser).where(TelegramUser.min_confidence <= conf)
     )

@@ -467,6 +467,7 @@ async def _evaluate_opportunity(
     signals["_suspension_reason"] = getattr(city, "suspension_reason", None) if is_suspended else None
     signals["_why_now"] = why_now
     signals["_calibrated_confidence"] = int(round(calibrated_certainty * 100))
+    signals["_shares_per_buy"] = SHARES_PER_BUY
 
     opp = Opportunity(
         outcome_id=outcome.id,

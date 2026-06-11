@@ -671,7 +671,9 @@ def fmt_opportunity(
     create_buy = signals.get("_create_virtual_buy")
     buy_thresh = signals.get("_buy_threshold")
     is_blacklisted = signals.get("_city_blacklisted", False)
-    SHARES = 5
+    # Use the share count the detector actually opened the position with; the
+    # old hardcoded 5 could silently diverge from the stored virtual_shares.
+    SHARES = int(signals.get("_shares_per_buy") or 5)
     if entry_cost is not None and create_buy:
         entry_cents_v = round(float(entry_cost) * 100)
         cost_v = SHARES * float(entry_cost)
