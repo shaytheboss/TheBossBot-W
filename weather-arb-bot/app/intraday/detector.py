@@ -36,13 +36,16 @@ aggregator = SignalAggregator()
 _poly_col = PolymarketCollector()
 
 # Forecast blend weights: HRRR is the best 0-18h US model, NWS updates hourly.
+# Wunderground is deliberately ABSENT: for a same-day market its scraped
+# "high" is the observed-so-far maximum (the history page), not a forecast of
+# the final high — blending it in dragged the expected final max down toward
+# the current running max. It feeds the model via official_running_max instead.
 _BLEND_WEIGHTS = {
     "hrrr_forecast": 2.0,
     "nws_forecast": 1.5,
     "gfs_forecast": 1.25,
     "ecmwf_forecast": 1.25,
     "icon_forecast": 1.0,
-    "wunderground_forecast": 1.0,
     "tomorrowio_forecast": 1.0,
     "meteosource_forecast": 1.0,
 }
@@ -51,6 +54,42 @@ _BLEND_WEIGHTS = {
 REALERT_CONF_DELTA = 0.01
 _realert_date: Optional[date] = None
 _last_alerted: dict[tuple, float] = {}   # (outcome_id, side) -> certainty
+
+
+# Wunderground observed-max floor: WU's history page for today shows the
+# OFFICIAL daily high so far — the number Polymarket actually resolves on.
+# METAR (different sampling, rounding) can lag it by 1-2°F, which is exactly
+# the kind of error that locks/kills a bucket without us noticing.
+WU_MAX_STALE_MINUTES = 90.0       # ignore WU readings older than this
+WU_MAX_DISCREPANCY_F = 4.0        # WU way above METAR ⇒ probably scraped a forecast row
+
+
+def official_running_max(
+    metar_max_f: Optional[float],
+    wu_high_f: Optional[float],
+    wu_age_minutes: Optional[float],
+) -> tuple[Optional[float], str, bool]:
+    """Resolution-source-aware running max.
+
+    Returns (official_max, source, wu_suspect). The official max is the higher
+    of the METAR running max and Wunderground's observed-so-far high — WU is
+    the station Polymarket resolves on, so when it reads higher the METAR
+    number is simply behind reality. A WU value far above METAR (more than
+    WU_MAX_DISCREPANCY_F) is treated as suspect (the scraper may have caught a
+    forecast row instead of an observation) and NOT used, only flagged.
+    """
+    if metar_max_f is None:
+        return None, "none", False
+    if wu_high_f is None:
+        return metar_max_f, "metar", False
+    if wu_age_minutes is not None and wu_age_minutes > WU_MAX_STALE_MINUTES:
+        return metar_max_f, "metar", False
+    wu = float(wu_high_f)
+    if wu > metar_max_f + WU_MAX_DISCREPANCY_F:
+        return metar_max_f, "metar", True   # suspect — surface but don't trust
+    if wu > metar_max_f:
+        return wu, "wunderground", False
+    return metar_max_f, "metar", False
 
 
 def _reset_realert_if_new_day() -> None:
@@ -272,11 +311,30 @@ async def _evaluate_intraday_outcome(
         onshore_wind_dir=getattr(city, "onshore_wind_dir", None),
     )
 
-    running_max = signals.get("metar_today_max_f")
+    metar_max = signals.get("metar_today_max_f")
     price_info = signals.get("market_price")
-    if running_max is None or not price_info:
+    if metar_max is None or not price_info:
         return None, None
-    running_max = float(running_max)
+    metar_max = float(metar_max)
+
+    # OFFICIAL running max: Polymarket resolves on the Wunderground station,
+    # whose observed-so-far high can run 1-2°F above METAR. Using METAR alone
+    # underestimated the floor (real incident: WU history showed 74°F while
+    # METAR said 73.0°F — the model called a bucket "expected final 73.0").
+    wu_fc = signals.get("wunderground_forecast") or {}
+    wu_high = wu_fc.get("predicted_high_f")
+    wu_age_min: Optional[float] = None
+    if wu_fc.get("retrieved_at"):
+        try:
+            wu_ts = datetime.fromisoformat(str(wu_fc["retrieved_at"]))
+            if wu_ts.tzinfo is None:
+                wu_ts = wu_ts.replace(tzinfo=timezone.utc)
+            wu_age_min = (datetime.now(timezone.utc) - wu_ts).total_seconds() / 60.0
+        except (ValueError, TypeError):
+            pass
+    running_max, max_source, wu_suspect = official_running_max(
+        metar_max, wu_high, wu_age_min
+    )
 
     current_temp = (signals.get("primary_metar") or {}).get("temperature_f")
     current_temp = float(current_temp) if current_temp is not None else None
@@ -307,7 +365,16 @@ async def _evaluate_intraday_outcome(
         bucket_max=outcome.bucket_max,
         bucket_unit=bucket_unit,
         params=params,
+        metar_max_f=metar_max,
     )
+    breakdown["max_source"] = max_source
+    breakdown["wu_high_f"] = float(wu_high) if wu_high is not None else None
+    breakdown["wu_suspect"] = wu_suspect
+    if wu_suspect:
+        logger.warning(
+            f"Intraday: WU high {wu_high}°F is >{WU_MAX_DISCREPANCY_F}°F above "
+            f"METAR max {metar_max}°F for {city.name} — ignoring as suspect scrape"
+        )
 
     yes_entry = book["ask"]
     no_entry = round(1.0 - book["bid"], 4)
@@ -343,10 +410,11 @@ async def _evaluate_intraday_outcome(
     # blend actually used) for the alert display table.
     from app.analyzers.probability_estimator import _source_bias
     station_bias = signals.get("station_bias") or {}
+    # WU intentionally excluded — it's the observation feed here, not a model.
     _SRC_LABELS = {
         "hrrr_forecast": "HRRR", "nws_forecast": "NWS",
         "gfs_forecast": "GFS", "ecmwf_forecast": "ECMWF",
-        "icon_forecast": "ICON", "wunderground_forecast": "Wunderground",
+        "icon_forecast": "ICON",
         "tomorrowio_forecast": "Tomorrow.io", "meteosource_forecast": "Meteosource",
     }
     forecast_sources: dict[str, float] = {}

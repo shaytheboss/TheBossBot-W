@@ -183,12 +183,20 @@ def estimate_intraday(
     bucket_max: Optional[float],
     bucket_unit: str = "F",
     params: IntradayParams = DEFAULT_PARAMS,
+    metar_max_f: Optional[float] = None,
 ) -> Tuple[float, dict]:
-    """Full intraday estimate for one bucket. Returns (probability, breakdown)."""
+    """Full intraday estimate for one bucket. Returns (probability, breakdown).
+
+    running_max_f is the OFFICIAL running max (may come from Wunderground, the
+    resolution source). metar_max_f, when given, is the METAR-derived max used
+    only for peak-passed detection — current_temp_f and minutes_since_max are
+    METAR readings, so the cooling test must compare on the same scale.
+    """
     f_lo, f_hi = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
 
+    peak_detection_max = metar_max_f if metar_max_f is not None else running_max_f
     peak_passed = is_peak_passed(
-        local_hour, current_temp_f, running_max_f, minutes_since_max, params
+        local_hour, current_temp_f, peak_detection_max, minutes_since_max, params
     )
     sigma = intraday_sigma(local_hour, peak_passed, params)
     mu = expected_final_max(running_max_f, forecast_high_f, local_hour, params)
@@ -197,6 +205,7 @@ def estimate_intraday(
 
     breakdown = {
         "running_max_f": round(running_max_f, 1),
+        "metar_max_f": round(metar_max_f, 1) if metar_max_f is not None else None,
         "current_temp_f": round(current_temp_f, 1) if current_temp_f is not None else None,
         "forecast_high_f": round(forecast_high_f, 1) if forecast_high_f is not None else None,
         "expected_final_max_f": round(mu, 1),

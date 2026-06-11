@@ -114,7 +114,7 @@ def _fmt_open_position_alert(alert: dict) -> str:
     calib_note = f" (calibrated: {cal_conf}%)" if cal_conf != conf else ""
     change_note = alert.get("change_note")
     if change_note:
-        headline = "🔁 *SIGNAL UPDATE — BUY ALREADY OPEN*"
+        headline = f"*{conf}%* 🔁 *SIGNAL UPDATE — BUY ALREADY OPEN*"
         change_line = f"\n📊 *What changed:* {change_note}\n"
         footer = (
             "_The numbers moved materially since the last alert on this outcome. "
@@ -122,7 +122,7 @@ def _fmt_open_position_alert(alert: dict) -> str:
             "Review if manually trading._"
         )
     else:
-        headline = "🔁 *SIGNAL STILL FIRING — BUY ALREADY OPEN*"
+        headline = f"*{conf}%* 🔁 *SIGNAL STILL FIRING — BUY ALREADY OPEN*"
         change_line = ""
         footer = (
             "_The signal has not changed direction. "
@@ -149,7 +149,7 @@ def _fmt_bucket_switch_alert(alert: dict) -> str:
         old_parts.append(f"• _{label}_ (opened at {entry_cents}¢)")
     old_str = "\n".join(old_parts) if old_parts else "• (unknown)"
     return (
-        f"🔄 *BUCKET SWITCH SIGNAL*\n\n"
+        f"*{conf}%* 🔄 *BUCKET SWITCH SIGNAL*\n\n"
         f"📍 *{alert['city_name']}*\n"
         f"📅 {alert['event_date'].strftime('%b %d')}\n\n"
         f"*New signal:* {alert['new_side']} on _{alert['new_bucket_label']}_\n"
@@ -263,9 +263,9 @@ def _fmt_intraday_alert(
 
     # ── Headline ──────────────────────────────────────────────────────────
     if sig.get("_create_virtual_buy"):
-        headline = f"⚡ *INTRADAY BUY — {side} {bucket_label}* ({city_name})\n#INTRADAY"
+        headline = f"*{conf}%* ⚡ *INTRADAY BUY — {side} {bucket_label}* ({city_name})\n#INTRADAY"
     else:
-        headline = f"⚡ *INTRADAY — {side} {bucket_label}* ({city_name})\n#INTRADAY"
+        headline = f"*{conf}%* ⚡ *INTRADAY — {side} {bucket_label}* ({city_name})\n#INTRADAY"
 
     # ── Lock / peak status ────────────────────────────────────────────────
     hours_left_str = f"{float(hours_left):.1f}h" if hours_left is not None else "?h"
@@ -313,6 +313,23 @@ def _fmt_intraday_alert(
         gap = round(float(forecast_high) - float(running), 1)
         gap_str = f"+{gap}°F" if gap >= 0 else f"{gap}°F"
         cond_lines.append(f"  Forecast high – running max gap: *{gap_str}* (what remains to be gained)")
+    # Resolution-source transparency: Polymarket settles on the Wunderground
+    # station, so when WU reads higher than METAR the WU value IS the max.
+    max_source = bd.get("max_source")
+    metar_max = bd.get("metar_max_f")
+    wu_high = bd.get("wu_high_f")
+    if max_source == "wunderground" and wu_high is not None:
+        cond_lines.append(
+            f"  ⚠️ *Official source override*: Wunderground (resolution station) "
+            f"already reads *{wu_high}°F* vs METAR {metar_max}°F — using WU as the running max."
+        )
+    elif wu_high is not None and metar_max is not None and bd.get("wu_suspect"):
+        cond_lines.append(
+            f"  ⚠️ WU reads {wu_high}°F vs METAR {metar_max}°F — gap too large, "
+            f"treated as suspect scrape and NOT used. Verify manually."
+        )
+    elif wu_high is not None:
+        cond_lines.append(f"  WU (resolution station) observed high: {wu_high}°F ✓ consistent")
     conditions_block = "\n".join(cond_lines)
 
     # ── Per-source forecast table ─────────────────────────────────────────
@@ -505,10 +522,16 @@ def _fmt_intraday_realert(ra: dict) -> str:
         state_line = f"⏳ {hours_str} to peak end | running max {running}°F → expected {expected}°F | σ={sigma_str}"
 
     current_str = f" | now {current:.1f}°F" if current is not None else ""
+    wu_line = ""
+    if bd.get("max_source") == "wunderground" and bd.get("wu_high_f") is not None:
+        wu_line = (
+            f"\n⚠️ Running max from *Wunderground (resolution station)*: "
+            f"{bd['wu_high_f']}°F (METAR reads {bd.get('metar_max_f')}°F)"
+        )
     return (
-        f"⚡ *INTRADAY UPDATE* — {ra['side']} _{ra['bucket_label']}_ ({ra['city_name']})\n"
+        f"*{conf}%* ⚡ *INTRADAY UPDATE* — {ra['side']} _{ra['bucket_label']}_ ({ra['city_name']})\n"
         f"📊 {ra['change_note']}\n\n"
-        f"{state_line}{current_str}\n\n"
+        f"{state_line}{current_str}{wu_line}\n\n"
         f"💰 Entry: {entry_c}¢  |  Edge: +{edge_c}¢  |  Certainty: *{conf}%*\n"
         f"_Already recorded today — tracking continues on the original position._"
     )

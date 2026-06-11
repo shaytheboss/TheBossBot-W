@@ -1096,7 +1096,10 @@ def fmt_opportunity(
     else:
         headline = "\U0001f3af *HIGH CONFIDENCE OPPORTUNITY*"
 
+    # Probability first — every alert type leads with the model's certainty so
+    # it can be read at a glance from the notification preview.
     return (
+        f"*{side_prob_pct}%* "
         f"{update_section}"
         f"{headline}\n\n"
         f"{loc_line}\n"
