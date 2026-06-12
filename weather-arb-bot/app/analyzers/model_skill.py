@@ -1,23 +1,24 @@
-"""מאגר מנוהל של דיוק מודלים פר-עיר — הלב של "מי באמת צודק כאן".
+"""מאגר מנוהל של דיוק מודלים פר-עיר ופר-זמן-הקדמה.
 
-הרעיון: לכל (עיר, מודל) נמדוד שוב ושוב כמה התחזית של המודל קלעה לדלי
-שפולימרקט סגרה בפועל כמנצח — האמת היחידה שמשלמת. את התוצאה נשמור
-בטבלה מנוהלת (model_skill) שמתעדכנת אחרי כל settlement וב-job תקופתי,
-כך שהמשקולות נושמות עם הזמן: מודל שמצטיין בעיר מסוימת מקבל משקל גבוה,
-מודל שדועך מאבד אותו מעצמו (חלון מדידה מתגלגל של WINDOW_DAYS).
+הרעיון: לכל (עיר, מודל, days_ahead) נמדוד כמה התחזית של המודל קלעה
+לדלי שפולימרקט סגרה בפועל כמנצח — האמת היחידה שמשלמת.
 
-מי צורך את המשקולות:
-  - הבוט היומי:    probability_estimator משקלל את הממוצע הדטרמיניסטי
-  - הבוט התוך-יומי: detector מכפיל את משקלי הבסיס בבלנד התחזיות
-  - הדשבורד:        מסך "Model skill" מציג את הטבלה החיה
+days_ahead = (forecast_for_date - date(retrieved_at)).days
+  0 = ביום האירוע עצמו (ה"מילה האחרונה")
+  1 = יום לפני האירוע
+  2 = יומיים לפני האירוע
+  ...
 
-מקור הנתונים: טבלת forecasts הגולמית (לא Opportunity.signals!) — לכל
-שוק סגור נלקח הסנפשוט האחרון שכל מודל פרסם ביום האירוע עצמו. זה מכסה
-אוטומטית גם את היומי וגם את התוך-יומי, כי שניהם ניזונים מאותן תחזיות.
+למה זה חשוב: כשהבוט מוציא התראה יומיים מראש, התחזית שהוא סומך עליה
+היא בדיוק אותה תחזית-2-day-ahead. אם ECMWF מצטיין ב-2-day-ahead בניו-יורק
+אבל גרוע ב-same-day, הוא יקבל משקל גבוה בהתראות המוקדמות ונמוך בהתראות
+המאוחרות — כל קטגוריה מדידה בנפרד.
+
+כל אחד מהמשקולות נשמר בטבלה מנוהלת (model_skill) שמתעדכנת אחרי כל
+settlement וב-job תקופתי, כך שהמשקולות נושמות עם הזמן.
 
 עקרון בטיחות: מודל בלי מספיק דגימות (MIN_SAMPLES) נשאר במשקל ניטרלי
-1.0 — אין ענישה על חוסר היסטוריה, וההתנהגות זהה לממוצע לא-משוקלל עד
-שמצטברות ראיות. המשקל כלוא קשיח ב-[0.5, 1.5] כדי שאף מודל לא ישתלט.
+1.0 — אין ענישה על חוסר היסטוריה. המשקל כלוא קשיח ב-[0.5, 1.5].
 """
 import logging
 import time
@@ -41,6 +42,8 @@ MIN_SAMPLES = 5
 WINDOW_DAYS = 90
 # TTL לקאש הקריאה (החיזוי רץ כל כמה דקות; המשקולות זזות בקצב יומי)
 CACHE_TTL_SECONDS = 300
+# days_ahead מקסימלי שנמדד — תחזיות שפורסמו יותר רחוק לא נמדדות
+MAX_DAYS_AHEAD = 3
 
 # המודלים שנמדדים. Wunderground בכוונה לא כאן — ביום האירוע ה"תחזית"
 # שלו היא התצפית-עד-כה (עמוד ההיסטוריה), לא חיזוי, ולכן ציון עליו
@@ -52,7 +55,8 @@ SKILL_SOURCES: tuple[str, ...] = (
 # מיפוי שם-מקור ↔ מפתח-סיגנלים (כפי שהאסטימטורים מכירים אותו)
 SOURCE_TO_SIGNAL_KEY = {s: f"{s}_forecast" for s in SKILL_SOURCES}
 
-_cache: dict[int, tuple[float, dict]] = {}
+# קאש: מפתח = (city_id, days_ahead); ערך = (monotonic_ts, weights_dict)
+_cache: dict[tuple[int, int], tuple[float, dict]] = {}
 
 
 def invalidate_cache() -> None:
@@ -120,12 +124,15 @@ def skill_weight(hits: int, samples: int) -> float:
 
 # ── חישוב ועדכון הטבלה ──────────────────────────────────────────────────────
 
-async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[str, dict]:
-    """סטטיסטיקת דיוק לכל מודל בעיר אחת, על חלון הזמן המתגלגל.
+async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[tuple, dict]:
+    """סטטיסטיקת דיוק לכל (מודל, days_ahead) בעיר אחת, על חלון הזמן המתגלגל.
 
-    מחזיר {source: {samples, hits, dist_sum, signed_sum, last_event}}.
-    לכל שוק סגור נלקח הסנפשוט האחרון שהמודל פרסם ביום האירוע עצמו —
-    "המילה האחרונה" של המודל לפני שהיום הוכרע.
+    מחזיר {(source, days_ahead): {samples, hits, dist_sum, signed_sum, last_event}}.
+
+    לכל שוק סגור ולכל מודל, נמדדת כל תחזית שפורסמה ב-0..MAX_DAYS_AHEAD
+    ימים לפני האירוע — כלומר מכסים גם אותו-יום וגם תחזיות מוקדמות.
+    לכל (מודל, יום-אירוע, days_ahead) נלקחת התחזית עם retrieved_at המאוחר
+    ביותר בתוך אותו יום-הקדמה.
     """
     since = date.today() - timedelta(days=WINDOW_DAYS)
 
@@ -155,59 +162,56 @@ async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[str, dict]:
     if not winners_by_market:
         return {}
 
-    # 2. "המילה האחרונה" של כל מודל לכל יום-אירוע: התחזית עם retrieved_at
-    #    המאוחר ביותר עבור forecast_for_date == יום האירוע.
+    # 2. כל תחזיות המודלים לימי-האירוע הרלוונטיים
     event_days = sorted({market_dates[mid] for mid in winners_by_market})
-    sub = (
-        select(
-            Forecast.source,
-            Forecast.forecast_for_date,
-            sqlfunc.max(Forecast.retrieved_at).label("last_ts"),
-        )
-        .where(
+    fc_rows = (await db.execute(
+        select(Forecast).where(
             Forecast.city_id == city_id,
             Forecast.source.in_(SKILL_SOURCES),
             Forecast.forecast_for_date.in_(event_days),
+            Forecast.predicted_high_f.isnot(None),
         )
-        .group_by(Forecast.source, Forecast.forecast_for_date)
-        .subquery()
-    )
-    fc_rows = (await db.execute(
-        select(Forecast).join(
-            sub,
-            (Forecast.source == sub.c.source)
-            & (Forecast.forecast_for_date == sub.c.forecast_for_date)
-            & (Forecast.retrieved_at == sub.c.last_ts),
-        ).where(Forecast.city_id == city_id)
     )).scalars().all()
-    # (source, event_date) → predicted_high_f
-    final_word: dict[tuple, float] = {}
-    for fc in fc_rows:
-        if fc.predicted_high_f is not None:
-            final_word[(fc.source, fc.forecast_for_date)] = float(fc.predicted_high_f)
 
-    # 3. צבירה: לכל שוק סגור, ציון כל מודל שפרסם תחזית ליום הזה
-    stats: dict[str, dict] = {}
+    # 3. לכל (source, event_date, days_ahead) — שמור את התחזית עם retrieved_at
+    #    המאוחר ביותר בתוך אותו יום-הקדמה.
+    #    days_ahead = (event_date - date(retrieved_at)).days
+    best: dict[tuple, tuple] = {}   # (source, event_date, days_ahead) → (retrieved_at, high_f)
+    for fc in fc_rows:
+        da = (fc.forecast_for_date - fc.retrieved_at.date()).days
+        if da < 0 or da > MAX_DAYS_AHEAD:
+            continue   # פורסם אחרי האירוע, או רחוק מדי מראש — לא מדידה שימושית
+        key = (fc.source, fc.forecast_for_date, da)
+        if key not in best or fc.retrieved_at > best[key][0]:
+            best[key] = (fc.retrieved_at, float(fc.predicted_high_f))
+
+    # ארגון מחדש: (source, event_date) → {days_ahead: high_f}
+    by_source_date: dict[tuple, dict[int, float]] = {}
+    for (source, event_date, da), (_, high_f) in best.items():
+        by_source_date.setdefault((source, event_date), {})[da] = high_f
+
+    # 4. צבירה לסטטיסטיקה: {(source, days_ahead): {...}}
+    stats: dict[tuple, dict] = {}
     for mid, winners in winners_by_market.items():
         ev = market_dates[mid]
         for source in SKILL_SOURCES:
-            fc_val = final_word.get((source, ev))
-            if fc_val is None:
-                continue
-            scored = score_forecast(fc_val, winners)
-            if scored is None:
-                continue
-            hit, dist, signed = scored
-            s = stats.setdefault(source, {
-                "samples": 0, "hits": 0, "dist_sum": 0.0,
-                "signed_sum": 0.0, "last_event": None,
-            })
-            s["samples"] += 1
-            s["hits"] += 1 if hit else 0
-            s["dist_sum"] += dist
-            s["signed_sum"] += signed
-            if s["last_event"] is None or ev > s["last_event"]:
-                s["last_event"] = ev
+            da_map = by_source_date.get((source, ev), {})
+            for da, high_f in da_map.items():
+                scored = score_forecast(high_f, winners)
+                if scored is None:
+                    continue
+                hit, dist, signed = scored
+                key = (source, da)
+                st = stats.setdefault(key, {
+                    "samples": 0, "hits": 0, "dist_sum": 0.0,
+                    "signed_sum": 0.0, "last_event": None,
+                })
+                st["samples"] += 1
+                st["hits"] += 1 if hit else 0
+                st["dist_sum"] += dist
+                st["signed_sum"] += signed
+                if st["last_event"] is None or ev > st["last_event"]:
+                    st["last_event"] = ev
     return stats
 
 
@@ -229,18 +233,18 @@ async def update_model_skill(db: AsyncSession) -> dict:
             logger.warning("model_skill: compute failed for city %s: %s", city.id, exc)
             continue
 
-        # שורות קיימות של העיר — upsert ידני (עובד גם על SQLite בבדיקות)
+        # שורות קיימות של העיר — upsert ידני, מפתח: (source, days_ahead)
         existing = {
-            row.source: row
+            (row.source, row.days_ahead): row
             for row in (await db.execute(
                 select(ModelSkill).where(ModelSkill.city_id == city.id)
             )).scalars().all()
         }
-        for source, s in stats.items():
+        for (source, days_ahead), s in stats.items():
             n, h = s["samples"], s["hits"]
-            row = existing.get(source)
+            row = existing.get((source, days_ahead))
             if row is None:
-                row = ModelSkill(city_id=city.id, source=source)
+                row = ModelSkill(city_id=city.id, source=source, days_ahead=days_ahead)
                 db.add(row)
             row.samples = n
             row.hits = h
@@ -253,10 +257,10 @@ async def update_model_skill(db: AsyncSession) -> dict:
             row.last_event_date = s["last_event"]
             row.updated_at = datetime.now(timezone.utc)
             updated_rows += 1
-        # מודל שנעלם מהחלון (אין לו עוד שווקים) — מתאפס לניטרלי במקום
-        # לגרור משקל ישן לנצח
-        for source, row in existing.items():
-            if source not in stats:
+
+        # מודל/day-ahead שנעלם מהחלון — מתאפס לניטרלי במקום לגרור משקל ישן
+        for key, row in existing.items():
+            if key not in stats:
                 row.samples = 0
                 row.hits = 0
                 row.hit_rate = None
@@ -274,22 +278,31 @@ async def update_model_skill(db: AsyncSession) -> dict:
 
 # ── הקריאה מצד החיזוי ───────────────────────────────────────────────────────
 
-async def get_skill_weights(db: AsyncSession, city_id: int) -> dict:
-    """משקולות לעיר במפתחות-סיגנלים: {'gfs_forecast': 1.32, ...}.
+async def get_skill_weights(db: AsyncSession, city_id: int, days_ahead: int = 0) -> dict:
+    """משקולות לעיר ולזמן-הקדמה במפתחות-סיגנלים: {'gfs_forecast': 1.32, ...}.
+
+    days_ahead = כמה ימים לפני יום האירוע ניתנת ההתראה הנוכחית:
+      0 — התראה ביום עצמו (same-day)
+      1 — התראה יום לפני
+      2 — התראה יומיים לפני
+    ברירת מחדל 0 (אחורה-תואם עם הגרסה הקודמת).
 
     קודם מהטבלה המנוהלת (עם קאש קצר). אם לטבלה אין עדיין שורות לעיר
-    (לפני הריצה הראשונה של ה-job) — נפילה רכה למנגנון החישוב הוותיק,
-    כדי שהמעבר לא ישאיר אף עיר בלי משקולות אפילו לרגע.
+    (לפני הריצה הראשונה של ה-job) — נפילה רכה למנגנון החישוב הוותיק.
     """
+    cache_key = (city_id, days_ahead)
     now = time.monotonic()
-    cached = _cache.get(city_id)
+    cached = _cache.get(cache_key)
     if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
         return cached[1]
 
     weights: dict = {}
     try:
         rows = (await db.execute(
-            select(ModelSkill).where(ModelSkill.city_id == city_id)
+            select(ModelSkill).where(
+                ModelSkill.city_id == city_id,
+                ModelSkill.days_ahead == days_ahead,
+            )
         )).scalars().all()
         for row in rows:
             if row.samples >= MIN_SAMPLES:
@@ -297,7 +310,8 @@ async def get_skill_weights(db: AsyncSession, city_id: int) -> dict:
                 if key:
                     weights[key] = float(row.weight)
     except Exception as exc:
-        logger.warning("model_skill: read failed for city %s: %s", city_id, exc)
+        logger.warning("model_skill: read failed for city %s da=%s: %s",
+                       city_id, days_ahead, exc)
 
     if not weights:
         # נפילה רכה: החישוב הוותיק (מ-Opportunity.signals) עד שהטבלה תתמלא
@@ -309,5 +323,5 @@ async def get_skill_weights(db: AsyncSession, city_id: int) -> dict:
                            city_id, exc)
             weights = {}
 
-    _cache[city_id] = (now, weights)
+    _cache[cache_key] = (now, weights)
     return weights

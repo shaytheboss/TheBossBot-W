@@ -814,7 +814,7 @@ async def admin_model_skill(
     q = (
         select(ModelSkill, City.name)
         .join(City, City.id == ModelSkill.city_id)
-        .order_by(City.name, ModelSkill.source)
+        .order_by(City.name, ModelSkill.source, ModelSkill.days_ahead)
     )
     if city_id is not None:
         q = q.where(ModelSkill.city_id == city_id)
@@ -826,6 +826,8 @@ async def admin_model_skill(
                 "city_id": r.ModelSkill.city_id,
                 "city": r.name,
                 "source": r.ModelSkill.source,
+                # days_ahead = כמה ימים לפני יום האירוע פורסמה התחזית הנמדדת
+                "days_ahead": r.ModelSkill.days_ahead,
                 "samples": r.ModelSkill.samples,
                 "hits": r.ModelSkill.hits,
                 "hit_rate": r.ModelSkill.hit_rate,

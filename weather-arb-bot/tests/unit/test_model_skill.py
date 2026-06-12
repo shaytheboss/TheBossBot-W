@@ -109,6 +109,12 @@ def test_source_signal_key_mapping_complete():
     assert "wunderground" not in SKILL_SOURCES
 
 
+def test_max_days_ahead_is_defined():
+    """MAX_DAYS_AHEAD קיים ומוגבל — תחזיות רחוקות מדי לא נכנסות למדידה."""
+    from app.analyzers.model_skill import MAX_DAYS_AHEAD
+    assert 1 <= MAX_DAYS_AHEAD <= 7   # בין יום אחד לשבוע
+
+
 # ── השקלול בבלנד התוך-יומי ───────────────────────────────────────────────────
 
 def _signals(weights=None):
