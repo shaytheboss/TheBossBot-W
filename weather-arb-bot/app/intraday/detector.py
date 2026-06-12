@@ -50,10 +50,15 @@ _BLEND_WEIGHTS = {
     "meteosource_forecast": 1.0,
 }
 
-# Re-alert (no new DB record) when certainty moved >= 1pp since last alert.
-REALERT_CONF_DELTA = 0.01
+# Re-alert (no new DB record) when certainty moved >= 2pp since the last
+# alert AND at least REALERT_COOLDOWN_MIN minutes have passed. The 1pp /
+# no-cooldown version produced three updates in 30 minutes from pure sigma
+# time-decay drift (Guangzhou 93→94→96) — mechanical, not actionable.
+REALERT_CONF_DELTA = 0.02
+REALERT_COOLDOWN_MIN = 15.0
 _realert_date: Optional[date] = None
-_last_alerted: dict[tuple, float] = {}   # (outcome_id, side) -> certainty
+# (outcome_id, side) -> (certainty, sent_at_utc)
+_last_alerted: dict[tuple, tuple] = {}
 
 
 # Wunderground observed-max floor: WU's history page for today shows the
@@ -108,24 +113,39 @@ def _params_from_settings() -> IntradayParams:
     )
 
 
-def blended_forecast_high(signals: dict) -> Optional[float]:
-    """Weighted mean of today's bias-corrected deterministic forecast highs.
+def corrected_forecast_values(signals: dict) -> dict[str, float]:
+    """Per-source bias-corrected forecast highs for the blend sources.
 
     The same airport warm-bias correction the daily estimator applies: METAR
     daily highs run warmer than gridded NWP (tarmac + urban heat island), and
-    the intraday model compares this blend directly against the METAR running
-    max — so the forecasts must live on the METAR scale.
+    the intraday model compares these directly against the METAR running max
+    — so the forecasts must live on the METAR scale.
     """
     from app.analyzers.probability_estimator import _source_bias
     station_bias = signals.get("station_bias") or {}
-    total_w = 0.0
-    acc = 0.0
-    for key, w in _BLEND_WEIGHTS.items():
+    out: dict[str, float] = {}
+    for key in _BLEND_WEIGHTS:
         val = (signals.get(key) or {}).get("predicted_high_f")
         if val is not None:
-            acc += w * (float(val) + _source_bias(station_bias, key))
-            total_w += w
-    return acc / total_w if total_w > 0 else None
+            out[key] = float(val) + _source_bias(station_bias, key)
+    return out
+
+
+def blended_forecast_high(signals: dict) -> Optional[float]:
+    """Weighted mean of today's bias-corrected deterministic forecast highs."""
+    vals = corrected_forecast_values(signals)
+    if not vals:
+        return None
+    total_w = sum(_BLEND_WEIGHTS[k] for k in vals)
+    return sum(_BLEND_WEIGHTS[k] * v for k, v in vals.items()) / total_w
+
+
+def forecast_spread(signals: dict) -> Optional[float]:
+    """Max-min spread (°F) of the bias-corrected blend sources; None if <2."""
+    vals = list(corrected_forecast_values(signals).values())
+    if len(vals) < 2:
+        return None
+    return max(vals) - min(vals)
 
 
 async def _minutes_since_running_max(
@@ -181,16 +201,26 @@ async def _has_intraday_today(db: AsyncSession, outcome_id: int, side: str, tz) 
     return q.scalar_one_or_none() is not None
 
 
-def _realert_due(outcome_id: int, side: str, certainty: float) -> tuple[bool, Optional[str]]:
+def _realert_due(
+    outcome_id: int, side: str, certainty: float,
+    now_utc: Optional[datetime] = None,
+) -> tuple[bool, Optional[str]]:
+    now = now_utc or datetime.now(timezone.utc)
     key = (outcome_id, side)
     last = _last_alerted.get(key)
     if last is None:
-        _last_alerted[key] = certainty
+        _last_alerted[key] = (certainty, now)
         return True, None
-    delta = certainty - last
+    last_cert, last_ts = last
+    delta = certainty - last_cert
     if abs(delta) < REALERT_CONF_DELTA - 1e-9:
         return False, None
-    _last_alerted[key] = certainty
+    if (now - last_ts).total_seconds() < REALERT_COOLDOWN_MIN * 60.0:
+        # Material move but too soon after the previous update — wait. The
+        # baseline is NOT advanced, so a sustained move still alerts after
+        # the cooldown instead of being silently absorbed.
+        return False, None
+    _last_alerted[key] = (certainty, now)
     arrow = "↑" if delta > 0 else "↓"
     return True, f"certainty {arrow}{abs(round(delta * 100))}pp"
 
@@ -353,6 +383,7 @@ async def _evaluate_intraday_outcome(
         return None, None
 
     forecast_high = blended_forecast_high(signals)
+    spread_f = forecast_spread(signals)
     bucket_unit = resolve_bucket_unit(outcome)
 
     prob, breakdown = estimate_intraday(
@@ -366,6 +397,7 @@ async def _evaluate_intraday_outcome(
         bucket_unit=bucket_unit,
         params=params,
         metar_max_f=metar_max,
+        forecast_spread_f=spread_f,
     )
     breakdown["max_source"] = max_source
     breakdown["wu_high_f"] = float(wu_high) if wu_high is not None else None
@@ -406,22 +438,21 @@ async def _evaluate_intraday_outcome(
 
     create_buy = certainty >= buy_thresh and not bool(getattr(city, "blacklisted", False))
 
-    # Collect per-source forecast highs (bias-corrected — the same values the
-    # blend actually used) for the alert display table.
-    from app.analyzers.probability_estimator import _source_bias
+    # Per-source forecast highs (bias-corrected — the same values the blend
+    # actually used) for the alert display table. WU intentionally excluded —
+    # it's the observation feed here, not a model.
     station_bias = signals.get("station_bias") or {}
-    # WU intentionally excluded — it's the observation feed here, not a model.
     _SRC_LABELS = {
         "hrrr_forecast": "HRRR", "nws_forecast": "NWS",
         "gfs_forecast": "GFS", "ecmwf_forecast": "ECMWF",
         "icon_forecast": "ICON",
         "tomorrowio_forecast": "Tomorrow.io", "meteosource_forecast": "Meteosource",
     }
-    forecast_sources: dict[str, float] = {}
-    for key, label in _SRC_LABELS.items():
-        val = (signals.get(key) or {}).get("predicted_high_f")
-        if val is not None:
-            forecast_sources[label] = round(float(val) + _source_bias(station_bias, key), 1)
+    forecast_sources: dict[str, float] = {
+        _SRC_LABELS[key]: round(v, 1)
+        for key, v in corrected_forecast_values(signals).items()
+        if key in _SRC_LABELS
+    }
 
     intraday_signals = {
         "_intraday": breakdown,

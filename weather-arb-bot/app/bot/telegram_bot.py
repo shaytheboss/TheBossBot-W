@@ -143,20 +143,23 @@ def _fmt_bucket_switch_alert(alert: dict) -> str:
     conf = alert["new_confidence"]
     edge_cents = int(round(alert["new_edge"] * 100))
     new_entry = int(round(alert["new_entry_cost"] * 100))
+    old_confs = alert.get("old_confidences") or []
     old_parts = []
-    for label, entry in zip(alert["old_buckets"], alert["old_entry_prices"]):
+    for i, (label, entry) in enumerate(zip(alert["old_buckets"], alert["old_entry_prices"])):
         entry_cents = int(round(entry * 100))
-        old_parts.append(f"• _{label}_ (opened at {entry_cents}¢)")
+        conf_part = f", conf {old_confs[i]}%" if i < len(old_confs) and old_confs[i] is not None else ""
+        old_parts.append(f"• _{label}_ (opened at {entry_cents}¢{conf_part})")
     old_str = "\n".join(old_parts) if old_parts else "• (unknown)"
     return (
-        f"*{conf}%* 🔄 *BUCKET SWITCH SIGNAL*\n\n"
+        f"*{conf}%* 🔄 *BUCKET SWITCH SIGNAL — forecast moved (YES)*\n\n"
         f"📍 *{alert['city_name']}*\n"
         f"📅 {alert['event_date'].strftime('%b %d')}\n\n"
         f"*New signal:* {alert['new_side']} on _{alert['new_bucket_label']}_\n"
         f"Confidence: *{conf}%*  |  Edge: +{edge_cents}¢  |  Entry: {new_entry}¢\n\n"
-        f"*Currently open position(s) on same market:*\n{old_str}\n\n"
-        f"_Consider: exit current bucket(s) and enter the new one — or hold both if the "
-        f"forecast is genuinely ambiguous between them._"
+        f"*Currently open YES position(s) on same market:*\n{old_str}\n\n"
+        f"_Only one bucket can resolve YES — the model now favours a different "
+        f"bucket than your open position. Compare the confidences above before "
+        f"acting; if the new one is weaker, holding is reasonable._"
     )
 
 
@@ -211,6 +214,29 @@ def _sigma_context(hours_left, peak_passed: bool) -> str:
     return "<1h to peak — almost certain"
 
 
+def _temp_str(v_f, is_c: bool) -> str:
+    """One temperature for display: °F, with °C appended for Celsius markets."""
+    if v_f is None:
+        return "N/A"
+    v = float(v_f)
+    if is_c:
+        return f"{v:.1f}°F ({(v - 32.0) * 5.0 / 9.0:.1f}°C)"
+    return f"{v:.1f}°F"
+
+
+def _delta_str(d_f, is_c: bool, signed: bool = True) -> str:
+    """A temperature DIFFERENCE for display (Δ°C = Δ°F × 5/9, no offset)."""
+    if d_f is None:
+        return "?"
+    d = float(d_f)
+    fmt = f"{d:+.1f}" if signed else f"{abs(d):.1f}"
+    if is_c:
+        dc = d * 5.0 / 9.0
+        fmt_c = f"{dc:+.1f}" if signed else f"{abs(dc):.1f}"
+        return f"{fmt}°F ({fmt_c}°C)"
+    return f"{fmt}°F"
+
+
 def _fmt_intraday_alert(
     opp,
     city_name: str,
@@ -220,12 +246,14 @@ def _fmt_intraday_alert(
     event_date=None,
     market_url: str = "",
 ) -> str:
+    from app.utils.units import is_celsius_bucket
     sig = opp.signals or {}
     bd = sig.get("_intraday") or {}
     book = sig.get("_book") or {}
     conf = opp.confidence_score
     side = opp.side
     is_no = (side == "NO")
+    is_c = (sig.get("_bucket_unit") == "C") or is_celsius_bucket(bucket_label)
 
     edge_c = int(round(float(opp.edge) * 100))
     entry_c = int(round(float(sig.get("_entry_cost") or 0) * 100))
@@ -274,7 +302,8 @@ def _fmt_intraday_alert(
         status_block = (
             f"{time_line}\n"
             "🔒 *LOCK — YES IMPOSSIBLE*\n"
-            f"Running max *{running}°F* already exceeds this bucket's ceiling *{f_hi}°F*. "
+            f"Running max *{_temp_str(running, is_c)}* has reached or passed this bucket's "
+            f"ceiling *{_temp_str(f_hi, is_c)}*. "
             "The daily max can only increase, so this bucket can never be the final answer.\n"
             "→ NO is mathematically guaranteed."
         )
@@ -282,15 +311,16 @@ def _fmt_intraday_alert(
         status_block = (
             f"{time_line}\n"
             "🔒 *LOCK — YES SECURED*\n"
-            f"Running max *{running}°F* has already crossed the open-ended bucket floor *{f_lo}°F*. "
+            f"Running max *{_temp_str(running, is_c)}* has already crossed the open-ended "
+            f"bucket floor *{_temp_str(f_lo, is_c)}*. "
             "→ YES is mathematically guaranteed regardless of remaining heating."
         )
     elif peak_passed:
-        sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
+        sigma_str = f"±{_delta_str(sigma, is_c, signed=False)}" if sigma is not None else "?"
         status_block = (
             f"{time_line}\n"
             f"🌡 *Peak passed* — temperature is now falling.\n"
-            f"Today's max is almost certainly set at *{running}°F*. "
+            f"Today's max is almost certainly set at *{_temp_str(running, is_c)}*. "
             f"Residual σ = {sigma_str}."
         )
     else:
@@ -303,16 +333,18 @@ def _fmt_intraday_alert(
         )
 
     # ── Current conditions ────────────────────────────────────────────────
-    current_str = f"*{current:.1f}°F*" if current is not None else "N/A"
-    running_str = f"*{running}°F*" if running is not None else "N/A"
-    expected_str = f"*{expected}°F*" if expected is not None else "N/A"
+    current_str = f"*{_temp_str(current, is_c)}*" if current is not None else "N/A"
+    running_str = f"*{_temp_str(running, is_c)}*" if running is not None else "N/A"
+    expected_str = f"*{_temp_str(expected, is_c)}*" if expected is not None else "N/A"
     cond_lines = [
         f"  Now: {current_str}  |  Running max today: {running_str}  |  Expected final: {expected_str}"
     ]
     if forecast_high is not None and running is not None:
         gap = round(float(forecast_high) - float(running), 1)
-        gap_str = f"+{gap}°F" if gap >= 0 else f"{gap}°F"
-        cond_lines.append(f"  Forecast high – running max gap: *{gap_str}* (what remains to be gained)")
+        cond_lines.append(
+            f"  Forecast high – running max gap: *{_delta_str(gap, is_c)}* "
+            f"(what remains to be gained)"
+        )
     # Resolution-source transparency: Polymarket settles on the Wunderground
     # station, so when WU reads higher than METAR the WU value IS the max.
     max_source = bd.get("max_source")
@@ -321,22 +353,25 @@ def _fmt_intraday_alert(
     if max_source == "wunderground" and wu_high is not None:
         cond_lines.append(
             f"  ⚠️ *Official source override*: Wunderground (resolution station) "
-            f"already reads *{wu_high}°F* vs METAR {metar_max}°F — using WU as the running max."
+            f"already reads *{_temp_str(wu_high, is_c)}* vs METAR {_temp_str(metar_max, is_c)} "
+            f"— using WU as the running max."
         )
     elif wu_high is not None and metar_max is not None and bd.get("wu_suspect"):
         cond_lines.append(
-            f"  ⚠️ WU reads {wu_high}°F vs METAR {metar_max}°F — gap too large, "
-            f"treated as suspect scrape and NOT used. Verify manually."
+            f"  ⚠️ WU reads {_temp_str(wu_high, is_c)} vs METAR {_temp_str(metar_max, is_c)} "
+            f"— gap too large, treated as suspect scrape and NOT used. Verify manually."
         )
     elif wu_high is not None:
-        cond_lines.append(f"  WU (resolution station) observed high: {wu_high}°F ✓ consistent")
+        cond_lines.append(
+            f"  WU (resolution station) observed high: {_temp_str(wu_high, is_c)} ✓ consistent"
+        )
     conditions_block = "\n".join(cond_lines)
 
     # ── Per-source forecast table ─────────────────────────────────────────
     fc_sources = sig.get("_forecast_sources") or {}
     fc_lines = []
     for label, val in fc_sources.items():
-        fc_lines.append(f"  • {label}: *{val:.1f}°F*")
+        fc_lines.append(f"  • {label}: *{_temp_str(val, is_c)}*")
     if forecast_high is not None:
         if fc_lines:
             fc_vals = list(fc_sources.values())
@@ -349,9 +384,13 @@ def _fmt_intraday_alert(
                 agree = "⚠️ moderate spread"
             else:
                 agree = "🚨 HIGH spread — models disagree"
-            fc_lines.append(f"  ↳ Blended high: *{forecast_high:.1f}°F*  |  Range: {lo_f:.1f}–{hi_f:.1f}°F (Δ{spread:.1f}°F) — {agree}")
+            fc_lines.append(
+                f"  ↳ Blended high: *{_temp_str(forecast_high, is_c)}*  |  "
+                f"Range: {_temp_str(lo_f, is_c)} – {_temp_str(hi_f, is_c)} "
+                f"(Δ{_delta_str(spread, is_c, signed=False)}) — {agree}"
+            )
         else:
-            fc_lines.append(f"  ↳ Blended high: *{forecast_high:.1f}°F* (single source)")
+            fc_lines.append(f"  ↳ Blended high: *{_temp_str(forecast_high, is_c)}* (single source)")
     else:
         fc_lines = ["  • No forecast data available"]
     bias_f = sig.get("_forecast_bias_f")
@@ -368,19 +407,41 @@ def _fmt_intraday_alert(
     forecasts_block = "\n".join(fc_lines)
 
     # ── Probability model math ────────────────────────────────────────────
-    sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
-    bucket_lo_str = f"{f_lo:.1f}°F" if f_lo is not None else "−∞"
-    bucket_hi_str = f"{f_hi:.1f}°F" if f_hi is not None else "+∞"
+    sigma_str = f"±{_delta_str(sigma, is_c, signed=False)}" if sigma is not None else "?"
     yes_pct = round((prob_yes or 0) * 100, 1)
     no_pct = round(100 - yes_pct, 1)
     sigma_ctx = _sigma_context(hours_left, bool(peak_passed))
+    # NOTE: no literal "[lo, hi)" here — an unmatched "[" makes Telegram's
+    # Markdown parser eat the bracket (it looks like the start of a link).
+    if f_lo is not None and f_hi is not None:
+        bounds_line = (
+            f"  • YES needs: {_temp_str(f_lo, is_c)} ≤ final max < {_temp_str(f_hi, is_c)}"
+        )
+    elif f_lo is not None:
+        bounds_line = f"  • YES needs: final max ≥ {_temp_str(f_lo, is_c)}"
+    elif f_hi is not None:
+        bounds_line = f"  • YES needs: final max < {_temp_str(f_hi, is_c)}"
+    else:
+        bounds_line = "  • YES needs: (unknown bounds)"
     math_lines = [
         f"_max(M, X) model: final max = max(running max, X),  X ~ N(μ, σ)_",
-        f"  • Bucket bounds: [{bucket_lo_str}, {bucket_hi_str})",
+        bounds_line,
         f"  • M (running max) = {running_str}  |  μ (expected final max) = {expected_str}",
         f"  • σ = {sigma_str}  ({sigma_ctx})",
-        f"  • P(YES) = {yes_pct}%  ⇒  P(NO) = {no_pct}%  →  *{side}*",
     ]
+    sigma_floor = bd.get("sigma_floor_from_spread")
+    fc_spread_bd = bd.get("forecast_spread_f")
+    if sigma_floor and sigma is not None and sigma_floor >= float(sigma) - 1e-9:
+        math_lines.append(
+            f"  • σ widened by model disagreement "
+            f"(sources span Δ{_delta_str(fc_spread_bd, is_c, signed=False)})"
+        )
+    math_lines.append(f"  • P(YES) = {yes_pct}%  ⇒  P(NO) = {no_pct}%  →  *{side}*")
+    if bd.get("pre_peak_cap_applied"):
+        math_lines.append(
+            "  • ⚠️ Pre-peak cap: heating window hasn't opened yet — unlocked YES "
+            "is capped at 90% (alert-only, no auto-buy) until the peak window starts."
+        )
     math_block = "\n".join(math_lines)
 
     # ── Pricing / book ────────────────────────────────────────────────────
@@ -498,9 +559,11 @@ async def send_intraday_alert(opportunity, db) -> None:
 
 
 def _fmt_intraday_realert(ra: dict) -> str:
+    from app.utils.units import is_celsius_bucket
     conf = int(round(ra["certainty"] * 100))
     edge_c = int(round(ra["edge"] * 100))
     entry_c = int(round(ra["entry_cost"] * 100))
+    is_c = is_celsius_bucket(ra.get("bucket_label"))
     bd = ra.get("breakdown") or {}
     running = bd.get("running_max_f")
     expected = bd.get("expected_final_max_f")
@@ -511,22 +574,32 @@ def _fmt_intraday_realert(ra: dict) -> str:
     sigma = bd.get("sigma_used")
 
     if lock == "yes_impossible":
-        state_line = f"🔒 LOCKED — YES IMPOSSIBLE (running max {running}°F above bucket ceiling)"
+        state_line = (
+            f"🔒 LOCKED — YES IMPOSSIBLE (running max {_temp_str(running, is_c)} "
+            f"at/above bucket ceiling)"
+        )
     elif lock == "yes_locked":
-        state_line = f"🔒 LOCKED — YES SECURED (running max {running}°F crossed bucket floor)"
+        state_line = (
+            f"🔒 LOCKED — YES SECURED (running max {_temp_str(running, is_c)} "
+            f"crossed bucket floor)"
+        )
     elif peak_passed:
-        state_line = f"🌡 Peak passed — temp now falling, max set at {running}°F"
+        state_line = f"🌡 Peak passed — temp now falling, max set at {_temp_str(running, is_c)}"
     else:
-        sigma_str = f"±{sigma:.1f}°F" if sigma is not None else "?"
+        sigma_str = f"±{_delta_str(sigma, is_c, signed=False)}" if sigma is not None else "?"
         hours_str = f"{float(hours_left):.1f}h" if hours_left is not None else "?h"
-        state_line = f"⏳ {hours_str} to peak end | running max {running}°F → expected {expected}°F | σ={sigma_str}"
+        state_line = (
+            f"⏳ {hours_str} to peak end | running max {_temp_str(running, is_c)} "
+            f"→ expected {_temp_str(expected, is_c)} | σ={sigma_str}"
+        )
 
-    current_str = f" | now {current:.1f}°F" if current is not None else ""
+    current_str = f" | now {_temp_str(current, is_c)}" if current is not None else ""
     wu_line = ""
     if bd.get("max_source") == "wunderground" and bd.get("wu_high_f") is not None:
         wu_line = (
             f"\n⚠️ Running max from *Wunderground (resolution station)*: "
-            f"{bd['wu_high_f']}°F (METAR reads {bd.get('metar_max_f')}°F)"
+            f"{_temp_str(bd['wu_high_f'], is_c)} "
+            f"(METAR reads {_temp_str(bd.get('metar_max_f'), is_c)})"
         )
     return (
         f"*{conf}%* ⚡ *INTRADAY UPDATE* — {ra['side']} _{ra['bucket_label']}_ ({ra['city_name']})\n"

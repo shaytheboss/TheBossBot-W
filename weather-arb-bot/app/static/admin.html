@@ -546,6 +546,49 @@ function _registerTable(tbodyId, rows, renderer, defaultSort) {
   setupSortableTable(tbodyId, defaultSort);
   _rerenderTable(tbodyId);
 }
+
+// Click-to-sort for statically rendered stats tables (built as HTML strings,
+// no row cache). Sorts the DOM rows in place; numeric-aware ($, %, ¢, pp, °F).
+function makeTablesSortable(containerId) {
+  const root = document.getElementById(containerId);
+  if (!root) return;
+  root.querySelectorAll('table').forEach(table => {
+    const tbody = table.querySelector('tbody');
+    if (!tbody) return;
+    table.querySelectorAll('thead th').forEach((th, idx) => {
+      th.classList.add('sortable');
+      th.onclick = () => {
+        const dir = th.dataset.dir === 'asc' ? 'desc' : 'asc';
+        table.querySelectorAll('thead th').forEach(h => {
+          h.dataset.dir = ''; h.classList.remove('sorted-asc', 'sorted-desc');
+        });
+        th.dataset.dir = dir;
+        th.classList.add(dir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+        const factor = dir === 'asc' ? 1 : -1;
+        const parseNum = s => {
+          const cleaned = s.replace(/[$%¢°FCpp,+↑↓\s]/g, '');
+          if (cleaned === '' || cleaned === '—' || cleaned === '-') return null;
+          const n = parseFloat(cleaned);
+          return isNaN(n) ? null : n;
+        };
+        const rows = [...tbody.querySelectorAll('tr')];
+        rows.sort((a, b) => {
+          const ta = (a.children[idx]?.textContent || '').trim();
+          const tb = (b.children[idx]?.textContent || '').trim();
+          const blankA = ta === '' || ta === '—';
+          const blankB = tb === '' || tb === '—';
+          if (blankA && blankB) return 0;
+          if (blankA) return 1;            // blanks last regardless of direction
+          if (blankB) return -1;
+          const na = parseNum(ta), nb = parseNum(tb);
+          if (na != null && nb != null) return (na - nb) * factor;
+          return ta.localeCompare(tb) * factor;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+      };
+    });
+  });
+}
 // ------------------------------------------------------------------------------
 
 async function init() {
@@ -751,6 +794,7 @@ function _renderConfBreakdown(rows) {
   }
   html += '</tbody></table>';
   box.innerHTML = html;
+  makeTablesSortable('statsConfBreakdown');
 }
 
 async function loadModelAccuracy() {
@@ -782,6 +826,7 @@ async function loadModelAccuracy() {
     html += '</tbody></table>';
   }
   box.innerHTML = html;
+  makeTablesSortable('statsModels');
 }
 
 function resetPosFilter() {
@@ -942,6 +987,7 @@ async function loadIntraday() {
     document.getElementById('intradayByConf').innerHTML = _intradayBreakdownTable(s.by_confidence);
     document.getElementById('intradayByLock').innerHTML = _intradayBreakdownTable(s.by_lock);
     document.getElementById('intradayByCity').innerHTML = _intradayBreakdownTable(s.by_city);
+    ['intradayByHour','intradayByConf','intradayByLock','intradayByCity'].forEach(makeTablesSortable);
   }
 }
 
@@ -1074,6 +1120,7 @@ async function loadLessons() {
     _lessonTable('By lead time', j.by_lead_time) +
     _lessonTable('By entry price', j.by_entry_price) +
     _lessonTable('By city', j.by_city);
+  makeTablesSortable('lessonsTables');
 }
 
 // --- Generic CSV export of what's currently rendered in a table --------------
