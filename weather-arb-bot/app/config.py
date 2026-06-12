@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     intraday_max_book_spread: float = 0.10
     intraday_shares_per_buy: int = 5
 
+    # מאגר דיוק-המודלים הפר-עירוני (model_skill): מרווח העדכון התקופתי
+    # בשניות. בנוסף לכך העדכון רץ מיד אחרי כל settlement של פולימרקט.
+    model_skill_update_interval: int = 3600
+
     # Auto-suspend a city after this many consecutive high-conf (≥90%) losses.
     # Set to 0 to disable auto-suspension entirely.
     suspension_consecutive_losses: int = 3

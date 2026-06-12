@@ -44,13 +44,31 @@ def test_tokyo_regression_no_more_96pct_buy():
     # 94% buy threshold is out of reach — alert-only, exactly the intent.
 
 
-def test_sigma_floor_widens_with_spread_and_remaining_heating():
-    _, bd_no_spread = estimate_intraday(**TOKYO)
-    _, bd_spread = estimate_intraday(**TOKYO, forecast_spread_f=4.7)
-    assert bd_spread["sigma_used"] > bd_no_spread["sigma_used"]
-    # floor = gain_weight * spread * 0.5
-    expected_floor = bd_spread["gain_weight"] * 4.7 * DEFAULT_PARAMS.spread_sigma_weight
-    assert bd_spread["sigma_floor_from_spread"] == pytest.approx(expected_floor, abs=1e-3)
+def test_sigma_combines_schedule_and_forecast_error_in_quadrature():
+    """תיקון פריז: כש-μ נשען על תחזית, σ חייב לכלול את שגיאת התחזית
+    באופן יחסי לתלות (w) — שני מקורות בלתי-תלויים מחוברים ריבועית."""
+    _, bd = estimate_intraday(**TOKYO)
+    w = bd["gain_weight"]
+    expected_fc_term = w * DEFAULT_PARAMS.same_day_forecast_sigma
+    assert bd["sigma_forecast_term"] == pytest.approx(expected_fc_term, abs=1e-3)
+    expected_sigma = (bd["sigma_schedule"] ** 2 + expected_fc_term ** 2) ** 0.5
+    assert bd["sigma_used"] == pytest.approx(expected_sigma, abs=1e-2)
+    # הסיגמה האפקטיבית גדולה מלוח-הזמנים לבדו — זה כל הרעיון
+    assert bd["sigma_used"] > bd["sigma_schedule"]
+
+
+def test_sigma_floor_binds_only_when_spread_is_huge():
+    """רצפת אי-ההסכמה (טוקיו) עדיין קיימת — אבל עכשיו היא נדרסת רק כשהפיזור
+    גדול מספיק כדי לעבור את איבר שגיאת-התחזית הריבועי."""
+    _, bd_moderate = estimate_intraday(**TOKYO, forecast_spread_f=4.7)
+    # פיזור 4.7: הרצפה (w·4.7·0.5≈1.29) קטנה מהשילוב הריבועי (≈1.69) — לא קובעת
+    assert bd_moderate["sigma_used"] > bd_moderate["sigma_floor_from_spread"]
+    _, bd_huge = estimate_intraday(**TOKYO, forecast_spread_f=9.0)
+    # פיזור 9.0: הרצפה (≈2.48) גדולה מהשילוב — היא שקובעת את הסיגמה
+    assert bd_huge["sigma_used"] == pytest.approx(
+        bd_huge["sigma_floor_from_spread"], abs=1e-3
+    )
+    assert bd_huge["sigma_used"] > bd_moderate["sigma_used"]
 
 
 def test_sigma_floor_ignored_after_peak_passed():
