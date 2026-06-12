@@ -74,7 +74,7 @@ def test_full_alert_contains_all_sections():
     assert "HRRR: 62.0°F".replace(" ", "") in text.replace("*", "").replace(" ", "")
     assert "Blended high" in text
     assert "Airport bias +1.5°F" in text
-    assert "Bucket bounds: [65.5°F, 67.5°F)" in text
+    assert "YES needs: 65.5°F ≤ final max < 67.5°F" in text
     assert "σ = ±2.2°F" in text
     assert "P(YES) = 7.0%" in text
     assert "P(NO) = 93.0%" in text

@@ -229,10 +229,11 @@ async def _get_prior_opportunity(
 
 
 async def _get_open_sibling_positions(
-    db: AsyncSession, market_id: int, exclude_outcome_id: int
+    db: AsyncSession, market_id: int, exclude_outcome_id: int,
+    side: Optional[str] = None,
 ) -> list[Opportunity]:
     """Return open virtual positions on outcomes of the same market (excluding this one)."""
-    result = await db.execute(
+    q = (
         select(Opportunity, MarketOutcome.bucket_label, MarketOutcome.id.label("mo_id"))
         .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
         .where(
@@ -241,6 +242,9 @@ async def _get_open_sibling_positions(
             Opportunity.virtual_status == "open",
         )
     )
+    if side is not None:
+        q = q.where(Opportunity.side == side)
+    result = await db.execute(q)
     return result.all()
 
 
@@ -613,14 +617,19 @@ async def detect_opportunities(
             except Exception as e:
                 logger.error(f"Error evaluating outcome {d['outcome'].id}: {e}", exc_info=True)
 
-        # Bucket-switch detection: if any new opportunity targets a different
-        # bucket than an already-open virtual position on the same market,
-        # emit a side alert (once per day per unique switch) suggesting the switch.
+        # Bucket-switch detection — YES side ONLY. Only one bucket can resolve
+        # YES, so a new YES signal on a different bucket genuinely contradicts
+        # an open YES position. NO positions on different buckets are
+        # COMPLEMENTARY (both can win), so suggesting a "switch" between them
+        # was wrong — it told the user to abandon a 95% NO because an adjacent
+        # 83% NO appeared (the Chicago incident).
         _reset_side_dedup_if_new_day()
         for opp in new_opps_this_market:
+            if opp.side != "YES":
+                continue
             try:
                 siblings = await _get_open_sibling_positions(
-                    db, market.id, opp.outcome_id
+                    db, market.id, opp.outcome_id, side="YES"
                 )
                 if siblings:
                     old_ids = frozenset(row.mo_id for row in siblings)
@@ -633,6 +642,18 @@ async def detect_opportunities(
                         float(row.Opportunity.virtual_entry_price or 0)
                         for row in siblings
                     ]
+                    old_confidences = [
+                        row.Opportunity.confidence_score for row in siblings
+                    ]
+                    opp_signals = opp.signals or {}
+                    # The actual cost to enter now — virtual_entry_price is
+                    # None when the new signal didn't clear the buy threshold
+                    # (that's how "Entry: 0¢" reached Telegram).
+                    new_entry = (
+                        opp_signals.get("_entry_cost")
+                        if opp_signals.get("_entry_cost") is not None
+                        else (opp.virtual_entry_price or 0)
+                    )
                     side_alerts.append({
                         "type": "bucket_switch",
                         "city_name": city.name,
@@ -643,9 +664,10 @@ async def detect_opportunities(
                         "new_side": opp.side,
                         "new_confidence": opp.confidence_score,
                         "new_edge": float(opp.edge),
-                        "new_entry_cost": float(opp.virtual_entry_price or 0),
+                        "new_entry_cost": float(new_entry),
                         "old_buckets": old_labels,
                         "old_entry_prices": old_entry_prices,
+                        "old_confidences": old_confidences,
                     })
             except Exception as e:
                 logger.error(f"Bucket-switch check failed for opp {opp.id}: {e}", exc_info=True)

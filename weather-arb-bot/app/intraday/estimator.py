@@ -40,6 +40,15 @@ class IntradayParams:
     cooling_drop_f: float = 1.5
     # ...for at least this long, and only after peak_start_hour.
     cooling_min_minutes: float = 90.0
+    # Model disagreement is genuine uncertainty about the remaining heating:
+    # sigma floor = gain_weight * source_spread * spread_sigma_weight.
+    # (Tokyo incident: sources spanned 4.7°F yet sigma was 1.0 — the model
+    # claimed 96% on a bucket whose floor the running max was sitting on.)
+    spread_sigma_weight: float = 0.5
+    # An unlocked YES before the peak window even opens cannot be a near-lock:
+    # the max can still escape upward out of the bucket. Cap it below the buy
+    # threshold so knife-edge cases alert but never auto-buy.
+    pre_peak_yes_cap: float = 0.90
 
 
 DEFAULT_PARAMS = IntradayParams()
@@ -184,6 +193,7 @@ def estimate_intraday(
     bucket_unit: str = "F",
     params: IntradayParams = DEFAULT_PARAMS,
     metar_max_f: Optional[float] = None,
+    forecast_spread_f: Optional[float] = None,
 ) -> Tuple[float, dict]:
     """Full intraday estimate for one bucket. Returns (probability, breakdown).
 
@@ -191,6 +201,8 @@ def estimate_intraday(
     resolution source). metar_max_f, when given, is the METAR-derived max used
     only for peak-passed detection — current_temp_f and minutes_since_max are
     METAR readings, so the cooling test must compare on the same scale.
+    forecast_spread_f is the max-min spread of the (bias-corrected) source
+    forecasts: disagreement about the remaining heating widens sigma.
     """
     f_lo, f_hi = _bucket_to_f_bounds(bucket_min, bucket_max, bucket_unit)
 
@@ -199,9 +211,30 @@ def estimate_intraday(
         local_hour, current_temp_f, peak_detection_max, minutes_since_max, params
     )
     sigma = intraday_sigma(local_hour, peak_passed, params)
+    sigma_floor = 0.0
+    if forecast_spread_f and forecast_spread_f > 0 and not peak_passed:
+        sigma_floor = (
+            gain_weight(local_hour, params)
+            * float(forecast_spread_f)
+            * params.spread_sigma_weight
+        )
+        sigma = max(sigma, sigma_floor)
     mu = expected_final_max(running_max_f, forecast_high_f, local_hour, params)
     p = bucket_probability(running_max_f, mu, sigma, f_lo, f_hi)
     state = lock_state(running_max_f, f_lo, f_hi)
+
+    # Pre-peak YES cap: before the climatological peak window opens, an
+    # UNLOCKED bucket can still lose its YES to further heating no matter how
+    # tight sigma says it is. Never let such a YES cross the cap (locks are
+    # exempt — they are mathematical, not statistical).
+    pre_peak_cap_applied = False
+    if (
+        state is None
+        and local_hour < params.peak_start_hour
+        and p > params.pre_peak_yes_cap
+    ):
+        p = params.pre_peak_yes_cap
+        pre_peak_cap_applied = True
 
     breakdown = {
         "running_max_f": round(running_max_f, 1),
@@ -212,7 +245,12 @@ def estimate_intraday(
         "local_hour": round(local_hour, 2),
         "hours_to_peak_end": round(hours_to_peak_end(local_hour, params), 2),
         "gain_weight": round(gain_weight(local_hour, params), 3),
-        "sigma_used": sigma,
+        "sigma_used": round(sigma, 3),
+        "sigma_floor_from_spread": round(sigma_floor, 3),
+        "forecast_spread_f": (
+            round(float(forecast_spread_f), 1) if forecast_spread_f is not None else None
+        ),
+        "pre_peak_cap_applied": pre_peak_cap_applied,
         "peak_passed": peak_passed,
         "lock_state": state,
         "f_lo": f_lo,
