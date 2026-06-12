@@ -718,6 +718,21 @@ async def job_run_intraday():
             logger.error(f"Intraday job failed: {e}", exc_info=True)
 
 
+async def job_update_model_skill():
+    """עדכון מאגר דיוק-המודלים הפר-עירוני (model_skill).
+
+    רץ גם כ-job תקופתי וגם מיד אחרי שכל settlement מסתיים, כדי שתוצאה
+    טרייה מפולימרקט תשפיע על המשקולות עוד באותו יום ולא בסבב הבא.
+    """
+    from app.analyzers.model_skill import update_model_skill
+    async with AsyncSessionLocal() as db:
+        try:
+            summary = await update_model_skill(db)
+            logger.info(f"job_update_model_skill: {summary}")
+        except Exception as e:
+            logger.error(f"job_update_model_skill failed: {e}", exc_info=True)
+
+
 async def job_run_analyzer():
     async with AsyncSessionLocal() as db:
         try:
@@ -1221,6 +1236,7 @@ async def job_check_resolutions():
         if not markets:
             return
         logger.info(f"job_check_resolutions: checking {len(markets)} unresolved past markets")
+        any_resolved = False   # האם נסגר משהו בריצה הזו → עדכון מאגר הכישרון
         for market in markets:
             city_result = await db.execute(select(City).where(City.id == market.city_id))
             city = city_result.scalar_one_or_none()
@@ -1293,6 +1309,7 @@ async def job_check_resolutions():
 
             market.resolved = True
             market.resolution_value = res_val
+            any_resolved = True
             _mark_outcome_winners(outcomes, winning_outcome_ids)
 
             # Settle ALL unsettled opportunities on this market — not only the
@@ -1354,6 +1371,16 @@ async def job_check_resolutions():
                     )
                 except Exception as e:
                     logger.error(f"Failed to send resolution alert for {market.external_id}: {e}")
+
+        # נסגרו שווקים בריצה הזו → מעדכנים מיד את מאגר דיוק-המודלים, כדי
+        # שהמשקולות יראו את התוצאה הטרייה כבר בסריקת החיזוי הבאה.
+        # try/except נפרד: כשל בעדכון הכישרון לעולם לא מפיל settlement.
+        if any_resolved:
+            try:
+                from app.analyzers.model_skill import update_model_skill
+                await update_model_skill(db)
+            except Exception as e:
+                logger.error(f"model_skill update after resolutions failed: {e}", exc_info=True)
 
 
 async def job_retroactive_resolution_fix() -> dict:

@@ -7,6 +7,7 @@ from app.models.opportunity import Opportunity
 from app.models.intraday import IntradayOpportunity
 from app.models.alert import Alert, TelegramUser
 from app.models.forecast_accuracy import ForecastAccuracy
+from app.models.model_skill import ModelSkill
 
 __all__ = [
     "City",
@@ -21,4 +22,5 @@ __all__ = [
     "Alert",
     "TelegramUser",
     "ForecastAccuracy",
+    "ModelSkill",
 ]

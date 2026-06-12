@@ -442,6 +442,11 @@ def _fmt_intraday_alert(
             "  • ⚠️ Pre-peak cap: heating window hasn't opened yet — unlocked YES "
             "is capped at 90% (alert-only, no auto-buy) until the peak window starts."
         )
+    if bd.get("stat_cap_applied"):
+        math_lines.append(
+            "  • ⚠️ Statistical cap: this is a forecast-dependent estimate (not a "
+            "lock) — confidence is capped at 96% no matter how tight σ looks."
+        )
     math_block = "\n".join(math_lines)
 
     # ── Pricing / book ────────────────────────────────────────────────────

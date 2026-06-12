@@ -21,6 +21,7 @@ from app.workers.jobs import (
     job_fetch_polymarket,
     job_run_analyzer,
     job_run_intraday,
+    job_update_model_skill,
 )
 from app.workers.icon_job import job_fetch_icon
 
@@ -128,6 +129,18 @@ def build_scheduler() -> AsyncIOScheduler:
             max_instances=1,
             misfire_grace_time=60,
         )
+    # מאגר דיוק-המודלים הפר-עירוני: עדכון תקופתי (בנוסף לעדכון המיידי
+    # שרץ אחרי כל settlement בתוך job_check_resolutions). רץ גם בעלייה
+    # כדי שהטבלה תתמלא מיד אחרי דיפלוי ראשון של הפיצ'ר.
+    scheduler.add_job(
+        job_update_model_skill,
+        IntervalTrigger(seconds=getattr(settings, "model_skill_update_interval", 3600)),
+        id="model_skill",
+        name="Update per-city model skill DB",
+        next_run_time=now,
+        max_instances=1,
+        misfire_grace_time=300,
+    )
 
     return scheduler
 

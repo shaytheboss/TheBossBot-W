@@ -139,6 +139,9 @@
       <h3 style="margin-top:24px;">Model accuracy</h3>
       <p class="small">Each weather model's point forecast scored against the bucket Polymarket settled, over resolved markets in the current filter. Helps spot which model performs best — and where (per-city), so models could later be weighted per city.</p>
       <div id="statsModels"></div>
+      <h3 style="margin-top:24px;">⚖️ Model skill DB (live prediction weights) <button class="btn small" onclick="refreshModelSkill(this)" title="Recompute the skill table now (also runs automatically after every settlement and hourly)">↻ Recompute</button></h3>
+      <p class="small">The <strong>managed, continuously-updated</strong> per-city model accuracy database. Each row scores a model's last same-day forecast against the bucket Polymarket actually settled, over a rolling 90-day window. The <strong>Weight</strong> column is what both the daily and the ⚡ intraday predictors actually use (1.0 = neutral; models below the sample minimum stay neutral until they earn a track record). Updates automatically after every settlement and hourly.</p>
+      <div id="statsModelSkill"></div>
       <h3 style="margin-top:24px;">Inventory</h3>
       <div class="grid" id="statsInv"></div>
     </section>
@@ -744,6 +747,7 @@ async function loadStats() {
     card('Outcomes w/ token', i.outcomes_with_token) + card('Telegram users', i.telegram_users);
   _renderConfBreakdown(s.by_confidence_band || []);
   loadModelAccuracy();
+  loadModelSkill();
 }
 
 function _renderConfBreakdown(rows) {
@@ -827,6 +831,61 @@ async function loadModelAccuracy() {
   }
   box.innerHTML = html;
   makeTablesSortable('statsModels');
+}
+
+// --- Model skill DB (the managed per-city accuracy store) --------------------
+async function loadModelSkill() {
+  const box = document.getElementById('statsModelSkill');
+  if (!box) return;
+  const cityId = document.getElementById('statsCity').value;
+  const qs = cityId ? ('?city_id=' + cityId) : '';
+  const r = await api('/model-skill' + qs);
+  if (!r.ok) { box.innerHTML = '<p class="small">Could not load model skill DB.</p>'; return; }
+  const j = await r.json();
+  const rows = j.rows || [];
+  if (!rows.length) {
+    box.innerHTML = '<p class="small">Skill DB is empty — it fills automatically after the first settlements (or click ↻ Recompute).</p>';
+    return;
+  }
+  const minN = j.min_samples;
+  const wCell = r0 => {
+    if (!r0.active) return `<span style="opacity:.55" title="Below ${minN} samples — stays neutral (1.0)">1.0 (neutral)</span>`;
+    const w = r0.weight;
+    const color = w >= 1.15 ? 'var(--win)' : (w <= 0.85 ? 'var(--loss)' : 'var(--fg)');
+    return `<span style="color:${color};font-weight:600">${w.toFixed(2)}</span>`;
+  };
+  let html = `<table><thead><tr>
+    <th>City</th><th>Model</th><th>Samples</th><th>Hits</th><th>Hit rate</th>
+    <th>MAE (°F)</th><th>Bias (°F)</th><th>Weight</th><th>Last event</th><th>Updated</th>
+  </tr></thead><tbody>`;
+  for (const r0 of rows) {
+    html += `<tr>
+      <td>${escapeHtml(r0.city)}</td>
+      <td>${escapeHtml(r0.source)}</td>
+      <td>${r0.samples}</td>
+      <td>${r0.hits}</td>
+      <td>${r0.hit_rate != null ? Math.round(r0.hit_rate * 100) + '%' : '—'}</td>
+      <td>${r0.mae_f != null ? r0.mae_f.toFixed(1) : '—'}</td>
+      <td>${r0.bias_f != null ? (r0.bias_f >= 0 ? '+' : '') + r0.bias_f.toFixed(1) : '—'}</td>
+      <td>${wCell(r0)}</td>
+      <td>${r0.last_event_date || '—'}</td>
+      <td class="small">${r0.updated_at ? r0.updated_at.slice(0,16).replace('T',' ') : '—'}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  box.innerHTML = html;
+  makeTablesSortable('statsModelSkill');
+}
+
+async function refreshModelSkill(btn) {
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Working…';
+  try {
+    const r = await api('/model-skill/refresh', { method: 'POST' });
+    if (r.ok) await loadModelSkill();
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
 }
 
 function resetPosFilter() {

@@ -132,12 +132,22 @@ def corrected_forecast_values(signals: dict) -> dict[str, float]:
 
 
 def blended_forecast_high(signals: dict) -> Optional[float]:
-    """Weighted mean of today's bias-corrected deterministic forecast highs."""
+    """ממוצע משוקלל של תחזיות-השיא המתוקנות של היום.
+
+    המשקל של כל מודל = משקל הבסיס (HRRR הכי טוב ל-0-18 שעות וכו')
+    כפול משקל הכישרון הפר-עירוני מהמאגר המנוהל (model_skill):
+    מודל שמוכיח שוב ושוב שהוא צודק בעיר הזו מקבל יותר השפעה על
+    הצפי, ומודל שטועה — פחות. בלי רשומת כישרון: ניטרלי (1.0).
+    """
     vals = corrected_forecast_values(signals)
     if not vals:
         return None
-    total_w = sum(_BLEND_WEIGHTS[k] for k in vals)
-    return sum(_BLEND_WEIGHTS[k] * v for k, v in vals.items()) / total_w
+    skill: dict = signals.get("model_weights") or {}
+    eff_w = {k: _BLEND_WEIGHTS[k] * float(skill.get(k, 1.0)) for k in vals}
+    total_w = sum(eff_w.values())
+    if total_w <= 0:
+        return None
+    return sum(eff_w[k] * v for k, v in vals.items()) / total_w
 
 
 def forecast_spread(signals: dict) -> Optional[float]:

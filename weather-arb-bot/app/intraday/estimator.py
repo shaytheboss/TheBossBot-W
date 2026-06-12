@@ -40,15 +40,28 @@ class IntradayParams:
     cooling_drop_f: float = 1.5
     # ...for at least this long, and only after peak_start_hour.
     cooling_min_minutes: float = 90.0
-    # Model disagreement is genuine uncertainty about the remaining heating:
-    # sigma floor = gain_weight * source_spread * spread_sigma_weight.
-    # (Tokyo incident: sources spanned 4.7°F yet sigma was 1.0 — the model
-    # claimed 96% on a bucket whose floor the running max was sitting on.)
+    # מודל שחולק על מודל = אי-ודאות אמיתית על החימום שנותר:
+    # רצפת סיגמה = gain_weight * פיזור-המקורות * spread_sigma_weight.
+    # (תקרית טוקיו: המקורות נפרשו על 4.7°F אבל סיגמה טענה ±1.0 — המודל
+    # הכריז 96% על דלי שהמקסימום הרץ ישב בדיוק על הרצפה שלו.)
     spread_sigma_weight: float = 0.5
-    # An unlocked YES before the peak window even opens cannot be a near-lock:
-    # the max can still escape upward out of the bucket. Cap it below the buy
-    # threshold so knife-edge cases alert but never auto-buy.
+    # YES לא-נעול לפני שחלון השיא בכלל נפתח לא יכול להיות "כמעט-נעילה":
+    # המקסימום עדיין יכול לברוח כלפי מעלה מהדלי. התקרה מתחת לסף הקנייה
+    # כדי שמקרי קצה יתריעו אבל לעולם לא ייקנו אוטומטית.
     pre_peak_yes_cap: float = 0.90
+    # ── תקרית פריז (12 ביוני) ─────────────────────────────────────────────
+    # שגיאת תחזית של אותו יום: כש-μ נשען על תחזית (ולא על המקסימום שכבר
+    # נמדד), אי-הוודאות חייבת לכלול את שגיאת התחזית עצמה. בפריז: מקסימום רץ
+    # 66.2°F, צפי סופי 73.8°F — כלומר μ היה כמעט כולו תחזית — אבל σ נלקח
+    # מלוח הזמנים בלבד (±1.6°F) והבוט הכריז NO ב-98%... והיום עקף את כל
+    # המודלים והדלי "הבלתי-אפשרי" זכה. ±2.5°F הוא סדר הגודל המקובל לשגיאת
+    # תחזית מקסימום של אותו יום.
+    same_day_forecast_sigma: float = 2.5
+    # תקרה סטטיסטית: אומדן שאינו נעילה מתמטית ואינו אחרי-שיא לעולם לא
+    # מורשה לטעון יותר מ-96% (או פחות מ-4% ל-YES) — יש זנבות שהמודל
+    # לא רואה (אדבקציה, פערי תחנות, הטיה ספציפית ליום).
+    stat_prob_hi: float = 0.96
+    stat_prob_lo: float = 0.04
 
 
 DEFAULT_PARAMS = IntradayParams()
@@ -210,23 +223,38 @@ def estimate_intraday(
     peak_passed = is_peak_passed(
         local_hour, current_temp_f, peak_detection_max, minutes_since_max, params
     )
-    sigma = intraday_sigma(local_hour, peak_passed, params)
+    w = gain_weight(local_hour, params)
+    sigma_schedule = intraday_sigma(local_hour, peak_passed, params)
+
+    # ── הרכבת הסיגמה האפקטיבית (תיקון תקרית פריז) ────────────────────────
+    # שני מקורות אי-ודאות בלתי-תלויים, ולכן מחוברים ריבועית (quadrature):
+    #   1. רעש תוך-יומי לפי לוח הזמנים (מתכווץ ככל שמתקרבים לסוף השיא)
+    #   2. שגיאת התחזית עצמה — נכנסת באופן יחסי לכמה ש-μ תלוי בתחזית:
+    #      μ = M + w·(F − M), ולכן שגיאה ב-F מתורגמת ל-w·שגיאה ב-μ.
+    #      בבוקר (w≈1) אנחנו בעצם חוזים תחזית — σ חייב להיות רחב;
+    #      אחרי השיא (w=0) המקסימום כבר נמדד — האיבר נעלם מעצמו.
+    # מעל שניהם: רצפה מאי-הסכמת מודלים (תקרית טוקיו) — אם המקורות עצמם
+    # חלוקים, אסור לסיגמה להיות צרה מהמחלוקת המשוקללת.
+    sigma_fc_term = 0.0
     sigma_floor = 0.0
-    if forecast_spread_f and forecast_spread_f > 0 and not peak_passed:
-        sigma_floor = (
-            gain_weight(local_hour, params)
-            * float(forecast_spread_f)
-            * params.spread_sigma_weight
-        )
-        sigma = max(sigma, sigma_floor)
+    if not peak_passed:
+        sigma_fc_term = w * params.same_day_forecast_sigma
+        sigma = math.sqrt(sigma_schedule ** 2 + sigma_fc_term ** 2)
+        if forecast_spread_f and forecast_spread_f > 0:
+            sigma_floor = w * float(forecast_spread_f) * params.spread_sigma_weight
+            sigma = max(sigma, sigma_floor)
+    else:
+        # אחרי שהשיא עבר המקסימום כבר נקבע במציאות — אין תלות בתחזית.
+        sigma = sigma_schedule
+
     mu = expected_final_max(running_max_f, forecast_high_f, local_hour, params)
     p = bucket_probability(running_max_f, mu, sigma, f_lo, f_hi)
     state = lock_state(running_max_f, f_lo, f_hi)
 
-    # Pre-peak YES cap: before the climatological peak window opens, an
-    # UNLOCKED bucket can still lose its YES to further heating no matter how
-    # tight sigma says it is. Never let such a YES cross the cap (locks are
-    # exempt — they are mathematical, not statistical).
+    # ── תקרת YES לפני חלון השיא ──────────────────────────────────────────
+    # לפני שחלון השיא הקלימטולוגי נפתח, דלי לא-נעול עדיין יכול לאבד את
+    # ה-YES שלו לחימום נוסף — לא משנה כמה הסיגמה צרה. נעילות פטורות
+    # (הן מתמטיות, לא סטטיסטיות).
     pre_peak_cap_applied = False
     if (
         state is None
@@ -236,6 +264,19 @@ def estimate_intraday(
         p = params.pre_peak_yes_cap
         pre_peak_cap_applied = True
 
+    # ── תקרה סטטיסטית (תיקון תקרית פריז, חלק ב') ─────────────────────────
+    # אומדן שאינו נעילה ואינו אחרי-שיא הוא ניחוש סטטיסטי שתלוי בתחזית —
+    # לעולם לא מורשה לטעון ביטחון קיצוני. 98% על משהו תוך-יומי שעוד
+    # תלוי ב-5 שעות חימום עתידי הוא חוסר ענווה, לא מודל.
+    stat_cap_applied = False
+    if state is None and not peak_passed:
+        if p > params.stat_prob_hi:
+            p = params.stat_prob_hi
+            stat_cap_applied = True
+        elif p < params.stat_prob_lo:
+            p = params.stat_prob_lo
+            stat_cap_applied = True
+
     breakdown = {
         "running_max_f": round(running_max_f, 1),
         "metar_max_f": round(metar_max_f, 1) if metar_max_f is not None else None,
@@ -244,13 +285,16 @@ def estimate_intraday(
         "expected_final_max_f": round(mu, 1),
         "local_hour": round(local_hour, 2),
         "hours_to_peak_end": round(hours_to_peak_end(local_hour, params), 2),
-        "gain_weight": round(gain_weight(local_hour, params), 3),
+        "gain_weight": round(w, 3),
         "sigma_used": round(sigma, 3),
+        "sigma_schedule": round(sigma_schedule, 3),
+        "sigma_forecast_term": round(sigma_fc_term, 3),
         "sigma_floor_from_spread": round(sigma_floor, 3),
         "forecast_spread_f": (
             round(float(forecast_spread_f), 1) if forecast_spread_f is not None else None
         ),
         "pre_peak_cap_applied": pre_peak_cap_applied,
+        "stat_cap_applied": stat_cap_applied,
         "peak_passed": peak_passed,
         "lock_state": state,
         "f_lo": f_lo,

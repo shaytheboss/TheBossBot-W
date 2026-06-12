@@ -797,6 +797,69 @@ async def admin_stats(
     }
 
 
+@router.get("/model-skill")
+async def admin_model_skill(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    city_id: Optional[int] = Query(default=None),
+):
+    """מאגר דיוק-המודלים המנוהל — הטבלה החיה שמזינה את משקולות החיזוי.
+
+    כל שורה = (עיר, מודל) על חלון המדידה המתגלגל: דגימות, פגיעות בדלי
+    שפולימרקט סגרה, מרחק ממוצע, הטיה חתומה, והמשקל הסופי [0.5-1.5]
+    שהבוט היומי והתוך-יומי משתמשים בו בפועל.
+    """
+    from app.models.model_skill import ModelSkill
+    from app.analyzers.model_skill import MIN_SAMPLES
+    q = (
+        select(ModelSkill, City.name)
+        .join(City, City.id == ModelSkill.city_id)
+        .order_by(City.name, ModelSkill.source)
+    )
+    if city_id is not None:
+        q = q.where(ModelSkill.city_id == city_id)
+    rows = (await db.execute(q)).all()
+    return {
+        "min_samples": MIN_SAMPLES,
+        "rows": [
+            {
+                "city_id": r.ModelSkill.city_id,
+                "city": r.name,
+                "source": r.ModelSkill.source,
+                "samples": r.ModelSkill.samples,
+                "hits": r.ModelSkill.hits,
+                "hit_rate": r.ModelSkill.hit_rate,
+                "mae_f": r.ModelSkill.mae_f,
+                "bias_f": r.ModelSkill.bias_f,
+                "weight": r.ModelSkill.weight,
+                # משקל פעיל = יש מספיק דגימות; אחרת המודל עדיין ניטרלי
+                "active": r.ModelSkill.samples >= MIN_SAMPLES,
+                "window_days": r.ModelSkill.window_days,
+                "last_event_date": (
+                    r.ModelSkill.last_event_date.isoformat()
+                    if r.ModelSkill.last_event_date else None
+                ),
+                "updated_at": (
+                    r.ModelSkill.updated_at.isoformat()
+                    if r.ModelSkill.updated_at else None
+                ),
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/model-skill/refresh")
+async def admin_model_skill_refresh(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """עדכון ידני מיידי של מאגר דיוק-המודלים (אותו חישוב כמו ה-job)."""
+    from app.analyzers.model_skill import update_model_skill
+    summary = await update_model_skill(db)
+    return summary
+
+
 @router.get("/model-accuracy")
 async def admin_model_accuracy(
     _: str = Depends(require_admin),

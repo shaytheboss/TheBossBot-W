@@ -31,7 +31,9 @@ from app.models.pirep import Pirep
 from app.models.market import MarketPrice, MarketOutcome
 from app.utils.units import resolve_bucket_unit
 from app.analyzers.bias_estimator import get_station_bias
-from app.analyzers.model_weights import get_city_model_weights
+# משקולות מודלים פר-עיר מהמאגר המנוהל (model_skill); נופל אוטומטית
+# למנגנון החישוב הוותיק כשהטבלה עוד ריקה לעיר.
+from app.analyzers.model_skill import get_skill_weights
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,7 @@ class SignalAggregator:
         signals["station_bias"] = await get_station_bias(
             db, city_id, primary_icao, tz_name=city_tz or "UTC"
         )
-        signals["model_weights"] = await get_city_model_weights(db, city_id)
+        signals["model_weights"] = await get_skill_weights(db, city_id)
         # City-specific onshore (sea→land) wind bearing; None disables the
         # wind heuristics in the estimator and confidence scorer.
         signals["_onshore_wind_dir"] = onshore_wind_dir
