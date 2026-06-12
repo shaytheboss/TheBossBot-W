@@ -7,12 +7,12 @@ from app.database import Base
 
 
 class ModelSkill(Base):
-    """מאגר מנוהל של דיוק מודלים פר-עיר — "מי באמת צודק כאן".
+    """מאגר מנוהל של דיוק מודלים פר-עיר ופר-זמן-הקדמה — "מי באמת צודק כאן".
 
-    שורה אחת לכל (עיר, מודל). מתעדכן אוטומטית אחרי כל settlement של
-    פולימרקט (ועל-ידי job תקופתי), כך שהמשקולות תמיד משקפות את חלון
-    הזמן האחרון ולא היסטוריה עתיקה — מודל שהיה מצוין לפני חודשיים
-    ועכשיו דועך יאבד את המשקל שלו מעצמו.
+    שורה אחת לכל (עיר, מודל, days_ahead). days_ahead הוא כמה ימים לפני
+    יום האירוע פורסמה התחזית שנמדדת: 0 = ביום עצמו, 1 = יום לפני, 2 = יומיים לפני.
+    כך מודל שמצטיין בתחזית יומיים מראש נחשב בנפרד מביצועיו ביום האירוע עצמו —
+    ומשקל ה-2-day-ahead שלו ייחשב רק כשנדע כמה הקדמה יש בהתראה הנוכחית.
 
     הציון נמדד מול האמת היחידה שמשלמת: הדלי שפולימרקט סגרה כמנצח.
     לא מול METAR, לא מול תחזיות אחרות — מול התוצאה שעליה מתחשבן הכסף.
@@ -23,12 +23,16 @@ class ModelSkill(Base):
     """
     __tablename__ = "model_skill"
     __table_args__ = (
-        UniqueConstraint("city_id", "source", name="uq_model_skill_city_source"),
+        UniqueConstraint("city_id", "source", "days_ahead",
+                         name="uq_model_skill_city_source_da"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     city_id = Column(Integer, ForeignKey("cities.id"), nullable=False, index=True)
     source = Column(String(32), nullable=False)        # 'gfs' / 'ecmwf' / 'hrrr' / ...
+    # כמה ימים לפני יום האירוע פורסמה התחזית הנמדדת:
+    #   0 = ביום האירוע עצמו (ה"מילה האחרונה"), 1 = יום לפני, 2 = יומיים לפני, ...
+    days_ahead = Column(Integer, nullable=False, default=0)
 
     # ── הסטטיסטיקה עצמה (על חלון הזמן האחרון בלבד) ──
     samples = Column(Integer, nullable=False, default=0)   # שווקים סגורים שנמדדו

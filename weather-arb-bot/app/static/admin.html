@@ -140,7 +140,7 @@
       <p class="small">Each weather model's point forecast scored against the bucket Polymarket settled, over resolved markets in the current filter. Helps spot which model performs best — and where (per-city), so models could later be weighted per city.</p>
       <div id="statsModels"></div>
       <h3 style="margin-top:24px;">⚖️ Model skill DB (live prediction weights) <button class="btn small" onclick="refreshModelSkill(this)" title="Recompute the skill table now (also runs automatically after every settlement and hourly)">↻ Recompute</button></h3>
-      <p class="small">The <strong>managed, continuously-updated</strong> per-city model accuracy database. Each row scores a model's last same-day forecast against the bucket Polymarket actually settled, over a rolling 90-day window. The <strong>Weight</strong> column is what both the daily and the ⚡ intraday predictors actually use (1.0 = neutral; models below the sample minimum stay neutral until they earn a track record). Updates automatically after every settlement and hourly.</p>
+      <p class="small">The <strong>managed, continuously-updated</strong> per-city model accuracy database. Each row scores a model at a specific <strong>Days ahead</strong> lead time: 0 = same-day forecast, 1 = one day before, 2 = two days before. A 2-day-ahead alert uses 2-day-ahead weights — models are compared fairly at each lead time. The <strong>Weight</strong> column is what both the daily and the ⚡ intraday predictors actually use (1.0 = neutral; models below the sample minimum stay neutral until they earn a track record). Updates automatically after every settlement and hourly.</p>
       <div id="statsModelSkill"></div>
       <h3 style="margin-top:24px;">Inventory</h3>
       <div class="grid" id="statsInv"></div>
@@ -855,13 +855,16 @@ async function loadModelSkill() {
     return `<span style="color:${color};font-weight:600">${w.toFixed(2)}</span>`;
   };
   let html = `<table><thead><tr>
-    <th>City</th><th>Model</th><th>Samples</th><th>Hits</th><th>Hit rate</th>
+    <th>City</th><th>Model</th><th title="Days before the event this forecast was issued">Days ahead</th>
+    <th>Samples</th><th>Hits</th><th>Hit rate</th>
     <th>MAE (°F)</th><th>Bias (°F)</th><th>Weight</th><th>Last event</th><th>Updated</th>
   </tr></thead><tbody>`;
   for (const r0 of rows) {
+    const daLabel = r0.days_ahead === 0 ? 'same-day' : `${r0.days_ahead}d ahead`;
     html += `<tr>
       <td>${escapeHtml(r0.city)}</td>
       <td>${escapeHtml(r0.source)}</td>
+      <td class="small" title="${r0.days_ahead} days before event">${daLabel}</td>
       <td>${r0.samples}</td>
       <td>${r0.hits}</td>
       <td>${r0.hit_rate != null ? Math.round(r0.hit_rate * 100) + '%' : '—'}</td>

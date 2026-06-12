@@ -88,7 +88,11 @@ class SignalAggregator:
         signals["station_bias"] = await get_station_bias(
             db, city_id, primary_icao, tz_name=city_tz or "UTC"
         )
-        signals["model_weights"] = await get_skill_weights(db, city_id)
+        # days_ahead = כמה ימים לפני יום האירוע אנחנו עכשיו — קובע איזו
+        # שורת-דיוק לקחת מ-model_skill (0=אותו-יום, 1=יום מראש, ...).
+        _today = date.today()
+        _days_ahead = max(0, (forecast_date - _today).days) if forecast_date else 0
+        signals["model_weights"] = await get_skill_weights(db, city_id, days_ahead=_days_ahead)
         # City-specific onshore (sea→land) wind bearing; None disables the
         # wind heuristics in the estimator and confidence scorer.
         signals["_onshore_wind_dir"] = onshore_wind_dir
