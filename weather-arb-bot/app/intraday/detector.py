@@ -91,7 +91,11 @@ def official_running_max(
         return metar_max_f, "metar", False
     wu = float(wu_high_f)
     if wu > metar_max_f + WU_MAX_DISCREPANCY_F:
-        return metar_max_f, "metar", True   # suspect — surface but don't trust
+        return metar_max_f, "metar", True   # WU suspect — surface but don't trust
+    if metar_max_f > wu + WU_MAX_DISCREPANCY_F:
+        # METAR spike: one bad obs drove the max well above the WU station.
+        # Polymarket resolves on WU, so use WU as the official source.
+        return wu, "wunderground_spike_guard", True
     if wu > metar_max_f:
         return wu, "wunderground", False
     return metar_max_f, "metar", False
@@ -413,10 +417,16 @@ async def _evaluate_intraday_outcome(
     breakdown["wu_high_f"] = float(wu_high) if wu_high is not None else None
     breakdown["wu_suspect"] = wu_suspect
     if wu_suspect:
-        logger.warning(
-            f"Intraday: WU high {wu_high}°F is >{WU_MAX_DISCREPANCY_F}°F above "
-            f"METAR max {metar_max}°F for {city.name} — ignoring as suspect scrape"
-        )
+        if max_source == "wunderground_spike_guard":
+            logger.warning(
+                f"Intraday: METAR max {metar_max}°F is >{WU_MAX_DISCREPANCY_F}°F above "
+                f"WU {wu_high}°F for {city.name} — METAR spike, using WU as official source"
+            )
+        else:
+            logger.warning(
+                f"Intraday: WU high {wu_high}°F is >{WU_MAX_DISCREPANCY_F}°F above "
+                f"METAR max {metar_max}°F for {city.name} — ignoring as suspect scrape"
+            )
 
     yes_entry = book["ask"]
     no_entry = round(1.0 - book["bid"], 4)

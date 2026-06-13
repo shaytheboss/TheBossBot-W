@@ -1079,10 +1079,30 @@ def fmt_opportunity(
     if calibrated_conf is not None and abs(calibrated_conf - confidence) >= 2:
         direction = "↓" if calibrated_conf < confidence else "↑"
         calib_note = f" → calibrated {direction}{calibrated_conf}%"
+    calibration_gated = signals.get("_calibration_gated", False)
+    calib_gate_note = (
+        "\n⛔ _Calibration gate: raw confidence cleared the buy threshold but "
+        "historical win rate for this confidence band is lower — no virtual buy._"
+        if calibration_gated else ""
+    )
     certainty_note = (
         f"\n⚠️ Certainty: {confidence}%{calib_note} "
         f"(directional confidence = max(P(YES), P(NO)) of our blend)"
+        f"{calib_gate_note}"
     )
+
+    # Near-money warning: the modal bucket (most likely outcome per blended
+    # forecast) has the worst risk/reward profile — a 1-2°F error in either
+    # direction is a loss. Flag it clearly so the user can decide whether the
+    # edge justifies the exposure.
+    near_money_section = ""
+    if signals.get("_is_near_money"):
+        near_money_section = (
+            "\n\n⚠️ *NEAR-MONEY BUCKET* — this is the bucket the blended forecast "
+            "lands in (or closest to). The model is most confident here, but a "
+            "1-2°F error in either direction is a loss. Treat the edge as narrower "
+            "than it appears. Consider sizing down or skipping if manually trading."
+        )
 
     # Headline: when a virtual buy is actually opened, make that unmistakable at
     # the very top and add a #BUY hashtag so these messages are trivially
@@ -1117,6 +1137,7 @@ def fmt_opportunity(
         f"{math_section}"
         f"{uncertainty_section}"
         f"{atm_section}"
+        f"{near_money_section}"
         f"{certainty_note}{hours_left}{link_line}"
     )
 
