@@ -29,7 +29,9 @@ that temperature will stay below an upper bucket threshold.
 
 ## Calibration constants
 
-σ_base = 2.5°F same-day, grows +0.5°F/day → capped at 5.5°F (day 6+).
+σ_base = 4.0°F same-day, grows +0.5°F/day → capped at 6.0°F (day 4+).
+Calibrated against realized summer daily-MAXIMUM errors (3-5°F even same-day);
+the older 2.5°F floor implied ~93% confidence on a 4°F-off forecast.
 Open-ended buckets ("≥X°F" / "≤X°F") use σ×1.5 — tail events are harder to forecast.
 Clip: final P clipped to [3%, 92%] — no single source can claim >92% confidence.
 
@@ -479,6 +481,10 @@ def estimate_with_breakdown(
         "ensemble": None,
         "wunderground": None,
         "det_avg": None,
+        # Blended forecast HIGH in °F (bias-corrected). This is the temperature
+        # the models expect — distinct from det_avg, which is a PROBABILITY.
+        # Used by the near-money detector to find the bucket the forecast lands in.
+        "forecast_high_f": None,
         "ens_p": None,
         "wg_p": None,
         "blend_before_adjustments": None,
@@ -684,6 +690,14 @@ def estimate_with_breakdown(
         fc_for_boundary = sum(det_vals) / len(det_vals)
     elif wg_corrected is not None:
         fc_for_boundary = float(wg_corrected)
+    elif ensemble_vals:
+        fc_for_boundary = sum(ensemble_vals) / len(ensemble_vals)
+
+    # Expose the blended forecast high so downstream code (near-money detection)
+    # can locate the bucket the forecast actually lands in.
+    breakdown["forecast_high_f"] = (
+        float(fc_for_boundary) if fc_for_boundary is not None else None
+    )
 
     if fc_for_boundary is not None:
         blend_w, closest_source_f, closest_source_dist_f = boundary_uncertainty_blend(

@@ -187,6 +187,36 @@ def test_calibration_gate_note_absent_when_not_gated():
     assert "Calibration gate" not in text
 
 
+# ── Fix 3b: near-money detector reads a TEMPERATURE, not a probability ────────
+
+def test_breakdown_exposes_forecast_high_as_temperature():
+    """forecast_high_f must be the blended forecast HIGH (°F), distinct from
+    det_avg which is a probability in [0,1]. The near-money detector locates the
+    bucket the forecast lands in, so it must read a temperature — reading det_avg
+    (a probability) silently disabled the temperature path and always fell back
+    to the highest-probability bucket."""
+    from app.analyzers.probability_estimator import (
+        estimate_with_breakdown,
+        _bucket_contains,
+    )
+    signals = {
+        "gfs_forecast": {"predicted_high_f": 88.0},
+        "ecmwf_forecast": {"predicted_high_f": 89.0},
+        "station_bias": {"bias_f": 1.5, "per_source": {}},
+    }
+    _, b = estimate_with_breakdown(signals, 92, 93, days_ahead=0, bucket_unit="F")
+
+    # forecast_high_f is a plausible temperature, NOT a probability.
+    assert b["forecast_high_f"] is not None
+    assert b["forecast_high_f"] > 50.0
+    # det_avg is a probability — the value the old buggy code read by mistake.
+    assert 0.0 <= b["det_avg"] <= 1.0
+    # The forecast high (≈90°F) is found inside its true bucket, but a probability
+    # value never would be.
+    assert _bucket_contains(b["forecast_high_f"], 89, 91, "F")
+    assert not _bucket_contains(b["det_avg"], 89, 91, "F")
+
+
 # ── Fix 4: _has_open_position exists and has correct signature ────────────────
 
 def test_has_open_position_importable():
