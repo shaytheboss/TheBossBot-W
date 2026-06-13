@@ -97,7 +97,13 @@ _KEY_TO_BIAS_SOURCE: dict[str, str] = {
 
 # Ensemble-spread sigma bounds: the blended sigma is clamped to this range so a
 # freak ensemble (collapsed or exploded) can't push the CDF into nonsense.
-_SIGMA_BLEND_MIN_F = 2.0
+# Floor raised 2.0 → 3.0: on a synoptically quiet summer day every member
+# agrees, so the ensemble std collapses toward ~1°F and the blend dragged the
+# effective sigma BELOW the lead-time floor — manufacturing false confidence
+# precisely when all models are about to be wrong together (the regime the
+# ensemble cannot see). A tight ensemble may narrow uncertainty, never below
+# the realized same-day error floor.
+_SIGMA_BLEND_MIN_F = 3.0
 _SIGMA_BLEND_MAX_F = 7.0
 # Raw ensembles systematically under-disperse vs realized error; standard
 # practice is to inflate the spread before using it as a sigma estimate.
@@ -171,11 +177,17 @@ def _parse_coord(val) -> Optional[float]:
 
 
 def forecast_sigma_for_lead(days_ahead: Optional[int]) -> float:
-    # Calibrated against real MAE data: NWP daily-high errors are ~2-3°F same-day,
-    # growing to ~5°F by day 5. Prior version (1.5 + 0.5*d) was far too optimistic.
+    # Calibrated against real NWP verification: daily-MAXIMUM errors are larger
+    # than daily-MEAN errors — summer heat-wave maxima routinely miss by 3-5°F
+    # even same-day, because the timing/intensity of the afternoon peak is the
+    # hardest thing to forecast. The previous 2.5°F same-day floor implied ~93%
+    # confidence on a 2°F-wide bucket from a 4°F-off forecast — exactly the
+    # Denver/Paris overconfidence that produced losses. Floor raised to 4.0°F
+    # same-day so a single point forecast can never claim more certainty than
+    # the realized error distribution justifies.
     if days_ahead is None or days_ahead < 0:
-        return 4.0
-    return min(5.5, 2.5 + 0.5 * days_ahead)
+        return 4.5
+    return min(6.0, 4.0 + 0.5 * days_ahead)
 
 
 def _bucket_to_f_bounds(

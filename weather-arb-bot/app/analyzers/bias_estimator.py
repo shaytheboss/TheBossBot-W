@@ -31,6 +31,12 @@ UTC day — a UTC day window includes the previous local evening for US
 cities (and is hours off for Asian ones), contaminating the daily max with
 the prior afternoon's warmth.
 
+The window mean is RECENCY-WEIGHTED (EWMA, 5-day half-life) rather than flat:
+a heat wave or cold snap shows up in the bias within days instead of being
+diluted across the full 14-day window, so the bot stops betting NO on hot
+buckets sooner once a warming regime begins. A regime-shift note is attached
+when the last 5 days diverge from the full window by more than 1.5°F.
+
 Default prior: +1.5°F (conservative estimate for typical CONUS airports).
 """
 
@@ -48,6 +54,71 @@ DEFAULT_BIAS_F = 1.5
 MIN_SAMPLES = 5
 WINDOW_DAYS = 14
 MAX_BIAS_ABS_F = 8.0  # outlier guard — beyond this, assume a data bug
+
+# ── Short-term regime adaptation (heat-wave responsiveness) ────────────────────
+# A flat 14-day mean takes ~2 weeks to absorb a regime shift: when a heat wave
+# starts, the actual-vs-forecast error jumps but the old cool days keep dragging
+# the average down, so the bot stays under-corrected (too cold) and keeps
+# betting NO on hot buckets that then come in. Instead of a flat mean we use an
+# exponentially-recency-weighted mean (EWMA): a sample N days old gets weight
+# 0.5**(N / HALF_LIFE). With a 5-day half-life over a 14-day window, the last
+# few days carry ~2-3× the weight of the oldest, so a warming (or cooling)
+# regime is reflected within days while two weeks of data still anchor it
+# against single-day noise. The output is always within [min, max] of the
+# samples — it cannot overshoot.
+BIAS_RECENCY_HALF_LIFE_DAYS = 5.0
+# Window (days, most-recent) used only to surface a regime-shift note for the
+# dashboard — it does not change the bias value itself.
+BIAS_RECENT_NOTE_WINDOW_DAYS = 5
+# Recent vs full-window divergence (°F) above which we flag a regime shift.
+BIAS_REGIME_SHIFT_F = 1.5
+
+
+def _recency_weighted_mean(
+    dated_samples: list, half_life_days: float = BIAS_RECENCY_HALF_LIFE_DAYS
+) -> float:
+    """EWMA over (date, value) pairs — recent days weighted more heavily.
+
+    weight(sample) = 0.5 ** (age_in_days / half_life_days), where age is
+    measured from the most recent sample. Returns 0.0 for an empty input.
+    The result is bounded by [min(values), max(values)] so it can never
+    overshoot the observed data.
+    """
+    if not dated_samples:
+        return 0.0
+    newest = max(d for d, _ in dated_samples)
+    num = 0.0
+    den = 0.0
+    for d, v in dated_samples:
+        age = (newest - d).days
+        w = 0.5 ** (age / half_life_days) if half_life_days > 0 else 1.0
+        num += w * v
+        den += w
+    return num / den if den else 0.0
+
+
+def _recent_window_mean(dated_samples: list, days: int) -> Optional[float]:
+    """Flat mean over the most-recent `days` of (date, value) samples."""
+    if not dated_samples:
+        return None
+    newest = max(d for d, _ in dated_samples)
+    recent = [v for d, v in dated_samples if (newest - d).days < days]
+    return mean(recent) if recent else None
+
+
+def _regime_shift_note(dated_samples: list, full_mean: float) -> str:
+    """Human-readable flag when recent days diverge from the full window."""
+    recent = _recent_window_mean(dated_samples, BIAS_RECENT_NOTE_WINDOW_DAYS)
+    if recent is None:
+        return ""
+    delta = recent - full_mean
+    if abs(delta) < BIAS_REGIME_SHIFT_F:
+        return ""
+    direction = "warming" if delta > 0 else "cooling"
+    return (
+        f"; ⚠️ {direction} regime: last {BIAS_RECENT_NOTE_WINDOW_DAYS}d "
+        f"{recent:+.1f}°F vs {full_mean:+.1f}°F full-window (Δ{delta:+.1f}°F)"
+    )
 
 _NWP_SOURCES = ("gfs", "ecmwf", "hrrr", "nws", "tomorrowio", "meteosource", "icon")
 # Per-source bias is also learned for Wunderground (its bias is naturally ~0
@@ -182,15 +253,17 @@ async def get_station_bias(
             entry = wu_by_date.setdefault(r.fc_date, (float(r.wu_max_f), []))
             entry[1].append(float(r.predicted_f))
 
-        wu_samples_list = [
-            wu_max - (sum(preds) / len(preds))
-            for wu_max, preds in wu_by_date.values()
+        # Dated samples → recency-weighted (EWMA) bias so a heat wave is
+        # reflected within days rather than diluted over the full 14-day window.
+        wu_dated = [
+            (fc_date, wu_max - (sum(preds) / len(preds)))
+            for fc_date, (wu_max, preds) in wu_by_date.items()
             if preds
         ]
-        wu_samples = len(wu_samples_list)
+        wu_samples = len(wu_dated)
 
         if wu_samples >= MIN_SAMPLES:
-            candidate = mean(wu_samples_list)
+            candidate = _recency_weighted_mean(wu_dated)
             if abs(candidate) > MAX_BIAS_ABS_F:
                 logger.warning(
                     "WU bias outlier for %s: %.2f°F > %.1f°F cap — ignoring WU path",
@@ -199,10 +272,12 @@ async def get_station_bias(
                 wu_notes = f"WU outlier {candidate:.2f}°F capped"
             else:
                 wu_bias_f = candidate
-                wu_stddev = pstdev(wu_samples_list)
+                wu_flat = mean(v for _, v in wu_dated)
+                wu_stddev = pstdev([v for _, v in wu_dated])
                 wu_notes = (
-                    f"WU-anchored {window_days}d rolling, "
+                    f"WU-anchored {window_days}d EWMA, "
                     f"{wu_samples} samples, σ={wu_stddev:.2f}°F"
+                    + _regime_shift_note(wu_dated, wu_flat)
                 )
 
     except Exception as exc:
@@ -225,11 +300,12 @@ async def get_station_bias(
             entry = nwp_by_date.setdefault(r.fc_date, (actual, []))
             entry[1].append(predicted)
 
-    metar_samples_list = [
-        actual - (sum(preds) / len(preds))
-        for actual, preds in nwp_by_date.values()
+    metar_dated = [
+        (fc_date, actual - (sum(preds) / len(preds)))
+        for fc_date, (actual, preds) in nwp_by_date.items()
         if preds
     ]
+    metar_samples_list = [v for _, v in metar_dated]
 
     per_source: dict = {}
     for source, errs in per_source_errs.items():
@@ -265,7 +341,7 @@ async def get_station_bias(
         out["per_source"] = per_source
         return out
 
-    metar_bias = mean(metar_samples_list)
+    metar_bias = _recency_weighted_mean(metar_dated)
 
     if abs(metar_bias) > MAX_BIAS_ABS_F:
         logger.warning(
@@ -276,14 +352,16 @@ async def get_station_bias(
         out["per_source"] = per_source
         return out
 
+    metar_flat = mean(metar_samples_list)
     metar_stddev = pstdev(metar_samples_list)
     return {
         "bias_f": round(metar_bias, 2),
         "per_source": per_source,
         "samples": len(metar_samples_list),
         "notes": (
-            f"METAR-based {window_days}d rolling, "
+            f"METAR-based {window_days}d EWMA, "
             f"{len(metar_samples_list)} samples, σ={metar_stddev:.2f}°F"
+            + _regime_shift_note(metar_dated, metar_flat)
             + (f" (WU insufficient: {wu_samples} samples)" if wu_samples > 0 else "")
         ),
         "is_default": False,
