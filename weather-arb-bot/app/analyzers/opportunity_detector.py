@@ -446,9 +446,9 @@ async def _evaluate_opportunity(
     is_blacklisted = bool(getattr(city, "blacklisted", False))
     is_suspended = _city_is_suspended(city)
 
-    # Virtual buy is suppressed during suspension, blacklist, or when calibrated
-    # confidence is below the buy threshold (even if raw certainty clears it).
-    create_virtual_buy = (calibrated_certainty >= buy_thresh) and not is_blacklisted and not is_suspended
+    # Virtual buy is suppressed during suspension or blacklist.
+    # Calibration is display-only for now — raw certainty drives the gate.
+    create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted and not is_suspended
 
     # Dedup: skip new records when an OPEN position already exists for this
     # (outcome, side) — regardless of when it was opened. This prevents double
