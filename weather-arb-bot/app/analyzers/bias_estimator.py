@@ -1,22 +1,30 @@
 """Airport warm-bias estimator.
 
-METAR daily highs (the Polymarket resolution price) are systematically
-warmer than gridded NWP point forecasts — the tarmac and urban heat island
-effect shows up in the official ASOS reading but not in a 25-km model cell.
+Polymarket temperature markets resolve on Weather Underground (WU) station
+readings, which run 1-2°F warmer than METAR/ASOS official readings due to
+station siting, microclimate, and WU's max-temperature aggregation. Gridded
+NWP forecasts (GFS, ECMWF, HRRR, etc.) are calibrated against standard
+METAR observations, so there are two layers of bias:
 
-This module computes a per-city rolling 14-day bias:
-    bias_f = mean(actual_METAR_daily_max - T-1 NWP forecast average)
+    METAR bias:  mean(actual_METAR_daily_max  - T-1 NWP forecast average)
+    WU bias:     mean(WU_observed_daily_high  - T-1 NWP forecast average)
 
-plus a PER-SOURCE bias for each forecast model individually — GFS and HRRR
-have very different systematic errors, and Wunderground (station-anchored)
-typically has none, so a single averaged correction over- or under-corrects
-individual models. The probability estimator prefers the per-source value
-and falls back to the overall bias.
+Because Polymarket resolves on WU, the WU-anchored bias is the correct
+correction to apply before computing P(in bucket). When WU historical data
+is available in the forecasts table (source='wunderground', past dates),
+the WU bias is used as the primary bias_f. METAR bias is used as a fallback
+when WU data is insufficient.
 
-A positive bias_f means the airport runs warmer than the models predict,
+This module also computes a PER-SOURCE bias for each forecast model
+individually — GFS and HRRR have very different systematic errors, and
+Wunderground (station-anchored) typically has none, so a single averaged
+correction over- or under-corrects individual models. The probability
+estimator prefers the per-source value and falls back to the overall bias.
+
+A positive bias_f means the station reads warmer than the models predict,
 so we shift each model's point forecast UP by bias_f before computing
 P(in bucket). This corrects the systematic under-prediction and prevents
-the NO side from appearing overconfidently safe.
+the NO side from appearing overconfidently safe on hot buckets.
 
 Daily maxima are grouped by the CITY'S LOCAL day (City.timezone), not the
 UTC day — a UTC day window includes the previous local evening for US
@@ -57,19 +65,28 @@ async def get_station_bias(
 ) -> dict:
     """Compute rolling airport warm bias for a given ICAO / city.
 
+    Primary path: WU-anchored bias using Weather Underground historical
+    observations (source='wunderground' in the forecasts table), since
+    Polymarket resolves on WU. Falls back to METAR-based bias when WU
+    data is insufficient.
+
     Returns a dict:
         bias_f      float   overall bias in °F to ADD to model forecasts before CDF
         per_source  dict    source name → its own bias_f (only sources with
                             enough samples and a sane magnitude appear)
-        samples     int     number of daily matched (METAR, forecast) pairs
+        samples     int     number of daily matched pairs used for bias_f
         notes       str     human-readable description
         is_default  bool    True when falling back to the +1.5°F prior
     """
     end = date.today() - timedelta(days=1)   # yesterday (complete day)
     start = end - timedelta(days=window_days)
+    tz = tz_name or "UTC"
 
+    # ------------------------------------------------------------------ #
+    # 1. METAR query — drives per_source biases and METAR fallback path   #
+    # ------------------------------------------------------------------ #
     try:
-        result = await db.execute(
+        metar_result = await db.execute(
             text("""
                 SELECT
                     metar.fc_date,
@@ -102,18 +119,102 @@ async def get_station_bias(
                 "start": start,
                 "end_excl": end + timedelta(days=1),
                 "sources": list(_BIAS_SOURCES),
-                "tz": tz_name or "UTC",
+                "tz": tz,
             },
         )
-        rows = result.fetchall()
+        metar_rows = metar_result.fetchall()
     except Exception as exc:
-        logger.warning("Bias query failed for %s city_id=%s: %s", icao, city_id, exc)
+        logger.warning("METAR bias query failed for %s city_id=%s: %s", icao, city_id, exc)
         return _default_bias("query error")
 
-    # Per-date NWP predictions (for the overall bias) and per-source error lists.
-    nwp_by_date: dict = {}          # fc_date → (actual, [predicted...])
-    per_source_errs: dict = {}      # source → [actual - predicted, ...]
-    for r in rows:
+    # ------------------------------------------------------------------ #
+    # 2. WU-anchored bias query (primary path for Polymarket resolution)  #
+    # ------------------------------------------------------------------ #
+    wu_bias_f: Optional[float] = None
+    wu_samples: int = 0
+    wu_notes: str = ""
+
+    try:
+        wu_result = await db.execute(
+            text("""
+                SELECT
+                    wu.fc_date,
+                    wu.wu_max_f,
+                    f.source,
+                    AVG(f.predicted_high_f) AS predicted_f
+                FROM (
+                    SELECT
+                        forecast_for_date AS fc_date,
+                        MAX(predicted_high_f) AS wu_max_f
+                    FROM forecasts
+                    WHERE city_id = :city_id
+                      AND source = 'wunderground'
+                      AND forecast_for_date >= :start
+                      AND forecast_for_date < :end_excl
+                      AND predicted_high_f IS NOT NULL
+                    GROUP BY forecast_for_date
+                    HAVING COUNT(*) >= 1
+                ) wu
+                JOIN forecasts f
+                  ON f.city_id           = :city_id
+                 AND f.forecast_for_date = wu.fc_date
+                 AND f.source            = ANY(:nwp_sources)
+                 AND DATE(f.retrieved_at AT TIME ZONE :tz) =
+                         (wu.fc_date - INTERVAL '1 day')::date
+                WHERE f.predicted_high_f IS NOT NULL
+                GROUP BY wu.fc_date, wu.wu_max_f, f.source
+            """),
+            {
+                "city_id": city_id,
+                "start": start,
+                "end_excl": end + timedelta(days=1),
+                "nwp_sources": list(_NWP_SOURCES),
+                "tz": tz,
+            },
+        )
+        wu_rows = wu_result.fetchall()
+
+        # Group by fc_date: compute mean(wu_max - mean(nwp_predictions))
+        wu_by_date: dict = {}  # fc_date → (wu_max, [nwp_predicted, ...])
+        for r in wu_rows:
+            if r.wu_max_f is None or r.predicted_f is None:
+                continue
+            entry = wu_by_date.setdefault(r.fc_date, (float(r.wu_max_f), []))
+            entry[1].append(float(r.predicted_f))
+
+        wu_samples_list = [
+            wu_max - (sum(preds) / len(preds))
+            for wu_max, preds in wu_by_date.values()
+            if preds
+        ]
+        wu_samples = len(wu_samples_list)
+
+        if wu_samples >= MIN_SAMPLES:
+            candidate = mean(wu_samples_list)
+            if abs(candidate) > MAX_BIAS_ABS_F:
+                logger.warning(
+                    "WU bias outlier for %s: %.2f°F > %.1f°F cap — ignoring WU path",
+                    icao, candidate, MAX_BIAS_ABS_F,
+                )
+                wu_notes = f"WU outlier {candidate:.2f}°F capped"
+            else:
+                wu_bias_f = candidate
+                wu_stddev = pstdev(wu_samples_list)
+                wu_notes = (
+                    f"WU-anchored {window_days}d rolling, "
+                    f"{wu_samples} samples, σ={wu_stddev:.2f}°F"
+                )
+
+    except Exception as exc:
+        logger.warning("WU bias query failed for %s city_id=%s: %s", icao, city_id, exc)
+        # Non-fatal — fall through to METAR path
+
+    # ------------------------------------------------------------------ #
+    # 3. Per-source biases (METAR-based; fine for relative comparison)    #
+    # ------------------------------------------------------------------ #
+    nwp_by_date: dict = {}       # fc_date → (actual_metar, [predicted...])
+    per_source_errs: dict = {}   # source → [actual - predicted, ...]
+    for r in metar_rows:
         if r.actual_max_f is None or r.predicted_f is None:
             continue
         actual = float(r.actual_max_f)
@@ -124,14 +225,12 @@ async def get_station_bias(
             entry = nwp_by_date.setdefault(r.fc_date, (actual, []))
             entry[1].append(predicted)
 
-    samples = [
+    metar_samples_list = [
         actual - (sum(preds) / len(preds))
         for actual, preds in nwp_by_date.values()
         if preds
     ]
 
-    # Per-source biases — kept independently of whether the overall bias has
-    # enough data, but each source needs its own MIN_SAMPLES and sanity cap.
     per_source: dict = {}
     for source, errs in per_source_errs.items():
         if len(errs) < MIN_SAMPLES:
@@ -145,27 +244,48 @@ async def get_station_bias(
             continue
         per_source[source] = round(b, 2)
 
-    if len(samples) < MIN_SAMPLES:
-        out = _default_bias(f"only {len(samples)} day(s) of data (need {MIN_SAMPLES})")
-        out["per_source"] = per_source
-        return out
+    # ------------------------------------------------------------------ #
+    # 4. Pick primary bias: WU path if sufficient, else METAR fallback    #
+    # ------------------------------------------------------------------ #
+    if wu_bias_f is not None:
+        # WU-anchored — preferred because Polymarket resolves on WU
+        return {
+            "bias_f": round(wu_bias_f, 2),
+            "per_source": per_source,
+            "samples": wu_samples,
+            "notes": wu_notes,
+            "is_default": False,
+        }
 
-    bias = mean(samples)
-
-    if abs(bias) > MAX_BIAS_ABS_F:
-        logger.warning(
-            "Bias outlier for %s: %.2f°F > %.1f°F cap — using default", icao, bias, MAX_BIAS_ABS_F
+    # METAR fallback
+    if len(metar_samples_list) < MIN_SAMPLES:
+        out = _default_bias(
+            f"only {len(metar_samples_list)} day(s) of data (need {MIN_SAMPLES})"
         )
-        out = _default_bias(f"outlier {bias:.2f}°F capped")
         out["per_source"] = per_source
         return out
 
-    stddev = pstdev(samples)
+    metar_bias = mean(metar_samples_list)
+
+    if abs(metar_bias) > MAX_BIAS_ABS_F:
+        logger.warning(
+            "Bias outlier for %s: %.2f°F > %.1f°F cap — using default",
+            icao, metar_bias, MAX_BIAS_ABS_F,
+        )
+        out = _default_bias(f"outlier {metar_bias:.2f}°F capped")
+        out["per_source"] = per_source
+        return out
+
+    metar_stddev = pstdev(metar_samples_list)
     return {
-        "bias_f": round(bias, 2),
+        "bias_f": round(metar_bias, 2),
         "per_source": per_source,
-        "samples": len(samples),
-        "notes": f"{window_days}d rolling, {len(samples)} samples, σ={stddev:.2f}°F",
+        "samples": len(metar_samples_list),
+        "notes": (
+            f"METAR-based {window_days}d rolling, "
+            f"{len(metar_samples_list)} samples, σ={metar_stddev:.2f}°F"
+            + (f" (WU insufficient: {wu_samples} samples)" if wu_samples > 0 else "")
+        ),
         "is_default": False,
     }
 

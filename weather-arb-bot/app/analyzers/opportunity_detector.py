@@ -196,6 +196,23 @@ async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -
     return q.scalar_one_or_none() is not None
 
 
+async def _has_open_position(db: AsyncSession, outcome_id: int, side: str) -> bool:
+    """True if an OPEN virtual position already exists for this (outcome, side).
+
+    Prevents double-position entries when the bot runs across midnight: the
+    position opened on day T is still open on day T+1, and without this check
+    a second buy would be created — both then settle and the loss doubles.
+    """
+    q = await db.execute(
+        select(Opportunity.id).where(
+            Opportunity.outcome_id == outcome_id,
+            Opportunity.side == side,
+            Opportunity.virtual_status == "open",
+        ).limit(1)
+    )
+    return q.scalar_one_or_none() is not None
+
+
 async def _market_alert_cooldown_active(
     db: AsyncSession, market_id: int, minutes: int
 ) -> bool:
@@ -368,6 +385,7 @@ async def _evaluate_opportunity(
     book: Optional[dict],
     days_ahead: int,
     calibration_table: dict,
+    is_near_money: bool = False,
 ) -> tuple[Optional[Opportunity], Optional[dict]]:
     """Decide whether to create an Opportunity.
 
@@ -419,21 +437,25 @@ async def _evaluate_opportunity(
         )
         return None, None
 
-    # Calibrated confidence: stored for display only; threshold decisions use
-    # raw certainty to preserve virtual-buy tracking at 90–92%.
+    # Calibrated confidence: blends raw model certainty with empirical win rate
+    # for the same confidence band (2pp wide, rolling 120-day history).
+    # Used both for display AND to gate virtual buys — a 95% raw signal that
+    # historically wins only 70% of the time should not trigger an automatic buy.
     calibrated_certainty = calibrate(certainty, calibration_table)
 
     is_blacklisted = bool(getattr(city, "blacklisted", False))
     is_suspended = _city_is_suspended(city)
 
-    # Virtual buy is suppressed during suspension or blacklist.
-    create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted and not is_suspended
+    # Virtual buy is suppressed during suspension, blacklist, or when calibrated
+    # confidence is below the buy threshold (even if raw certainty clears it).
+    create_virtual_buy = (calibrated_certainty >= buy_thresh) and not is_blacklisted and not is_suspended
 
-    # Dedup: if a same-day opportunity for this outcome+side already exists,
-    # skip creating a new record — but emit a side alert when the signal is
-    # high-confidence. First occurrence today sends; later cycles re-send only
-    # on a material change (confidence >= 3pp or entry price >= 5¢ movement).
-    if await _has_opportunity_today(db, outcome.id, side):
+    # Dedup: skip new records when an OPEN position already exists for this
+    # (outcome, side) — regardless of when it was opened. This prevents double
+    # entries across midnight (Seoul/Tokyo incident: same bucket opened on day T
+    # and day T+1, both settling as losses). Also block same-day duplicates for
+    # alert-only signals (no virtual buy).
+    if await _has_open_position(db, outcome.id, side) or await _has_opportunity_today(db, outcome.id, side):
         logger.debug(f"Dedup: already have opportunity for outcome={outcome.id} today")
         if certainty >= buy_thresh:
             _reset_side_dedup_if_new_day()
@@ -472,6 +494,12 @@ async def _evaluate_opportunity(
     signals["_why_now"] = why_now
     signals["_calibrated_confidence"] = int(round(calibrated_certainty * 100))
     signals["_shares_per_buy"] = SHARES_PER_BUY
+    signals["_is_near_money"] = bool(is_near_money)
+    # True when calibration pulled the confidence below the buy threshold,
+    # meaning the raw model was more confident than the empirical win rate.
+    signals["_calibration_gated"] = bool(
+        certainty >= buy_thresh and calibrated_certainty < buy_thresh
+    )
 
     opp = Opportunity(
         outcome_id=outcome.id,
@@ -592,11 +620,49 @@ async def detect_opportunities(
         for d in outcome_data:
             d["breakdown"]["normalized_final"] = round(float(d["normalized_prob"]), 4)
 
+        # Phase 2.5: identify the "near-money" (modal) bucket — the bucket that
+        # contains the blended forecast high. This bucket has the worst
+        # risk/reward profile: a 1-2°F model error in either direction causes a
+        # loss. It fires frequently and is the primary source of our NO losses on
+        # adjacent-to-modal buckets. Flag it so the alert shows a clear warning.
+        near_money_outcome_id: Optional[int] = None
+        try:
+            from app.analyzers.probability_estimator import _bucket_contains
+            # Use the first outcome's breakdown to read the blended det_avg — all
+            # outcomes share the same market/forecast signals, so det_avg is the
+            # same across them.
+            modal_f: Optional[float] = None
+            for d in outcome_data:
+                modal_f = d["breakdown"].get("det_avg")
+                if modal_f is not None:
+                    break
+            if modal_f is None:
+                # Fallback: outcome with the highest normalized probability
+                best_d = max(outcome_data, key=lambda x: x["normalized_prob"])
+                near_money_outcome_id = best_d["outcome"].id
+            else:
+                # Find the outcome whose bucket contains the blended forecast high
+                for d in outcome_data:
+                    o = d["outcome"]
+                    bu = d["bucket_unit"]
+                    if _bucket_contains(float(modal_f), o.bucket_min, o.bucket_max, bu):
+                        near_money_outcome_id = o.id
+                        break
+                if near_money_outcome_id is None:
+                    # No bucket contains modal_f (rare — forecast outside all buckets);
+                    # fall back to the bucket with the highest normalized probability.
+                    best_d = max(outcome_data, key=lambda x: x["normalized_prob"])
+                    near_money_outcome_id = best_d["outcome"].id
+        except Exception as _nm_exc:
+            logger.debug(f"Near-money detection failed: {_nm_exc}")
+
         # Phase 3: evaluate ALL qualifying outcomes for this market.
         # Multiple buckets can fire simultaneously — alerting only the
         # best edge would miss profitable adjacent positions.
         new_opps_this_market: List[Opportunity] = []
         for d in outcome_data:
+            _is_nm = (near_money_outcome_id is not None and
+                      d["outcome"].id == near_money_outcome_id)
             try:
                 opp, sa = await _evaluate_opportunity(
                     db=db,
@@ -609,6 +675,7 @@ async def detect_opportunities(
                     book=d["book"],
                     days_ahead=days_ahead,
                     calibration_table=calibration_table,
+                    is_near_money=_is_nm,
                 )
                 if opp is not None:
                     new_opps_this_market.append(opp)

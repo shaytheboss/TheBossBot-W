@@ -187,13 +187,20 @@ class SignalAggregator:
         }
 
     async def _today_max_temp(self, db, icao, tz_name: Optional[str] = None) -> Optional[float]:
-        """Running maximum of today's METAR observations.
+        """Running maximum of today's METAR observations with spike rejection.
 
         "Today" is the CITY'S LOCAL day (City.timezone) — a UTC day window
         includes the previous local evening for US cities, contaminating the
         running max with yesterday's late-afternoon warmth.
+
+        A single erroneous METAR reading can spike the max by 10°F and lock a
+        bucket incorrectly (Hong Kong incident: bad 32°C reading vs actual 29.3°C).
+        Fetching all temperatures lets us discard the top value when it exceeds the
+        2nd-highest by more than METAR_SPIKE_THRESHOLD_F — genuine intraday jumps
+        of that magnitude are extremely rare.
         """
         import pytz
+        METAR_SPIKE_THRESHOLD_F = 5.0
         try:
             tz = pytz.timezone(tz_name) if tz_name else pytz.utc
         except Exception:
@@ -204,13 +211,26 @@ class SignalAggregator:
         )
         day_start_utc = day_start_local.astimezone(timezone.utc)
         result = await db.execute(
-            select(sqlfunc.max(MetarObservation.temperature_f)).where(
+            select(MetarObservation.temperature_f).where(
                 MetarObservation.icao == icao,
                 MetarObservation.observed_at >= day_start_utc,
+                MetarObservation.temperature_f.isnot(None),
             )
         )
-        val = result.scalar_one_or_none()
-        return float(val) if val is not None else None
+        temps = sorted(
+            [float(row[0]) for row in result.fetchall()],
+            reverse=True,
+        )
+        if not temps:
+            return None
+        if len(temps) >= 2 and temps[0] - temps[1] > METAR_SPIKE_THRESHOLD_F:
+            logger.warning(
+                "METAR spike rejected for %s: top reading %.1f°F is %.1f°F above "
+                "2nd-highest %.1f°F — using %.1f°F as today's max",
+                icao, temps[0], temps[0] - temps[1], temps[1], temps[1],
+            )
+            return temps[1]
+        return temps[0]
 
     async def _latest_forecast(self, db, city_id, source, forecast_date: Optional[date] = None):
         q = select(Forecast).where(Forecast.city_id == city_id, Forecast.source == source)

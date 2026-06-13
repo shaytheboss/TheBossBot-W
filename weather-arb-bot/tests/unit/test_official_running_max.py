@@ -57,6 +57,22 @@ def test_no_wu_data_falls_back_to_metar():
     assert suspect is False
 
 
+def test_metar_spike_above_wu_uses_wu():
+    """HK incident: METAR spiked to 89.6°F while WU showed 84.7°F (4.9°F gap > 4°F threshold)."""
+    mx, src, suspect = official_running_max(89.6, 84.7, 30.0)
+    assert mx == 84.7
+    assert src == "wunderground_spike_guard"
+    assert suspect is True
+
+
+def test_metar_just_above_wu_within_threshold_uses_metar():
+    """1°F gap (< 4°F threshold) — normal, METAR wins."""
+    mx, src, suspect = official_running_max(75.0, 74.0, 30.0)
+    assert mx == 75.0
+    assert src == "metar"
+    assert suspect is False
+
+
 def test_no_metar_returns_none():
     mx, src, _ = official_running_max(None, 74.0, 10.0)
     assert mx is None
