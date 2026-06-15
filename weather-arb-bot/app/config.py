@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     intraday_max_edge: float = 0.40
     intraday_max_book_spread: float = 0.10
     intraday_shares_per_buy: int = 5
+    # Maximum entry price for a virtual intraday buy (¢). Entry >88¢ means
+    # we're risking $4.40 to win ~40¢ — even at 99% win rate the EV is only
+    # 3¢ but one lock-failure loss destroys 10 wins. Alerts still fire.
+    intraday_max_entry_cost: float = 0.88
 
     # מאגר דיוק-המודלים הפר-עירוני (model_skill): מרווח העדכון התקופתי
     # בשניות. בנוסף לכך העדכון רץ מיד אחרי כל settlement של פולימרקט.

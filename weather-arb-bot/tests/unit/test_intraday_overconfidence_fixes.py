@@ -51,7 +51,9 @@ def test_sigma_combines_schedule_and_forecast_error_in_quadrature():
     w = bd["gain_weight"]
     expected_fc_term = w * DEFAULT_PARAMS.same_day_forecast_sigma
     assert bd["sigma_forecast_term"] == pytest.approx(expected_fc_term, abs=1e-3)
-    expected_sigma = (bd["sigma_schedule"] ** 2 + expected_fc_term ** 2) ** 0.5
+    quadrature_sigma = (bd["sigma_schedule"] ** 2 + expected_fc_term ** 2) ** 0.5
+    # Celsius market: σ is additionally floored at celsius_min_sigma_f (1.8°F).
+    expected_sigma = max(quadrature_sigma, DEFAULT_PARAMS.celsius_min_sigma_f)
     assert bd["sigma_used"] == pytest.approx(expected_sigma, abs=1e-2)
     # הסיגמה האפקטיבית גדולה מלוח-הזמנים לבדו — זה כל הרעיון
     assert bd["sigma_used"] > bd["sigma_schedule"]

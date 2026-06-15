@@ -68,6 +68,42 @@ _last_alerted: dict[tuple, tuple] = {}
 WU_MAX_STALE_MINUTES = 90.0       # ignore WU readings older than this
 WU_MAX_DISCREPANCY_F = 4.0        # WU way above METAR ⇒ probably scraped a forecast row
 
+# ── Intraday cluster early-warning ──────────────────────────────────────────
+# When a city in a geographic cluster is already running above its NWP forecast,
+# that's evidence of a regional regime (heat wave, marine layer dissipation)
+# that the NWP hasn't captured. Sister cities in the same cluster get a bias
+# boost so they don't fire overconfident NO bets on buckets that are now reachable.
+#
+# Cluster membership: keep to cities that share the same synoptic regime.
+# Only the intraday engine uses this (daily bias is handled by EWMA in
+# bias_estimator). The surprise is discounted (0.4×) and capped at 2°F to
+# avoid overcorrecting on a single noisy observation.
+_INTRADAY_CLUSTERS: dict[str, frozenset] = {
+    "europe": frozenset({
+        "Paris", "London", "Munich", "Madrid", "Amsterdam",
+        "Berlin", "Rome", "Vienna", "Brussels", "Lisbon",
+    }),
+    "east_asia": frozenset({
+        "Tokyo", "Seoul", "Hong Kong", "Taipei", "Shanghai",
+        "Beijing", "Chengdu", "Guangzhou",
+    }),
+    "us_south": frozenset({"Houston", "Dallas", "Austin", "Atlanta", "Miami"}),
+    "us_west":  frozenset({"San Francisco", "Seattle", "Los Angeles", "Portland"}),
+}
+CLUSTER_WARN_THRESHOLD_F = 2.0    # how much above NWP forecast triggers the signal
+CLUSTER_BOOST_FRACTION = 0.4      # fraction of excess to add as bias boost to sisters
+CLUSTER_BOOST_MAX_F = 2.0         # cap to avoid overcorrection
+
+# (cluster_name) → (date, excess_f, triggering_city)
+_cluster_warmth_today: dict[str, tuple] = {}
+
+
+def _city_cluster(city_name: str) -> Optional[str]:
+    for cluster, members in _INTRADAY_CLUSTERS.items():
+        if city_name in members:
+            return cluster
+    return None
+
 
 def official_running_max(
     metar_max_f: Optional[float],
@@ -379,6 +415,10 @@ async def _evaluate_intraday_outcome(
     running_max, max_source, wu_suspect = official_running_max(
         metar_max, wu_high, wu_age_min
     )
+    # A yes_impossible lock is trustworthy only when WU (the Polymarket
+    # resolution source) directly confirmed the running max. METAR can
+    # run 2-4°F above WU causing false locks (Seoul/HK/Dallas incidents).
+    wu_confirmed_for_lock = (max_source == "wunderground")
 
     current_temp = (signals.get("primary_metar") or {}).get("temperature_f")
     current_temp = float(current_temp) if current_temp is not None else None
@@ -400,6 +440,48 @@ async def _evaluate_intraday_outcome(
     spread_f = forecast_spread(signals)
     bucket_unit = resolve_bucket_unit(outcome)
 
+    # ── Fix 4: cluster early-warning bias boost ──────────────────────────────
+    # Register a warming surprise when this city is already running above its
+    # NWP forecast. Sister cities in the same cluster will receive a bias boost
+    # on subsequent evaluations within the same scan cycle.
+    cluster = _city_cluster(city.name)
+    if cluster and forecast_high is not None and running_max is not None:
+        excess = running_max - forecast_high
+        if excess > CLUSTER_WARN_THRESHOLD_F:
+            existing = _cluster_warmth_today.get(cluster)
+            today = date.today()
+            if existing is None or existing[0] < today or existing[1] < excess:
+                _cluster_warmth_today[cluster] = (today, excess, city.name)
+                logger.info(
+                    "Cluster warm-surprise: %s running %.1f°F > forecast %.1f°F "
+                    "(+%.1f°F) — flagging '%s' cluster",
+                    city.name, running_max, forecast_high, excess, cluster,
+                )
+
+    # Apply a bias boost from sister-city warming surprise (not self-triggered).
+    cluster_boost = 0.0
+    cluster_boost_note = ""
+    existing_warmth = _cluster_warmth_today.get(cluster) if cluster else None
+    if existing_warmth is not None:
+        warmth_date, warmth_excess, warmth_city = existing_warmth
+        if warmth_date == date.today() and warmth_city != city.name:
+            cluster_boost = min(warmth_excess * CLUSTER_BOOST_FRACTION, CLUSTER_BOOST_MAX_F)
+            cluster_boost_note = (
+                f"cluster {cluster!r}: {warmth_city} running +{warmth_excess:.1f}°F "
+                f"above forecast → bias +{cluster_boost:.1f}°F"
+            )
+            station_bias = signals.get("station_bias") or {}
+            existing_bias = float(station_bias.get("bias_f") or 1.5)
+            signals["station_bias"] = {
+                **station_bias,
+                "bias_f": round(existing_bias + cluster_boost, 2),
+                "notes": (
+                    (station_bias.get("notes") or "")
+                    + f"; ⚠️ {cluster_boost_note}"
+                ).lstrip("; "),
+            }
+            forecast_high = blended_forecast_high(signals)  # recompute with boosted bias
+
     prob, breakdown = estimate_intraday(
         running_max_f=running_max,
         current_temp_f=current_temp,
@@ -412,7 +494,11 @@ async def _evaluate_intraday_outcome(
         params=params,
         metar_max_f=metar_max,
         forecast_spread_f=spread_f,
+        wu_confirmed=wu_confirmed_for_lock,
     )
+    if cluster_boost > 0:
+        breakdown["cluster_boost_f"] = round(cluster_boost, 2)
+        breakdown["cluster_boost_note"] = cluster_boost_note
     breakdown["max_source"] = max_source
     breakdown["wu_high_f"] = float(wu_high) if wu_high is not None else None
     breakdown["wu_suspect"] = wu_suspect
@@ -456,7 +542,16 @@ async def _evaluate_intraday_outcome(
             }
         return None, None
 
-    create_buy = certainty >= buy_thresh and not bool(getattr(city, "blacklisted", False))
+    # Fix 3: entry-price cap. At 92¢ entry we risk $4.60 to win $0.40 — even a
+    # 99% win rate gives only 3¢ EV per trade, while a single yes_impossible
+    # lock-failure wipes out 11 wins. Alerts still fire; only buys are gated.
+    max_entry_cost = float(getattr(settings, "intraday_max_entry_cost", 0.88))
+    entry_too_expensive = entry_cost > max_entry_cost
+    create_buy = (
+        certainty >= buy_thresh
+        and not bool(getattr(city, "blacklisted", False))
+        and not entry_too_expensive
+    )
 
     # Per-source forecast highs (bias-corrected — the same values the blend
     # actually used) for the alert display table. WU intentionally excluded —
@@ -474,6 +569,7 @@ async def _evaluate_intraday_outcome(
         if key in _SRC_LABELS
     }
 
+    current_station_bias = signals.get("station_bias") or {}
     intraday_signals = {
         "_intraday": breakdown,
         "_book": book,
@@ -482,10 +578,13 @@ async def _evaluate_intraday_outcome(
         "_alert_threshold": alert_thresh,
         "_buy_threshold": buy_thresh,
         "_create_virtual_buy": bool(create_buy),
+        "_entry_too_expensive": bool(entry_too_expensive),
+        "_max_entry_cost": max_entry_cost,
+        "_wu_confirmed_for_lock": bool(wu_confirmed_for_lock),
         "_bucket_unit": bucket_unit,
         "_forecast_sources": forecast_sources,
-        "_forecast_bias_f": round(float(station_bias.get("bias_f") or 1.5), 2),
-        "_forecast_bias_is_default": bool(station_bias.get("is_default", True)),
+        "_forecast_bias_f": round(float(current_station_bias.get("bias_f") or 1.5), 2),
+        "_forecast_bias_is_default": bool(current_station_bias.get("is_default", True)),
     }
 
     opp = IntradayOpportunity(
