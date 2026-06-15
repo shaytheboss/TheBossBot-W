@@ -36,6 +36,13 @@ class IntradayParams:
         (0.0, 0.4),
     )
     post_peak_sigma: float = 0.3
+    # Celsius buckets are only 1°C = 1.8°F wide. WU rounds temperatures to
+    # the nearest °C, so a 0.5°C measurement difference between METAR and WU
+    # can flip the winning bucket. We keep σ ≥ this floor for all Celsius
+    # markets so that the model never manufactures >94% confidence on a YES bet
+    # that hinges on a single WU decimal. Applies to both YES and NO sides
+    # (a NO lock that only METAR confirmed is handled separately via wu_confirmed).
+    celsius_min_sigma_f: float = 1.8   # 1°C expressed in °F
     # "Peak passed" detection: current temp this far below the running max...
     cooling_drop_f: float = 1.5
     # ...for at least this long, and only after peak_start_hour.
@@ -143,6 +150,7 @@ def lock_state(
     running_max_f: float,
     f_lo: Optional[float],
     f_hi: Optional[float],
+    wu_confirmed: bool = True,
 ) -> Optional[str]:
     """Deterministic outcomes already decided by the monotonic running max.
 
@@ -150,9 +158,20 @@ def lock_state(
       this bucket cannot be the final answer (the max can only rise).
     - "yes_locked": open-ended ">=lo" bucket whose floor was already touched —
       it is guaranteed YES regardless of what happens next.
+
+    wu_confirmed: True when the running_max came from the Wunderground station
+    (the Polymarket resolution source). When False, we have only a METAR reading.
+    METAR and WU can diverge by 2-4°F, so a METAR-only lock is not trustworthy —
+    yes_impossible is suppressed in that case to prevent locking a bucket the WU
+    station has not yet confirmed.  yes_locked is unaffected (it only fires for
+    open-ended >= buckets where METAR above the floor is safe).
     """
     if f_hi is not None and running_max_f >= f_hi:
-        return "yes_impossible"
+        if wu_confirmed:
+            return "yes_impossible"
+        # METAR exceeded the ceiling but WU hasn't confirmed — treat as a
+        # high-confidence statistical signal, not a mathematical lock.
+        return "yes_impossible_unconfirmed"
     if f_hi is None and f_lo is not None and running_max_f >= f_lo:
         return "yes_locked"
     return None
@@ -181,6 +200,10 @@ def bucket_probability(
         return PROB_LO
     if state == "yes_locked":
         return PROB_HI
+    # "yes_impossible_unconfirmed" falls through to the statistical path —
+    # the running max is only from METAR (WU not yet available/fresh), so we
+    # use a very tight sigma but do NOT declare a hard lock. The probability
+    # will be very low (near PROB_LO) but not pinned there.
 
     if f_hi is None:
         # ">= lo" not yet touched (lo > M): P(X >= lo)
@@ -207,6 +230,7 @@ def estimate_intraday(
     params: IntradayParams = DEFAULT_PARAMS,
     metar_max_f: Optional[float] = None,
     forecast_spread_f: Optional[float] = None,
+    wu_confirmed: bool = True,
 ) -> Tuple[float, dict]:
     """Full intraday estimate for one bucket. Returns (probability, breakdown).
 
@@ -225,6 +249,11 @@ def estimate_intraday(
     )
     w = gain_weight(local_hour, params)
     sigma_schedule = intraday_sigma(local_hour, peak_passed, params)
+
+    # Pass wu_confirmed to lock_state so METAR-only readings don't trigger a
+    # hard mathematical lock (yes_impossible). The lock fires only when the
+    # Wunderground station — the Polymarket resolution source — confirms it.
+    state = lock_state(running_max_f, f_lo, f_hi, wu_confirmed=wu_confirmed)
 
     # ── הרכבת הסיגמה האפקטיבית (תיקון תקרית פריז) ────────────────────────
     # שני מקורות אי-ודאות בלתי-תלויים, ולכן מחוברים ריבועית (quadrature):
@@ -247,14 +276,23 @@ def estimate_intraday(
         # אחרי שהשיא עבר המקסימום כבר נקבע במציאות — אין תלות בתחזית.
         sigma = sigma_schedule
 
+    # Celsius bucket precision floor: WU rounds to the nearest °C (1.8°F), so
+    # a 0.5°C METAR-vs-WU measurement difference can flip the winning bucket.
+    # σ < 1.8°F implies false precision — the model cannot distinguish
+    # adjacent Celsius buckets reliably. Floor applies after peak too.
+    celsius_floor_applied = False
+    if bucket_unit == "C" and sigma < params.celsius_min_sigma_f:
+        sigma = params.celsius_min_sigma_f
+        celsius_floor_applied = True
+
     mu = expected_final_max(running_max_f, forecast_high_f, local_hour, params)
     p = bucket_probability(running_max_f, mu, sigma, f_lo, f_hi)
-    state = lock_state(running_max_f, f_lo, f_hi)
+    # state was already computed above (with wu_confirmed). Do NOT recompute here.
 
     # ── תקרת YES לפני חלון השיא ──────────────────────────────────────────
     # לפני שחלון השיא הקלימטולוגי נפתח, דלי לא-נעול עדיין יכול לאבד את
     # ה-YES שלו לחימום נוסף — לא משנה כמה הסיגמה צרה. נעילות פטורות
-    # (הן מתמטיות, לא סטטיסטיות).
+    # (הן מתמטיות, לא סטטיסטיות). unconfirmed locks treated like no lock here.
     pre_peak_cap_applied = False
     if (
         state is None
@@ -268,8 +306,10 @@ def estimate_intraday(
     # אומדן שאינו נעילה ואינו אחרי-שיא הוא ניחוש סטטיסטי שתלוי בתחזית —
     # לעולם לא מורשה לטעון ביטחון קיצוני. 98% על משהו תוך-יומי שעוד
     # תלוי ב-5 שעות חימום עתידי הוא חוסר ענווה, לא מודל.
+    # Unconfirmed locks (METAR-only) are also capped by the stat ceiling.
     stat_cap_applied = False
-    if state is None and not peak_passed:
+    _is_hard_lock = state in ("yes_impossible", "yes_locked")
+    if not _is_hard_lock and not peak_passed:
         if p > params.stat_prob_hi:
             p = params.stat_prob_hi
             stat_cap_applied = True
@@ -295,6 +335,8 @@ def estimate_intraday(
         ),
         "pre_peak_cap_applied": pre_peak_cap_applied,
         "stat_cap_applied": stat_cap_applied,
+        "celsius_floor_applied": celsius_floor_applied,
+        "wu_confirmed": wu_confirmed,
         "peak_passed": peak_passed,
         "lock_state": state,
         "f_lo": f_lo,

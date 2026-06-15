@@ -628,12 +628,14 @@ async def detect_opportunities(
         near_money_outcome_id: Optional[int] = None
         try:
             from app.analyzers.probability_estimator import _bucket_contains
-            # Use the first outcome's breakdown to read the blended det_avg — all
-            # outcomes share the same market/forecast signals, so det_avg is the
-            # same across them.
+            # Read the blended forecast HIGH (°F) — the temperature the models
+            # expect. NOTE: this must be forecast_high_f, NOT det_avg; det_avg is
+            # a PROBABILITY (0-1) and would never fall inside a temperature bucket,
+            # silently disabling the temperature path. All outcomes share the same
+            # market/forecast signals, so the value is identical across them.
             modal_f: Optional[float] = None
             for d in outcome_data:
-                modal_f = d["breakdown"].get("det_avg")
+                modal_f = d["breakdown"].get("forecast_high_f")
                 if modal_f is not None:
                     break
             if modal_f is None:
