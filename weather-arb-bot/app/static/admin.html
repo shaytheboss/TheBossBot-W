@@ -136,12 +136,15 @@
       <h3 style="margin-top:24px;">Performance by confidence band</h3>
       <p class="small">Each row = positions whose confidence score falls <strong>within that band only</strong> (not cumulative). Empty bands are hidden. Uses the <strong>same filters as the cards above</strong> (date, city, and Min conf), so the band rows always add up to the panel totals. Shows where your positions sit and whether ROI improves in higher bands.</p>
       <div id="statsConfBreakdown"></div>
-      <h3 style="margin-top:24px;">Model accuracy</h3>
+      <h3 style="margin-top:24px;">Model accuracy <button class="btn small" onclick="exportCsv('statsModelsCityBody', 'model-accuracy-by-city')" title="Download the per-city best-model table as CSV (opens in Excel)">⬇ CSV</button></h3>
       <p class="small">Each weather model's point forecast scored against the bucket Polymarket settled, over resolved markets in the current filter. Helps spot which model performs best — and where (per-city), so models could later be weighted per city.</p>
       <div id="statsModels"></div>
-      <h3 style="margin-top:24px;">⚖️ Model skill DB (live prediction weights) <button class="btn small" onclick="refreshModelSkill(this)" title="Recompute the skill table now (also runs automatically after every settlement and hourly)">↻ Recompute</button></h3>
+      <h3 style="margin-top:24px;">⚖️ Model skill DB (live prediction weights) <button class="btn small" onclick="refreshModelSkill(this)" title="Recompute the skill table now (also runs automatically after every settlement and hourly)">↻ Recompute</button> <button class="btn small" onclick="downloadServerCsv('/model-skill/csv' + (document.getElementById('statsCity').value ? '?city_id=' + document.getElementById('statsCity').value : ''), 'model-skill', this)" title="Download the full per-city per-model skill table as CSV (respects the City filter; opens in Excel)">⬇ CSV</button></h3>
       <p class="small">The <strong>managed, continuously-updated</strong> per-city model accuracy database. Each row scores a model at a specific <strong>Days ahead</strong> lead time: 0 = same-day forecast, 1 = one day before, 2 = two days before. A 2-day-ahead alert uses 2-day-ahead weights — models are compared fairly at each lead time. The <strong>Weight</strong> column is what both the daily and the ⚡ intraday predictors actually use (1.0 = neutral; models below the sample minimum stay neutral until they earn a track record). Updates automatically after every settlement and hourly.</p>
       <div id="statsModelSkill"></div>
+      <h3 style="margin-top:24px;">🔍 Missing model coverage <button class="btn small" onclick="downloadServerCsv('/collector-miss/csv' + (document.getElementById('statsCity').value ? '?city_id=' + document.getElementById('statsCity').value : ''), 'collector-miss', this)" title="Download which weather sources returned no data per city/date (respects the City filter; opens in Excel)">⬇ CSV</button></h3>
+      <p class="small">Which weather models returned <strong>no data</strong> for which city/date — the gaps behind a weak per-city blend. Grouped by city + source with a miss count and the date range seen. Use it to spot systematic holes like "ECMWF never responds for Tokyo" or an unconfigured API key.</p>
+      <div id="statsCollectorMiss"></div>
       <h3 style="margin-top:24px;">Inventory</h3>
       <div class="grid" id="statsInv"></div>
     </section>
@@ -219,7 +222,7 @@
       <div id="intradayByConf"></div>
       <h3>By lock state</h3>
       <div id="intradayByLock"></div>
-      <h3>By city</h3>
+      <h3>By city <button class="btn small" onclick="exportCsv('intradayByCityBody', 'intraday-by-city')" title="Download the per-city win-rate / P&amp;L table as CSV (opens in Excel)">⬇ CSV</button></h3>
       <div id="intradayByCity"></div>
     </section>
 
@@ -748,6 +751,7 @@ async function loadStats() {
   _renderConfBreakdown(s.by_confidence_band || []);
   loadModelAccuracy();
   loadModelSkill();
+  loadCollectorMiss();
 }
 
 function _renderConfBreakdown(rows) {
@@ -821,7 +825,7 @@ async function loadModelAccuracy() {
   const byCity = j.by_city || [];
   if (byCity.length) {
     html += '<h4 style="margin-top:16px;">Best model per city</h4>';
-    html += '<table><thead><tr><th>City</th><th>Best model</th><th>Accuracy</th><th>Samples</th></tr></thead><tbody>';
+    html += '<table><thead><tr><th>City</th><th>Best model</th><th>Accuracy</th><th>Samples</th></tr></thead><tbody id="statsModelsCityBody">';
     html += byCity.map(c => {
       const b = c.best_model;
       return `<tr><td>${escapeHtml(c.city)}</td><td>${b ? escapeHtml(b.model) : '—'}</td>` +
@@ -831,6 +835,38 @@ async function loadModelAccuracy() {
   }
   box.innerHTML = html;
   makeTablesSortable('statsModels');
+}
+
+// --- Missing model coverage (collector_miss) ---------------------------------
+async function loadCollectorMiss() {
+  const box = document.getElementById('statsCollectorMiss');
+  if (!box) return;
+  const cityId = document.getElementById('statsCity').value;
+  const qs = cityId ? ('?city_id=' + cityId) : '';
+  // The CSV endpoint returns grouped rows; reuse it for the on-screen table too
+  // by requesting JSON of the same shape is overkill — instead show a hint and
+  // rely on the CSV button for the full export.
+  const r = await api('/collector-miss/csv' + qs);
+  if (!r.ok) { box.innerHTML = '<p class="small">Could not load missing-source coverage.</p>'; return; }
+  const text = await r.text();
+  const lines = text.replace(/^﻿/, '').trim().split(/\r?\n/);
+  if (lines.length <= 1) {
+    box.innerHTML = '<p class="small">No missing-source events recorded yet (every model has reported for every city/date in range).</p>';
+    return;
+  }
+  const cells = lines.map(l => {
+    // simple CSV split — fields here contain no embedded commas
+    return l.split(',');
+  });
+  const head = cells[0];
+  let html = '<table><thead><tr>' + head.map(h => `<th>${escapeHtml(h)}</th>`).join('') +
+    '</tr></thead><tbody id="statsCollectorMissBody">';
+  html += cells.slice(1).map(row =>
+    '<tr>' + row.map(c => `<td>${escapeHtml(c)}</td>`).join('') + '</tr>'
+  ).join('');
+  html += '</tbody></table>';
+  box.innerHTML = html;
+  makeTablesSortable('statsCollectorMiss');
 }
 
 // --- Model skill DB (the managed per-city accuracy store) --------------------
@@ -998,7 +1034,7 @@ function _lessonTable(title, mapObj) {
     </tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-function _intradayBreakdownTable(obj) {
+function _intradayBreakdownTable(obj, tbodyId) {
   const keys = Object.keys(obj || {});
   if (!keys.length) return '<p class="small">No data yet.</p>';
   const rows = keys.map(k => {
@@ -1009,9 +1045,10 @@ function _intradayBreakdownTable(obj) {
     return `<tr><td>${k}</td><td>${s.positions}</td><td>${s.settled}</td><td>${s.wins}</td>
       <td>${wr}</td><td>$${s.invested.toFixed(2)}</td><td>${pnl}</td><td>${roi}</td></tr>`;
   }).join('');
+  const tb = tbodyId ? ` id="${tbodyId}"` : '';
   return `<table><thead><tr><th></th><th>Pos</th><th>Settled</th><th>Wins</th>
     <th>Win rate</th><th>Invested</th><th>P&amp;L</th><th>ROI</th></tr></thead>
-    <tbody>${rows}</tbody></table>`;
+    <tbody${tb}>${rows}</tbody></table>`;
 }
 
 function resetIntradayFilter() {
@@ -1048,7 +1085,7 @@ async function loadIntraday() {
     document.getElementById('intradayByHour').innerHTML = _intradayBreakdownTable(s.by_hour);
     document.getElementById('intradayByConf').innerHTML = _intradayBreakdownTable(s.by_confidence);
     document.getElementById('intradayByLock').innerHTML = _intradayBreakdownTable(s.by_lock);
-    document.getElementById('intradayByCity').innerHTML = _intradayBreakdownTable(s.by_city);
+    document.getElementById('intradayByCity').innerHTML = _intradayBreakdownTable(s.by_city, 'intradayByCityBody');
     ['intradayByHour','intradayByConf','intradayByLock','intradayByCity'].forEach(makeTablesSortable);
   }
 }
@@ -1183,6 +1220,31 @@ async function loadLessons() {
     _lessonTable('By entry price', j.by_entry_price) +
     _lessonTable('By city', j.by_city);
   makeTablesSortable('lessonsTables');
+}
+
+// --- Server-side CSV download (full dataset, not just what's rendered) --------
+// Fetches the endpoint with the auth cookie and saves the streamed CSV. Use for
+// data that the server exports in full (model-skill, collector-miss) rather than
+// re-serializing the on-screen table.
+async function downloadServerCsv(path, filenameBase, btn) {
+  const orig = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const r = await api(path);
+    if (!r.ok) { alert('Download failed: ' + r.status); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `${filenameBase}-${stamp}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
 }
 
 // --- Generic CSV export of what's currently rendered in a table --------------
