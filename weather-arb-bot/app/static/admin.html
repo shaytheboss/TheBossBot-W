@@ -31,6 +31,8 @@
   .pill.win { background: rgba(63,185,80,0.15); color: var(--win); }
   .pill.loss { background: rgba(248,81,73,0.15); color: var(--loss); }
   .pill.open { background: rgba(74,158,255,0.15); color: var(--accent); }
+  .pill.alpha { background: rgba(74,158,255,0.15); color: var(--accent); }
+  .pill.beta  { background: rgba(162,106,255,0.15); color: #a26aff; }
   input, button.btn, select { background: var(--panel); border:1px solid var(--border); color: var(--fg);
          padding:6px 10px; border-radius:6px; font-size:14px; }
   input[type=number] { -moz-appearance: textfield; }
@@ -145,6 +147,9 @@
       <h3 style="margin-top:24px;">🔍 Missing model coverage <button class="btn small" onclick="downloadServerCsv('/collector-miss/csv' + (document.getElementById('statsCity').value ? '?city_id=' + document.getElementById('statsCity').value : ''), 'collector-miss', this)" title="Download which weather sources returned no data per city/date (respects the City filter; opens in Excel)">⬇ CSV</button></h3>
       <p class="small">Which weather models returned <strong>no data</strong> for which city/date — the gaps behind a weak per-city blend. Grouped by city + source with a miss count and the date range seen. Use it to spot systematic holes like "ECMWF never responds for Tokyo" or an unconfigured API key.</p>
       <div id="statsCollectorMiss"></div>
+      <h3 style="margin-top:24px;">🆚 Alpha vs Beta Comparison</h3>
+      <p class="small">Side-by-side performance of the <span class="pill alpha">α Alpha</span> (classic) and <span class="pill beta">β Beta</span> (calibrated) estimators under the current date/city filter. Win rate and ROI use closed positions only.</p>
+      <div id="statsEstimatorComparison"></div>
       <h3 style="margin-top:24px;">Inventory</h3>
       <div class="grid" id="statsInv"></div>
     </section>
@@ -173,6 +178,11 @@
           <option value="loss">LOSS</option>
           <option value="open">Open</option>
         </select>
+        <select id="posEstimator" onchange="applyPosClientFilter()" title="Filter by estimator">
+          <option value="">All estimators</option>
+          <option value="alpha">α Alpha</option>
+          <option value="beta">β Beta</option>
+        </select>
         <label class="row small" title="Minimum model confidence (0-100)">Min conf <input type="number" id="posMinConf" min="0" max="100" step="1" style="width:46px;" oninput="applyPosClientFilter()" /></label>
         <button class="btn primary" onclick="loadPositions()">Apply Filter</button>
         <button class="btn" onclick="resetPosFilter()">Reset</button>
@@ -198,6 +208,7 @@
           <th data-sort-key="payout" data-sort-type="num">Payout</th>
           <th data-sort-key="pnl" data-sort-type="num">P&amp;L</th>
           <th data-sort-key="status" data-sort-type="str">Status</th>
+          <th data-sort-key="estimator" data-sort-type="str">Est</th>
           <th>Models</th>
           <th>Link</th>
           <th>Details</th>
@@ -323,6 +334,11 @@
           <option value="YES">YES</option>
           <option value="NO">NO</option>
         </select>
+        <select id="oppEstimator" onchange="applyOppClientFilter()" title="Filter by estimator">
+          <option value="">All estimators</option>
+          <option value="alpha">α Alpha</option>
+          <option value="beta">β Beta</option>
+        </select>
         <label class="row small" title="Minimum model confidence (0-100)">Min conf <input type="number" id="oppMinConf" min="0" max="100" step="1" style="width:46px;" oninput="applyOppClientFilter()" /></label>
         <label class="row small" title="Minimum edge pp">Min edge <input type="number" id="oppMinEdge" min="0" max="100" step="1" style="width:46px;" oninput="applyOppClientFilter()" /></label>
         <button class="btn primary" onclick="loadOpps()">Apply Filter</button>
@@ -342,6 +358,7 @@
           <th data-sort-key="edge" data-sort-type="num">Edge</th>
           <th data-sort-key="confidence" data-sort-type="num">Conf</th>
           <th data-sort-key="alert_sent" data-sort-type="num">Alert</th>
+          <th data-sort-key="estimator" data-sort-type="str">Est</th>
           <th data-sort-key="outcome" data-sort-type="str">Outcome</th>
           <th>Models</th>
           <th>Link</th>
@@ -752,6 +769,7 @@ async function loadStats() {
   loadModelAccuracy();
   loadModelSkill();
   loadCollectorMiss();
+  _renderEstimatorComparison(s.by_estimator || []);
 }
 
 function _renderConfBreakdown(rows) {
@@ -803,6 +821,52 @@ function _renderConfBreakdown(rows) {
   html += '</tbody></table>';
   box.innerHTML = html;
   makeTablesSortable('statsConfBreakdown');
+}
+
+function _renderEstimatorComparison(byEst) {
+  const box = document.getElementById('statsEstimatorComparison');
+  if (!box) return;
+  if (!byEst || !byEst.length) {
+    box.innerHTML = '<p class="small">No data yet — beta opportunities appear once the beta estimator has run.</p>';
+    return;
+  }
+  const m = {};
+  for (const r of byEst) m[r.estimator] = r;
+  const a = m['alpha'] || {};
+  const b = m['beta']  || {};
+  const fmt = v => (v == null ? '—' : (v >= 0 ? '+$' + v.toFixed(2) : '-$' + Math.abs(v).toFixed(2)));
+  const fmtROI = (cost, pnl) => {
+    if (!cost || cost <= 0) return '—';
+    const roi = pnl / cost * 100;
+    const color = roi >= 0 ? 'var(--win)' : 'var(--loss)';
+    return `<span style="color:${color};font-weight:600">${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%</span>`;
+  };
+  const fmtWR = v => {
+    if (v == null) return '—';
+    const color = v >= 60 ? 'var(--win)' : (v >= 45 ? 'var(--warn)' : 'var(--loss)');
+    return `<span style="color:${color}">${v}%</span>`;
+  };
+  box.innerHTML = `<table style="max-width:520px">
+    <thead><tr>
+      <th>Metric</th>
+      <th><span class="pill alpha">α Alpha</span></th>
+      <th><span class="pill beta">β Beta</span></th>
+    </tr></thead>
+    <tbody>
+      <tr><td>Detected</td><td>${a.total ?? 0}</td><td>${b.total ?? 0}</td></tr>
+      <tr><td>Alerted</td><td>${a.alerted ?? 0}</td><td>${b.alerted ?? 0}</td></tr>
+      <tr><td>Wins (signals)</td><td>${a.wins ?? 0}</td><td>${b.wins ?? 0}</td></tr>
+      <tr><td>Losses (signals)</td><td>${a.losses ?? 0}</td><td>${b.losses ?? 0}</td></tr>
+      <tr><td>Signal win rate</td><td>${fmtWR(a.win_rate_pct)}</td><td>${fmtWR(b.win_rate_pct)}</td></tr>
+      <tr><td>Positions opened</td><td>${a.positions ?? 0}</td><td>${b.positions ?? 0}</td></tr>
+      <tr><td>Pos wins</td><td>${a.pos_wins ?? 0}</td><td>${b.pos_wins ?? 0}</td></tr>
+      <tr><td>Pos losses</td><td>${a.pos_losses ?? 0}</td><td>${b.pos_losses ?? 0}</td></tr>
+      <tr><td>Pos win rate</td><td>${fmtWR(a.pos_win_rate_pct)}</td><td>${fmtWR(b.pos_win_rate_pct)}</td></tr>
+      <tr><td>Invested (closed)</td><td>${a.cost != null ? '$' + a.cost.toFixed(2) : '—'}</td><td>${b.cost != null ? '$' + b.cost.toFixed(2) : '—'}</td></tr>
+      <tr><td>Net P&amp;L (closed)</td><td>${fmt(a.pnl)}</td><td>${fmt(b.pnl)}</td></tr>
+      <tr><td>ROI (closed)</td><td>${fmtROI(a.cost, a.pnl)}</td><td>${fmtROI(b.cost, b.pnl)}</td></tr>
+    </tbody>
+  </table>`;
 }
 
 async function loadModelAccuracy() {
@@ -932,6 +996,7 @@ function resetPosFilter() {
   document.getElementById('posTo').value = '';
   document.getElementById('posCity').value = '';
   document.getElementById('posSide').value = '';
+  document.getElementById('posEstimator').value = '';
   document.getElementById('posStatus').value = '';
   document.getElementById('posMinConf').value = '';
   document.getElementById('posDateField').value = 'detected';
@@ -957,6 +1022,7 @@ function _renderPositions(rows) {
       <td>${fmtMoney(o.payout)}</td>
       <td style="color:${(o.pnl||0) >= 0 ? 'var(--win)' : 'var(--loss)'}">${fmtMoney(o.pnl)}</td>
       <td>${escapeHtml(o.status || '')}</td>
+      <td><span class="pill ${o.estimator||'alpha'}">${o.estimator === 'beta' ? 'β' : 'α'}</span></td>
       <td>${_modelsCell(o)}</td>
       <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
       <td><button class="btn small" onclick="viewAlert(${o.id})">View</button></td>
@@ -1385,12 +1451,14 @@ async function _pollRetroFixStatus() {
 
 function applyPosClientFilter() {
   const side = document.getElementById('posSide').value;
+  const est  = document.getElementById('posEstimator').value;
   const minConf = parseFloat(document.getElementById('posMinConf').value) || 0;
   const posStatus = document.getElementById('posStatus').value;
-  _clientFilters['positionsBody'] = (side || minConf > 0 || posStatus) ? (o => {
+  _clientFilters['positionsBody'] = (side || est || minConf > 0 || posStatus) ? (o => {
     if (side && o.side !== side) return false;
     if (posStatus && (o.status || '') !== posStatus) return false;
-    if (minConf > 0 && (o.confidence || 0) < minConf) return false;
+    if (est  && (o.estimator || 'alpha') !== est) return false;
+    if (minConf > 0 && (o.confidence ?? 0) < minConf) return false;
     return true;
   }) : null;
   _rerenderTable('positionsBody');
@@ -1398,12 +1466,14 @@ function applyPosClientFilter() {
 
 function applyOppClientFilter() {
   const side = document.getElementById('oppSide').value;
+  const est  = document.getElementById('oppEstimator').value;
   const minConf = parseFloat(document.getElementById('oppMinConf').value) || 0;
   const minEdge = parseFloat(document.getElementById('oppMinEdge').value) || 0;
-  _clientFilters['oppsBody'] = (side || minConf > 0 || minEdge > 0) ? (o => {
+  _clientFilters['oppsBody'] = (side || est || minConf > 0 || minEdge > 0) ? (o => {
     if (side && o.side !== side) return false;
-    if (minConf > 0 && (o.confidence || 0) < minConf) return false;
-    if (minEdge > 0 && Math.abs((o.edge || 0) * 100) < minEdge) return false;
+    if (est  && (o.estimator || 'alpha') !== est) return false;
+    if (minConf > 0 && (o.confidence ?? 0) < minConf) return false;
+    if (minEdge > 0 && ((o.edge ?? 0) * 100) < minEdge) return false;
     return true;
   }) : null;
   _rerenderTable('oppsBody');
@@ -1448,6 +1518,7 @@ function _renderOpps(rows) {
       <td>${o.edge != null ? (o.edge*100).toFixed(0) + 'pp' : ''}</td>
       <td>${o.confidence ?? ''}</td>
       <td>${o.alert_sent ? '✓' : ''}</td>
+      <td><span class="pill ${o.estimator||'alpha'}">${o.estimator === 'beta' ? 'β' : 'α'}</span></td>
       <td>${pill(o.outcome)}</td>
       <td>${_modelsCell(o)}</td>
       <td>${o.market_url ? `<a href="${o.market_url}" target="_blank">Poly</a>` : ''}</td>
@@ -1461,6 +1532,7 @@ function resetOppFilter() {
   document.getElementById('oppTo').value = '';
   document.getElementById('oppCity').value = '';
   document.getElementById('oppSide').value = '';
+  document.getElementById('oppEstimator').value = '';
   document.getElementById('oppMinConf').value = '';
   document.getElementById('oppMinEdge').value = '';
   document.getElementById('oppDateField').value = 'detected';
