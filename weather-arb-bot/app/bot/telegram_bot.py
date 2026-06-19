@@ -106,6 +106,100 @@ async def send_opportunity_alert(opportunity, db) -> None:
     await db.commit()
 
 
+async def send_beta_opportunity_alert(opportunity, db) -> None:
+    """Send a Telegram alert for a beta-estimator opportunity.
+
+    Uses the same fmt_opportunity formatter as alpha but prepends a [β] tag
+    so the user can immediately see which model fired. Completely independent
+    from send_opportunity_alert — if beta alerting fails, alpha is unaffected.
+    """
+    if not settings.telegram_bot_token:
+        return
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser, Alert
+    from app.models.market import MarketOutcome, Market
+    from app.models.city import City
+
+    try:
+        outcome_result = await db.execute(
+            select(MarketOutcome).where(MarketOutcome.id == opportunity.outcome_id)
+        )
+        outcome = outcome_result.scalar_one_or_none()
+        if not outcome:
+            return
+        market_result = await db.execute(select(Market).where(Market.id == outcome.market_id))
+        market = market_result.scalar_one_or_none()
+        if not market:
+            return
+        city_result = await db.execute(select(City).where(City.id == market.city_id))
+        city = city_result.scalar_one_or_none()
+
+        market_url = (
+            f"https://polymarket.com/event/{market.external_id}" if market.external_id else None
+        )
+        signals = opportunity.signals or {}
+
+        base_text = fmt_opportunity(
+            city_name=city.name if city else "Unknown",
+            market_question=market.question,
+            bucket_label=outcome.bucket_label,
+            market_price=float(opportunity.market_price),
+            true_prob=float(opportunity.estimated_true_prob),
+            edge=float(opportunity.edge),
+            confidence=opportunity.confidence_score,
+            signals=signals,
+            side=opportunity.side or "YES",
+            event_date=market.event_date,
+            resolution_time=market.resolution_time,
+            market_url=market_url,
+            station_icao=city.primary_icao if city else None,
+            city_timezone=city.timezone if city else None,
+            prior_opportunity=None,
+        )
+
+        # Build beta-specific footer with blocked sources and variance-city note
+        blocked = signals.get("_beta_blocked_sources") or []
+        is_variance = signals.get("_beta_is_variance_city", False)
+        beta_notes: list[str] = []
+        if blocked:
+            blocked_labels = ", ".join(b["source"] for b in blocked)
+            beta_notes.append(f"🚫 Blocked (high bias): {blocked_labels}")
+        if is_variance:
+            beta_notes.append("📊 Variance city: sigma widened 1.2x (London archetype)")
+        beta_footer = ""
+        if beta_notes:
+            beta_footer = "\n\n" + "\n".join(beta_notes)
+
+        text = f"[β] *BETA ESTIMATOR*\n{base_text}{beta_footer}"
+
+        users_result = await db.execute(
+            select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score)
+        )
+        users = users_result.scalars().all()
+        bot = Bot(token=settings.telegram_bot_token)
+        for user in users:
+            if user.cities_watched and city and city.id not in user.cities_watched:
+                continue
+            try:
+                msg = await bot.send_message(chat_id=user.chat_id, text=text, parse_mode="Markdown")
+                alert = Alert(
+                    alert_type="OPPORTUNITY_DETECTED",
+                    city_id=city.id if city else None,
+                    market_id=market.id,
+                    opportunity_id=opportunity.id,
+                    priority="MEDIUM",
+                    message_text=text,
+                    telegram_message_id=msg.message_id,
+                )
+                db.add(alert)
+            except Exception as e:
+                logger.error(f"[beta] Failed to send alert to {user.chat_id}: {e}")
+        opportunity.alert_sent = True
+        await db.commit()
+    except Exception as e:
+        logger.error(f"[beta] send_beta_opportunity_alert failed: {e}", exc_info=True)
+
+
 def _fmt_open_position_alert(alert: dict) -> str:
     conf = int(round(alert["certainty"] * 100))
     cal_conf = int(round(alert["calibrated_certainty"] * 100))

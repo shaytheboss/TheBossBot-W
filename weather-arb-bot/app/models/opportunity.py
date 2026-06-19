@@ -33,5 +33,9 @@ class Opportunity(Base):
     # One of: "open", "win", "loss" (or NULL when no virtual buy was made).
     virtual_status = Column(String(16), nullable=True, default=None)
 
+    # Which estimator produced this row: "alpha" (classic) or "beta" (calibrated).
+    # NULL on legacy rows — treated as "alpha" in all display logic.
+    estimator = Column(String(8), nullable=True, default="alpha")
+
     outcome_ref = relationship("MarketOutcome", back_populates="opportunities")
     alerts = relationship("Alert", back_populates="opportunity")
