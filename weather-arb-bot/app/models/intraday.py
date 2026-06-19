@@ -44,4 +44,9 @@ class IntradayOpportunity(Base):
     virtual_pnl = Column(Float, nullable=True, default=None)
     virtual_status = Column(String(16), nullable=True, default=None)
 
+    # ── Basket strategy tag ──────────────────────────────────────────────────
+    # Non-null when this NO bet is part of a multi-bucket basket play. All legs
+    # of the same basket share the same basket_id. Format: "bkt_YYYYMMDD_HHMMSS_<market_id>".
+    basket_id = Column(String(40), nullable=True, default=None, index=True)
+
     outcome_ref = relationship("MarketOutcome")

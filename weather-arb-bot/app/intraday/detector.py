@@ -60,6 +60,12 @@ _realert_date: Optional[date] = None
 # (outcome_id, side) -> (certainty, sent_at_utc)
 _last_alerted: dict[tuple, tuple] = {}
 
+# ── Basket strategy ───────────────────────────────────────────────────────────
+# A basket is profitable when buying NO across N buckets of the same market
+# returns net EV > 0. Exactly one YES can win, so at least N-1 NOs pay out.
+# Net EV per share = (N-1)/N - avg_entry_cost. Minimum 3 legs required.
+BASKET_MIN_BUCKETS = 3
+
 
 # Wunderground observed-max floor: WU's history page for today shows the
 # OFFICIAL daily high so far — the number Polymarket actually resolves on.
@@ -300,15 +306,84 @@ def _realert_due(
     return True, f"certainty {arrow}{abs(round(delta * 100))}pp"
 
 
-async def detect_intraday(db: AsyncSession) -> tuple[List[IntradayOpportunity], List[dict]]:
-    """Scan same-day markets. Returns (new_opportunities, realert_dicts).
+async def _evaluate_basket(
+    db: AsyncSession,
+    market: Market,
+    city: City,
+    market_opps: List[tuple],
+) -> Optional[dict]:
+    """Check if the new NO buys for this market form a net-positive basket.
+
+    A basket is profitable when buying NO across N buckets yields net EV > 0:
+      net EV/share = (N-1)/N - avg_entry_cost > 0
+
+    Only open virtual buys (side=NO) created this scan cycle count. Returns a
+    basket summary dict if conditions are met and basket_id was committed to DB,
+    None otherwise.
+    """
+    no_buys = [
+        (opp, label) for opp, label in market_opps
+        if opp.side == "NO" and opp.virtual_status == "open"
+    ]
+    n = len(no_buys)
+    if n < BASKET_MIN_BUCKETS:
+        return None
+
+    avg_entry = sum(o.virtual_entry_price for o, _ in no_buys) / n
+    ev_per_share = (n - 1) / n - avg_entry
+    if ev_per_share <= 0:
+        return None
+
+    basket_id = (
+        f"bkt_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{market.id}"
+    )
+    shares_per_leg = no_buys[0][0].virtual_shares or 0
+    total_cost = sum(o.virtual_cost or 0 for o, _ in no_buys)
+    expected_payout = (n - 1) * shares_per_leg * 1.0  # N-1 legs win
+    net_pnl = expected_payout - total_cost
+
+    for opp, _ in no_buys:
+        opp.basket_id = basket_id
+    await db.commit()
+
+    logger.info(
+        "Basket detected for %s market %s: %d NO legs, avg entry %.3f, "
+        "net EV/share %.3f, basket_id=%s",
+        city.name, market.id, n, avg_entry, ev_per_share, basket_id,
+    )
+
+    return {
+        "city_name": city.name,
+        "market_id": market.id,
+        "market_external_id": market.external_id,
+        "basket_id": basket_id,
+        "n_legs": n,
+        "buckets": [label for _, label in no_buys],
+        "avg_entry_cost": round(avg_entry, 4),
+        "total_cost": round(total_cost, 2),
+        "shares_per_leg": shares_per_leg,
+        "expected_payout": round(expected_payout, 2),
+        "net_pnl_if_one_wins": round(net_pnl, 2),
+        "ev_per_share": round(ev_per_share, 4),
+        "legs": [
+            {"outcome_id": o.outcome_id, "bucket": label, "entry": o.virtual_entry_price}
+            for o, label in no_buys
+        ],
+    }
+
+
+async def detect_intraday(
+    db: AsyncSession,
+) -> tuple[List[IntradayOpportunity], List[dict], List[dict]]:
+    """Scan same-day markets. Returns (new_opportunities, realert_dicts, basket_summaries).
 
     New opportunities get a full ⚡ alert and a DB record; realerts are
     lightweight updates on already-recorded signals (no new record, so the
-    stats stay one-row-per-position).
+    stats stay one-row-per-position). Basket summaries describe multi-bucket
+    NO plays where net EV > 0 — they trigger a separate basket alert.
     """
     if not bool(getattr(settings, "intraday_enabled", True)):
-        return [], []
+        return [], [], []
 
     params = _params_from_settings()
     _reset_realert_if_new_day()
@@ -323,6 +398,7 @@ async def detect_intraday(db: AsyncSession) -> tuple[List[IntradayOpportunity], 
     now_utc = datetime.now(timezone.utc)
     found: List[IntradayOpportunity] = []
     realerts: List[dict] = []
+    baskets: List[dict] = []
 
     # Same-day is the CITY's local day; the UTC window [-1, +1] covers all zones.
     result = await db.execute(
@@ -365,6 +441,8 @@ async def detect_intraday(db: AsyncSession) -> tuple[List[IntradayOpportunity], 
             db, city.primary_icao, tz, now_utc
         )
 
+        # Collect (opp, bucket_label) pairs for basket detection after this market.
+        market_opps: List[tuple] = []
         for outcome in outcomes:
             try:
                 opp, realert = await _evaluate_intraday_outcome(
@@ -376,6 +454,7 @@ async def detect_intraday(db: AsyncSession) -> tuple[List[IntradayOpportunity], 
                 )
                 if opp is not None:
                     found.append(opp)
+                    market_opps.append((opp, outcome.bucket_label))
                 if realert is not None:
                     realerts.append(realert)
             except Exception as e:
@@ -384,7 +463,15 @@ async def detect_intraday(db: AsyncSession) -> tuple[List[IntradayOpportunity], 
                     exc_info=True,
                 )
 
-    return found, realerts
+        # Basket strategy: check if new NO buys in this market form a net-positive basket.
+        try:
+            basket = await _evaluate_basket(db, market, city, market_opps)
+            if basket is not None:
+                baskets.append(basket)
+        except Exception as e:
+            logger.error(f"Basket evaluation failed for market {market.id}: {e}", exc_info=True)
+
+    return found, realerts, baskets
 
 
 async def _evaluate_intraday_outcome(

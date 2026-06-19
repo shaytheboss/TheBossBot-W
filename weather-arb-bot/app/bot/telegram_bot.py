@@ -634,3 +634,57 @@ async def send_intraday_realert(ra: dict, db) -> None:
             await bot.send_message(chat_id=user.chat_id, text=text, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Failed to send intraday realert to {user.chat_id}: {e}")
+
+
+def _fmt_basket_alert(basket: dict) -> str:
+    """Format a multi-bucket NO basket alert.
+
+    Warsaw 16/6 archetype: bought NO on 4 buckets, 3 won, net +$2.05.
+    The strategy is net-positive because exactly one bucket wins YES and all
+    others pay out. Net EV/share = (N-1)/N - avg_entry_cost.
+    """
+    n = basket["n_legs"]
+    total = basket["total_cost"]
+    payout = basket["expected_payout"]
+    net = basket["net_pnl_if_one_wins"]
+    ev = basket["ev_per_share"]
+    avg_entry_c = int(round(basket["avg_entry_cost"] * 100))
+    bucket_lines = "\n".join(
+        f"  • NO _{leg['bucket']}_ @ {int(round(leg['entry'] * 100))}¢"
+        for leg in basket["legs"]
+    )
+    market_url = (
+        f"\nhttps://polymarket.com/event/{basket['market_external_id']}"
+        if basket.get("market_external_id") else ""
+    )
+    return (
+        f"🧺 *BASKET PLAY* — {n} NO legs in *{basket['city_name']}*\n"
+        f"#BASKET #INTRADAY\n\n"
+        f"{bucket_lines}\n\n"
+        f"💵 Total invested: *${total:.2f}*\n"
+        f"💰 Payout if 1 YES wins: *${payout:.2f}* (net *+${net:.2f}*)\n"
+        f"📊 Avg entry: {avg_entry_c}¢  |  EV/share: +{int(round(ev * 100))}¢\n"
+        f"_Each leg tagged `{basket['basket_id']}`_"
+        f"{market_url}"
+    )
+
+
+async def send_basket_alert(basket: dict, db) -> None:
+    """Send the multi-bucket basket alert to all admin-level Telegram subscribers."""
+    if not settings.telegram_bot_token:
+        return
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser
+
+    text = _fmt_basket_alert(basket)
+    users_result = await db.execute(select(TelegramUser))
+    users = users_result.scalars().all()
+    bot = Bot(token=settings.telegram_bot_token)
+    for user in users:
+        try:
+            await bot.send_message(
+                chat_id=user.chat_id, text=text, parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send basket alert to {user.chat_id}: {e}")

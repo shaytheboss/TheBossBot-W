@@ -304,6 +304,53 @@ def _compute_why_now(
     return " | ".join(parts) if parts else None
 
 
+async def _persist_collector_misses(
+    db: AsyncSession,
+    city_id: int,
+    event_date,
+    breakdown: dict,
+) -> None:
+    """Write CollectorMiss rows for any global sources that returned no data.
+
+    Uses INSERT ... ON CONFLICT DO NOTHING so multiple outcomes for the same
+    market don't produce duplicate rows. Failures are logged but never raise —
+    missing-source tracking is observational and must never break estimates.
+    """
+    from app.models.collector_miss import CollectorMiss
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    no_data: list[tuple[str, str]] = [
+        (src, "no_data") for src in (breakdown.get("missing_sources") or [])
+    ] + [
+        (src, "no_key") for src in (breakdown.get("missing_no_key") or [])
+    ]
+    if not no_data:
+        return
+
+    try:
+        for source, reason in no_data:
+            # Use merge-style upsert: if the unique row already exists, skip.
+            existing = await db.execute(
+                select(CollectorMiss.id).where(
+                    CollectorMiss.city_id == city_id,
+                    CollectorMiss.event_date == event_date,
+                    CollectorMiss.source == source,
+                    CollectorMiss.miss_reason == reason,
+                ).limit(1)
+            )
+            if existing.scalar_one_or_none() is None:
+                db.add(CollectorMiss(
+                    city_id=city_id,
+                    event_date=event_date,
+                    source=source,
+                    miss_reason=reason,
+                ))
+        await db.flush()
+    except Exception as e:
+        logger.debug(f"collector_miss persist failed (non-critical): {e}")
+        await db.rollback()
+
+
 async def _collect_outcome_data(
     db: AsyncSession,
     city: City,
@@ -352,6 +399,10 @@ async def _collect_outcome_data(
         days_ahead=days_ahead,
         bucket_unit=bucket_unit,
     )
+
+    # Persist missing-source events once per (city, date, source) so the
+    # dashboard can surface systematic data gaps per city over time.
+    await _persist_collector_misses(db, city.id, market.event_date, breakdown)
 
     # Never recommend on a fabricated prior: if no forecast source reported for
     # this city/date, the estimate is just the flat 0.25 fallback. Skipping here
