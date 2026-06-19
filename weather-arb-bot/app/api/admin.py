@@ -738,10 +738,6 @@ async def admin_stats(
     )).scalar()
 
     # ── Performance by confidence band ──────────────────────────────────────
-    # Honours the SAME filters as the cards above (date/city/min-conf) so the
-    # band rows always reconcile with the headline panel — see
-    # _confidence_band_breakdown for the full rationale. One SQL round-trip;
-    # grouped into bands in Python.
     band_rows = (await db.execute(
         fq(
             select(
@@ -753,6 +749,48 @@ async def admin_stats(
         ).where(Opportunity.virtual_shares != None)
     )).all()
     by_confidence_band = _confidence_band_breakdown(band_rows)
+
+    # ── Alpha vs Beta comparison (single GROUP BY query) ─────────────────────
+    est_col = func.coalesce(Opportunity.estimator, "alpha").label("est")
+    est_rows = (await db.execute(
+        fq(select(
+            est_col,
+            func.count(Opportunity.id).label("total"),
+            func.count(Opportunity.id).filter(Opportunity.alert_sent == True).label("alerted"),
+            func.count(Opportunity.id).filter(Opportunity.outcome == "WIN").label("wins"),
+            func.count(Opportunity.id).filter(Opportunity.outcome == "LOSS").label("losses"),
+            func.count(Opportunity.id).filter(Opportunity.virtual_shares != None).label("positions"),
+            func.count(Opportunity.id).filter(Opportunity.virtual_status == "win").label("pos_wins"),
+            func.count(Opportunity.id).filter(Opportunity.virtual_status == "loss").label("pos_losses"),
+            func.coalesce(
+                func.sum(Opportunity.virtual_cost).filter(
+                    Opportunity.virtual_status.in_(["win", "loss"])
+                ), 0.0
+            ).label("cost"),
+            func.coalesce(
+                func.sum(Opportunity.virtual_pnl).filter(
+                    Opportunity.virtual_status.in_(["win", "loss"])
+                ), 0.0
+            ).label("pnl"),
+        )).group_by(est_col)
+    )).all()
+    by_estimator = [
+        {
+            "estimator": r.est,
+            "total": r.total,
+            "alerted": r.alerted,
+            "wins": r.wins,
+            "losses": r.losses,
+            "win_rate_pct": round(r.wins / max(r.wins + r.losses, 1) * 100, 1),
+            "positions": r.positions,
+            "pos_wins": r.pos_wins,
+            "pos_losses": r.pos_losses,
+            "pos_win_rate_pct": round(r.pos_wins / max(r.pos_wins + r.pos_losses, 1) * 100, 1),
+            "cost": round(float(r.cost), 2),
+            "pnl": round(float(r.pnl), 2),
+        }
+        for r in est_rows
+    ]
 
     return {
         "filter": {
@@ -789,11 +827,8 @@ async def admin_stats(
             "outcomes_with_token": outcomes_with_token,
             "telegram_users": telegram_users,
         },
-        # Per-band breakdown: each row = positions with confidence in
-        # [min_conf, max_conf]. Honours the same filters as the cards above
-        # (date/city/min-conf), so the band rows always reconcile with the
-        # headline panel. Only non-empty bands are included.
         "by_confidence_band": by_confidence_band,
+        "by_estimator": by_estimator,
     }
 
 
@@ -1171,6 +1206,7 @@ async def admin_positions(
                 f"https://polymarket.com/event/{market.external_id}"
                 if market.external_id else None
             ),
+            "estimator": opp.estimator or "alpha",
         })
     return out
 
@@ -1337,6 +1373,7 @@ async def admin_opportunities(
     to_date: Optional[str] = Query(default=None),
     city_id: Optional[int] = Query(default=None),
     date_field: str = Query(default="detected", description="'detected' or 'event'"),
+    estimator: Optional[str] = Query(default=None, description="'alpha' or 'beta'"),
 ):
     from_dt = _parse_iso_date(from_date, "from_date")
     to_dt_inc = _parse_iso_date(to_date, "to_date")
@@ -1362,6 +1399,13 @@ async def admin_opportunities(
         q = q.where(Opportunity.outcome == outcome.upper())
     if city_id is not None:
         q = q.where(Market.city_id == city_id)
+    if estimator:
+        if estimator == "alpha":
+            q = q.where(
+                (Opportunity.estimator == "alpha") | (Opportunity.estimator.is_(None))
+            )
+        else:
+            q = q.where(Opportunity.estimator == estimator)
     if by_event:
         if from_dt is not None:
             q = q.where(Market.event_date >= from_dt.date())
@@ -1399,8 +1443,7 @@ async def admin_opportunities(
             "alert_sent": opp.alert_sent,
             "outcome": opp.outcome,
             "closed_at": opp.closed_at.isoformat() if opp.closed_at else None,
-            # Per-model forecasts captured at detection time, scored against the
-            # winning bucket once the market settles (correct=None if unresolved).
+            "estimator": opp.estimator or "alpha",
             "model_forecasts": _score_model_forecasts(
                 _extract_model_forecasts(opp.signals), winners_map.get(market.id, [])
             ),
