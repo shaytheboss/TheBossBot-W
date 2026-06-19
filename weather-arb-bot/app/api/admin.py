@@ -851,6 +851,134 @@ async def admin_model_skill(
     }
 
 
+@router.get("/model-skill/csv")
+async def admin_model_skill_csv(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    city_id: Optional[int] = Query(default=None),
+):
+    """CSV export of the model-skill table — one row per (city, source, days_ahead).
+
+    Download with: curl -b admin_session=... /admin/model-skill/csv > model_skill.csv
+    """
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+    from app.models.model_skill import ModelSkill
+    from app.analyzers.model_skill import MIN_SAMPLES
+
+    q = (
+        select(ModelSkill, City.name)
+        .join(City, City.id == ModelSkill.city_id)
+        .order_by(City.name, ModelSkill.source, ModelSkill.days_ahead)
+    )
+    if city_id is not None:
+        q = q.where(ModelSkill.city_id == city_id)
+    rows = (await db.execute(q)).all()
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "city_id", "city", "source", "days_ahead", "samples", "hits",
+        "hit_rate", "mae_f", "bias_f", "weight", "active",
+        "window_days", "last_event_date", "updated_at",
+    ])
+    writer.writeheader()
+    for r in rows:
+        ms = r.ModelSkill
+        writer.writerow({
+            "city_id": ms.city_id,
+            "city": r.name,
+            "source": ms.source,
+            "days_ahead": ms.days_ahead,
+            "samples": ms.samples,
+            "hits": ms.hits,
+            "hit_rate": round(ms.hit_rate, 4) if ms.hit_rate is not None else "",
+            "mae_f": round(ms.mae_f, 4) if ms.mae_f is not None else "",
+            "bias_f": round(ms.bias_f, 4) if ms.bias_f is not None else "",
+            "weight": round(ms.weight, 4) if ms.weight is not None else "",
+            "active": ms.samples >= MIN_SAMPLES,
+            "window_days": ms.window_days,
+            "last_event_date": ms.last_event_date.isoformat() if ms.last_event_date else "",
+            "updated_at": ms.updated_at.isoformat() if ms.updated_at else "",
+        })
+    buf.seek(0)
+
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=model_skill.csv"},
+    )
+
+
+@router.get("/collector-miss/csv")
+async def admin_collector_miss_csv(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    city_id: Optional[int] = Query(default=None),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+):
+    """CSV export of collector_miss — which weather sources failed per city/date.
+
+    Use this to identify systematic data gaps: e.g. ECMWF never responding for
+    Tokyo, or Tomorrow.io unconfigured. Grouped by (city, source, reason) with
+    a miss_count so repeated failures on different dates are collapsed.
+    """
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+    from app.models.collector_miss import CollectorMiss
+
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+
+    q = (
+        select(
+            City.id.label("city_id"),
+            City.name.label("city"),
+            CollectorMiss.source,
+            CollectorMiss.miss_reason,
+            func.count(CollectorMiss.id).label("miss_count"),
+            func.min(CollectorMiss.event_date).label("first_seen"),
+            func.max(CollectorMiss.event_date).label("last_seen"),
+        )
+        .join(City, City.id == CollectorMiss.city_id)
+        .group_by(City.id, City.name, CollectorMiss.source, CollectorMiss.miss_reason)
+        .order_by(City.name, CollectorMiss.source)
+    )
+    if city_id is not None:
+        q = q.where(CollectorMiss.city_id == city_id)
+    if from_dt is not None:
+        q = q.where(CollectorMiss.event_date >= from_dt.date())
+    if to_dt_inc is not None:
+        q = q.where(CollectorMiss.event_date <= to_dt_inc.date())
+
+    rows = (await db.execute(q)).all()
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "city_id", "city", "source", "miss_reason", "miss_count", "first_seen", "last_seen",
+    ])
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({
+            "city_id": r.city_id,
+            "city": r.city,
+            "source": r.source,
+            "miss_reason": r.miss_reason,
+            "miss_count": r.miss_count,
+            "first_seen": r.first_seen.isoformat() if r.first_seen else "",
+            "last_seen": r.last_seen.isoformat() if r.last_seen else "",
+        })
+    buf.seek(0)
+
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=collector_miss.csv"},
+    )
+
+
 @router.post("/model-skill/refresh")
 async def admin_model_skill_refresh(
     _: str = Depends(require_admin),
@@ -1473,6 +1601,68 @@ async def admin_intraday_stats(
         "by_lock": {k: _bucket_stats(v) for k, v in sorted(by_lock.items())},
         "by_city": {k: _bucket_stats(v) for k, v in sorted(by_city.items())},
     }
+
+
+@router.get("/intraday/basket-history")
+async def admin_basket_history(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    from_date: Optional[str] = Query(default=None),
+    to_date: Optional[str] = Query(default=None),
+):
+    """All intraday positions that are part of a basket play, grouped by basket_id."""
+    from app.models.intraday import IntradayOpportunity
+    from_dt = _parse_iso_date(from_date, "from_date")
+    to_dt_inc = _parse_iso_date(to_date, "to_date")
+    to_dt = (to_dt_inc + timedelta(days=1)) if to_dt_inc else None
+
+    q = (
+        select(IntradayOpportunity, MarketOutcome.bucket_label, City.name.label("city_name"))
+        .join(MarketOutcome, MarketOutcome.id == IntradayOpportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+        .where(IntradayOpportunity.basket_id.isnot(None))
+        .order_by(IntradayOpportunity.basket_id, IntradayOpportunity.detected_at)
+    )
+    if from_dt:
+        q = q.where(IntradayOpportunity.detected_at >= from_dt)
+    if to_dt:
+        q = q.where(IntradayOpportunity.detected_at < to_dt)
+
+    rows = (await db.execute(q)).all()
+
+    baskets: dict[str, dict] = {}
+    for r in rows:
+        opp = r.IntradayOpportunity
+        bid = opp.basket_id
+        if bid not in baskets:
+            baskets[bid] = {
+                "basket_id": bid,
+                "city": r.city_name,
+                "detected_at": opp.detected_at.isoformat() if opp.detected_at else None,
+                "legs": [],
+                "total_cost": 0.0,
+                "total_pnl": 0.0,
+                "wins": 0,
+                "losses": 0,
+            }
+        b = baskets[bid]
+        b["legs"].append({
+            "bucket": r.bucket_label,
+            "side": opp.side,
+            "entry_price": opp.virtual_entry_price,
+            "cost": float(opp.virtual_cost or 0),
+            "pnl": float(opp.virtual_pnl or 0),
+            "status": opp.virtual_status,
+        })
+        b["total_cost"] = round(b["total_cost"] + float(opp.virtual_cost or 0), 2)
+        b["total_pnl"] = round(b["total_pnl"] + float(opp.virtual_pnl or 0), 2)
+        if opp.virtual_status == "win":
+            b["wins"] += 1
+        elif opp.virtual_status == "loss":
+            b["losses"] += 1
+
+    return {"baskets": list(baskets.values())}
 
 
 @router.get("/cities")

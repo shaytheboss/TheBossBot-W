@@ -698,12 +698,14 @@ async def job_run_intraday():
     """Intraday (same-day, hours-scale) detection cycle. Fully isolated from
     the daily analyzer — see INTRADAY.md."""
     from app.intraday.detector import detect_intraday
-    from app.bot.telegram_bot import send_intraday_alert, send_intraday_realert
+    from app.bot.telegram_bot import send_intraday_alert, send_intraday_realert, send_basket_alert
     async with AsyncSessionLocal() as db:
         try:
-            opportunities, realerts = await detect_intraday(db)
+            opportunities, realerts, baskets = await detect_intraday(db)
             if opportunities:
                 logger.info(f"job_run_intraday: {len(opportunities)} intraday opportunities")
+            if baskets:
+                logger.info(f"job_run_intraday: {len(baskets)} basket plays detected")
             for opp in opportunities:
                 try:
                     await send_intraday_alert(opp, db)
@@ -714,6 +716,11 @@ async def job_run_intraday():
                     await send_intraday_realert(ra, db)
                 except Exception as e:
                     logger.error(f"Failed to send intraday realert: {e}")
+            for basket in baskets:
+                try:
+                    await send_basket_alert(basket, db)
+                except Exception as e:
+                    logger.error(f"Failed to send basket alert for {basket.get('basket_id')}: {e}")
         except Exception as e:
             logger.error(f"Intraday job failed: {e}", exc_info=True)
 
