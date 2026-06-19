@@ -27,6 +27,15 @@ class IntradayParams:
     start_hour: float = 10.0        # don't run the intraday view before this local hour
     peak_start_hour: float = 14.0   # climatological window in which the max occurs
     peak_end_hour: float = 17.0
+    # ── תקרית טאיפיי (14 ביוני) ───────────────────────────────────────────
+    # "peak passed" הוכרז ב-14:14 — 14 דקות בלבד לתוך חלון השיא — על סמך
+    # ירידה זמנית של 1.8°F. σ קרס ל-0.3°F, הביטחון טיפס ל-96%, והטמפרטורה
+    # המשיכה לעלות תוך שעה וההימור נפל. השיא היומי האמיתי מגיע לרוב
+    # 14:00-16:00, ולכן אסור להכריז "השיא עבר" בתחילת החלון על סמך ירידה
+    # רגעית. זיהוי-הקירור מורשה רק מהשעה הזו ואילך; לפניה המקסימום עוד
+    # יכול לברוח כלפי מעלה והמודל שומר על σ רחב מלוח-הזמנים. הקירור עצמו
+    # (cooling_drop_f / cooling_min_minutes) עדיין נדרש בנוסף לתנאי הזה.
+    peak_confirm_hour: float = 15.5
     # (hours_to_peak_end_at_least, sigma) — first matching row wins, ordered desc.
     sigma_schedule: tuple = (
         (6.0, 2.2),
@@ -118,11 +127,18 @@ def is_peak_passed(
 ) -> bool:
     """True when the day's max is very unlikely to rise further.
 
-    Requires all three: we're past the start of the peak window, the current
-    temp has fallen well below the max, and the max was set long enough ago
-    that the drop isn't just METAR noise.
+    Requires all three: we're far enough into the peak window that an early-
+    afternoon dip can't be the heating merely pausing (peak_confirm_hour), the
+    current temp has fallen well below the max, and the max was set long enough
+    ago that the drop isn't just METAR noise.
+
+    The gate is peak_confirm_hour (not peak_start_hour): the climatological max
+    typically lands 14:00-16:00, so a cooling signal at the very start of the
+    window (Taipei 14:14) is unreliable — the temperature routinely resumes
+    climbing. Collapsing σ on that false signal is what produced the 96%
+    wrong-direction confidence. Before peak_confirm_hour we keep the schedule σ.
     """
-    if local_hour < params.peak_start_hour:
+    if local_hour < params.peak_confirm_hour:
         return False
     if current_temp_f is None or minutes_since_max is None:
         return False

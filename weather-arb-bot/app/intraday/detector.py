@@ -251,6 +251,31 @@ async def _has_intraday_today(db: AsyncSession, outcome_id: int, side: str, tz) 
     return q.scalar_one_or_none() is not None
 
 
+async def _has_open_opposite_intraday(
+    db: AsyncSession, outcome_id: int, side: str
+) -> bool:
+    """True if an OPEN virtual position exists on the OPPOSITE side of this
+    same outcome.
+
+    Holding both YES and NO on the identical bucket is a guaranteed loss: one
+    side always wins and the other always loses, and you paid both entry costs
+    (London 15/6: 21°C NO @ 60¢ + 21°C YES @ 74¢ = $1.34 to get back $1.00).
+    This happens when the model flips sides on a bucket as the temperature
+    evolves — the per-side dedup (_has_intraday_today) doesn't catch it because
+    the opposite side has no record yet. We keep the contradictory alert (data)
+    but never open the contradictory virtual buy.
+    """
+    opposite = "YES" if side == "NO" else "NO"
+    q = await db.execute(
+        select(IntradayOpportunity.id).where(
+            IntradayOpportunity.outcome_id == outcome_id,
+            IntradayOpportunity.side == opposite,
+            IntradayOpportunity.virtual_status == "open",
+        ).limit(1)
+    )
+    return q.scalar_one_or_none() is not None
+
+
 def _realert_due(
     outcome_id: int, side: str, certainty: float,
     now_utc: Optional[datetime] = None,
@@ -547,10 +572,25 @@ async def _evaluate_intraday_outcome(
     # lock-failure wipes out 11 wins. Alerts still fire; only buys are gated.
     max_entry_cost = float(getattr(settings, "intraday_max_entry_cost", 0.88))
     entry_too_expensive = entry_cost > max_entry_cost
+
+    # Coherence guard: never open a virtual buy on a bucket where we already
+    # hold an OPEN position on the opposite side — that's a locked-in loss
+    # (London 15/6 cross-bet). The contradictory signal can still alert/realert;
+    # only the second virtual buy is suppressed.
+    has_open_opposite = await _has_open_opposite_intraday(db, outcome.id, side)
+    if has_open_opposite:
+        logger.warning(
+            "Intraday cross-bet blocked: %s %s %s — open %s position already "
+            "exists on this bucket; suppressing contradictory virtual buy.",
+            city.name, outcome.bucket_label, side,
+            "YES" if side == "NO" else "NO",
+        )
+
     create_buy = (
         certainty >= buy_thresh
         and not bool(getattr(city, "blacklisted", False))
         and not entry_too_expensive
+        and not has_open_opposite
     )
 
     # Per-source forecast highs (bias-corrected — the same values the blend
@@ -579,6 +619,7 @@ async def _evaluate_intraday_outcome(
         "_buy_threshold": buy_thresh,
         "_create_virtual_buy": bool(create_buy),
         "_entry_too_expensive": bool(entry_too_expensive),
+        "_has_open_opposite": bool(has_open_opposite),
         "_max_entry_cost": max_entry_cost,
         "_wu_confirmed_for_lock": bool(wu_confirmed_for_lock),
         "_bucket_unit": bucket_unit,
