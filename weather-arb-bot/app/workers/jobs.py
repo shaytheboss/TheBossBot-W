@@ -761,6 +761,22 @@ async def job_run_analyzer():
         except Exception as e:
             logger.error(f"Analyzer job failed: {e}", exc_info=True)
 
+    # Beta estimator runs in its own session so a beta failure can never affect alpha.
+    async with AsyncSessionLocal() as db:
+        try:
+            from app.analyzers.beta_opportunity_detector import detect_beta_opportunities
+            from app.bot.telegram_bot import send_beta_opportunity_alert
+            beta_opps = await detect_beta_opportunities(db)
+            if beta_opps:
+                logger.info(f"job_run_analyzer [beta]: {len(beta_opps)} beta opportunities found")
+            for opp in beta_opps:
+                try:
+                    await send_beta_opportunity_alert(opp, db)
+                except Exception as e:
+                    logger.error(f"[beta] Failed to send alert for opportunity {opp.id}: {e}")
+        except Exception as e:
+            logger.error(f"Beta analyzer job failed (non-critical): {e}", exc_info=True)
+
 
 async def _fetch_polymarket_winning_outcomes(
     event_slug: str,
