@@ -78,6 +78,14 @@ class IntradayParams:
     # לא רואה (אדבקציה, פערי תחנות, הטיה ספציפית ליום).
     stat_prob_hi: float = 0.96
     stat_prob_lo: float = 0.04
+    # ── תקרית סיאול / הונג-קונג / דאלאס (METAR-vs-WU divergence) ─────────
+    # כשהMETAR עוקף את תקרת הדלי אבל WU (מקור הסטלמנט) עוד לא אישר —
+    # lock_state = "yes_impossible_unconfirmed". עם σ=0.3 אפילו פער של 1°F
+    # מייצר ביטחון NO של 98.5% (99 conf). WU אז מציג ערך נמוך יותר וההימור
+    # מפסיד. הפיזור הטיפוסי METAR-WU הוא 1-3°F, לכן σ המינימלי לאי-מאושרים
+    # הוא 2.0°F — מה שמבטיח שפער של 2°F ייתן ביטחון NO של ~84% בלבד (מתחת
+    # לסף הקנייה של 94%), ולא 99% כפי שהיה קודם.
+    unconfirmed_lock_sigma_f: float = 2.0
 
 
 DEFAULT_PARAMS = IntradayParams()
@@ -199,6 +207,7 @@ def bucket_probability(
     sigma: float,
     f_lo: Optional[float],
     f_hi: Optional[float],
+    wu_confirmed: bool = True,
 ) -> float:
     """P(final max lands in [f_lo, f_hi)) under final = max(M, X), X~N(mu, sigma).
 
@@ -208,18 +217,23 @@ def bucket_probability(
     - bucket containing M (lo <= M < hi)-> Phi((hi - mu) / sigma)
     - bucket above M (lo > M)           -> Phi((hi-mu)/s) - Phi((lo-mu)/s)
     Open-ended tails follow the same logic with the missing bound at +/-inf.
+
+    wu_confirmed controls whether a running_max above f_hi is treated as a
+    mathematical lock ("yes_impossible") or falls through to the statistical
+    path ("yes_impossible_unconfirmed"). Pass False when running_max is from
+    METAR only — WU (the resolution source) may resolve at a different value.
     """
     sigma = max(sigma, 1e-6)
 
-    state = lock_state(running_max_f, f_lo, f_hi)
+    state = lock_state(running_max_f, f_lo, f_hi, wu_confirmed=wu_confirmed)
     if state == "yes_impossible":
         return PROB_LO
     if state == "yes_locked":
         return PROB_HI
     # "yes_impossible_unconfirmed" falls through to the statistical path —
     # the running max is only from METAR (WU not yet available/fresh), so we
-    # use a very tight sigma but do NOT declare a hard lock. The probability
-    # will be very low (near PROB_LO) but not pinned there.
+    # use sigma (widened by the unconfirmed_lock_sigma_f override in
+    # estimate_intraday) to reflect WU-METAR divergence uncertainty.
 
     if f_hi is None:
         # ">= lo" not yet touched (lo > M): P(X >= lo)
@@ -301,9 +315,23 @@ def estimate_intraday(
         sigma = params.celsius_min_sigma_f
         celsius_floor_applied = True
 
+    # ── Unconfirmed-lock sigma override (Seoul/HK/Dallas fix) ─────────────────
+    # When METAR exceeded the bucket ceiling but WU hasn't confirmed it yet,
+    # the typical 1-3°F METAR-WU divergence dominates over schedule noise.
+    # Applying σ=0.3°F here claims 99% NO confidence based on a single METAR
+    # reading — which then loses when WU resolves at a lower value. The 2°F
+    # floor means a 2°F METAR excess yields ~84% NO certainty (below 94% buy
+    # threshold) rather than the former 99%.
+    unconfirmed_sigma_applied = False
+    if state == "yes_impossible_unconfirmed" and sigma < params.unconfirmed_lock_sigma_f:
+        sigma = params.unconfirmed_lock_sigma_f
+        unconfirmed_sigma_applied = True
+
     mu = expected_final_max(running_max_f, forecast_high_f, local_hour, params)
-    p = bucket_probability(running_max_f, mu, sigma, f_lo, f_hi)
-    # state was already computed above (with wu_confirmed). Do NOT recompute here.
+    # Pass wu_confirmed so bucket_probability uses the same lock logic we did
+    # above — unconfirmed METAR-only readings must NOT pin p at PROB_LO.
+    p = bucket_probability(running_max_f, mu, sigma, f_lo, f_hi, wu_confirmed=wu_confirmed)
+    # state was already computed above. Do NOT recompute here.
 
     # ── תקרת YES לפני חלון השיא ──────────────────────────────────────────
     # לפני שחלון השיא הקלימטולוגי נפתח, דלי לא-נעול עדיין יכול לאבד את
@@ -322,10 +350,14 @@ def estimate_intraday(
     # אומדן שאינו נעילה ואינו אחרי-שיא הוא ניחוש סטטיסטי שתלוי בתחזית —
     # לעולם לא מורשה לטעון ביטחון קיצוני. 98% על משהו תוך-יומי שעוד
     # תלוי ב-5 שעות חימום עתידי הוא חוסר ענווה, לא מודל.
-    # Unconfirmed locks (METAR-only) are also capped by the stat ceiling.
+    # Unconfirmed locks (METAR-only) are statistical even after peak: WU can
+    # still resolve at a different value. The cap applies to them too.
+    # Normal post-peak (lock_state=None) is exempt: running max inside/below
+    # the bucket with confirmed peak is genuinely high-confidence.
     stat_cap_applied = False
     _is_hard_lock = state in ("yes_impossible", "yes_locked")
-    if not _is_hard_lock and not peak_passed:
+    _is_unconfirmed = state == "yes_impossible_unconfirmed"
+    if not _is_hard_lock and (not peak_passed or _is_unconfirmed):
         if p > params.stat_prob_hi:
             p = params.stat_prob_hi
             stat_cap_applied = True
@@ -352,6 +384,7 @@ def estimate_intraday(
         "pre_peak_cap_applied": pre_peak_cap_applied,
         "stat_cap_applied": stat_cap_applied,
         "celsius_floor_applied": celsius_floor_applied,
+        "unconfirmed_sigma_applied": unconfirmed_sigma_applied,
         "wu_confirmed": wu_confirmed,
         "peak_passed": peak_passed,
         "lock_state": state,
