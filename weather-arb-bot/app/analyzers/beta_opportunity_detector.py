@@ -17,7 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.analyzers.signal_aggregator import SignalAggregator
-from app.analyzers.beta_estimator import beta_estimate_with_breakdown, _clip as _beta_clip
+from app.analyzers.beta_estimator import (
+    beta_estimate_with_breakdown,
+    beta_blend_with_market,
+    _clip as _beta_clip,
+)
 from app.collectors.polymarket_collector import PolymarketCollector
 from app.config import settings
 from app.models.city import City
@@ -345,6 +349,15 @@ async def detect_beta_opportunities(db: AsyncSession) -> List[Opportunity]:
                     d["breakdown"]["normalization_scale"] = round(scale, 4)
                 else:
                     d["breakdown"]["normalization_scale"] = None
+                # Temper toward the market price (beta's edge is anti-predictive;
+                # the market tracks realized outcomes far better). Applied after
+                # normalization so it operates on beta's final estimate.
+                market_prob = (d["signals"].get("market_price") or {}).get("yes_price")
+                blended, blend_info = beta_blend_with_market(
+                    d["normalized_prob"], market_prob
+                )
+                d["normalized_prob"] = _beta_clip(blended)
+                d["breakdown"]["market_blend"] = blend_info
                 d["breakdown"]["normalized_final"] = round(float(d["normalized_prob"]), 4)
 
             for d in outcome_data:

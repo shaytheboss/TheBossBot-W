@@ -31,9 +31,21 @@ logger = logging.getLogger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 BETA_BLOCK_BIAS_F = 5.0        # block (city, source) when |bias_f| exceeds this
-BETA_SIGMA_FLOOR = 3.0         # minimum sigma (°F) for any source
+BETA_SIGMA_FLOOR = 4.0         # minimum sigma (°F) for any source (was 3.0 — too tight)
 BETA_SIGMA_CAP = 7.0           # maximum sigma (°F)
 BETA_MAE_SIGMA_SCALE = 1.2     # per-source sigma = max(floor, mae_f * this)
+
+# ── Calibration fixes (overconfidence was the root cause of beta's losses) ──────
+# 1. Bias-correction shrinkage: bias_f from few resolutions is mostly noise, so
+#    apply only a fraction of it. fraction = samples / (samples + K). With K=20:
+#    n=5 → 20%, n=20 → 50%, n=60 → 75%. Prevents beta "jumping" on noisy bias.
+BETA_BIAS_SHRINK_K = 20.0
+# 2. Sigma already widened via the raised floor above + bias-estimate uncertainty
+#    (mae/sqrt(n)) added in quadrature inside _beta_source_sigma.
+# 3. Market-price blend: beta's edge is empirically anti-predictive while the
+#    market price tracks realized outcomes far better. Pull beta toward the market
+#    by (1 - weight). 0.6 keeps beta the primary voice but reins in the extremes.
+BETA_MARKET_BLEND_WEIGHT = 0.6
 BETA_ACCURACY_MAE_CEIL = 5.0   # MAE at which accuracy_score = 0.0
 BETA_HIT_RATE_WEIGHT = 0.70    # weight of hit_rate in blended weight
 BETA_ACCURACY_WEIGHT = 0.30    # weight of accuracy_score in blended weight
@@ -52,7 +64,7 @@ _ENSEMBLE_WEIGHT_BASE = 0.70
 _ENSEMBLE_WEIGHT_MIN = 0.40
 _ENSEMBLE_STD_INFLATION = 1.3
 _ENSEMBLE_MIN_FOR_SIGMA = 10
-_SIGMA_BLEND_MIN_F = 3.0
+_SIGMA_BLEND_MIN_F = 4.0
 _SIGMA_BLEND_MAX_F = 7.0
 _SOURCE_SPREAD_THRESHOLD_F = 3.0
 _SOURCE_SPREAD_MAX_BLEND_F = 6.0
@@ -198,8 +210,12 @@ def _beta_source_bias(skill, signals_key: str, station_bias: dict) -> float:
     Falls back to the existing station_bias pipeline when no skill data exists,
     so beta is no worse than alpha in the absence of historical data.
     """
-    if skill is not None and skill.bias_f is not None:
-        return -float(skill.bias_f)
+    if skill is not None and skill.bias_f is not None and (skill.samples or 0) >= 1:
+        # Shrink the correction toward 0 by sample count — a bias_f estimated from
+        # few resolutions is dominated by noise, so trust it only partially.
+        n = float(skill.samples or 0)
+        shrink = n / (n + BETA_BIAS_SHRINK_K)
+        return -float(skill.bias_f) * shrink
     # Fallback to per-source station bias, then global bias
     per_source = (station_bias or {}).get("per_source") or {}
     src = _SIGNALS_KEY_TO_SRC.get(signals_key)
@@ -218,8 +234,18 @@ def _beta_source_sigma(skill, sigma_global: float) -> float:
     Models with high MAE get a wider sigma automatically.
     """
     if skill is not None and skill.mae_f is not None:
-        mae_sigma = float(skill.mae_f) * BETA_MAE_SIGMA_SCALE
-        return max(BETA_SIGMA_FLOOR, min(BETA_SIGMA_CAP, max(sigma_global, mae_sigma)))
+        mae = float(skill.mae_f)
+        mae_sigma = mae * BETA_MAE_SIGMA_SCALE
+        base = max(sigma_global, mae_sigma)
+        # Add the uncertainty of the bias correction itself in quadrature. A bias
+        # estimated from n resolutions has standard error ~ mae/sqrt(n); folding
+        # it in widens the CDF when the skill data is thin, killing false
+        # confidence (the source of beta's inverted high-confidence losses).
+        n = float(skill.samples or 0)
+        if n >= 1:
+            sigma_bias_unc = mae / math.sqrt(n)
+            base = math.sqrt(base * base + sigma_bias_unc * sigma_bias_unc)
+        return max(BETA_SIGMA_FLOOR, min(BETA_SIGMA_CAP, base))
     return sigma_global
 
 
@@ -268,6 +294,34 @@ def _lead_sigma(days_ahead: Optional[int]) -> float:
     if days_ahead is None or days_ahead < 0:
         return 4.5
     return min(6.0, 4.0 + 0.5 * days_ahead)
+
+
+def beta_blend_with_market(
+    p_beta: float,
+    market_prob: Optional[float],
+    weight: float = BETA_MARKET_BLEND_WEIGHT,
+) -> Tuple[float, Optional[dict]]:
+    """Temper beta's probability toward the market price.
+
+    Empirically beta's confidence is anti-predictive at the top end while the
+    market price tracks realized outcomes far better (75¢ entries resolved ~64%
+    while beta claimed 95%). Blending pulls beta toward the market and shrinks
+    the anti-predictive edge by `weight`. Both probabilities are on the YES
+    (P-in-bucket) scale. Returns (blended_prob, info); info is None when no
+    market price is available so beta degrades to its own estimate.
+    """
+    if market_prob is None:
+        return p_beta, None
+    mp = max(0.0, min(1.0, float(market_prob)))
+    w = max(0.0, min(1.0, float(weight)))
+    blended = w * float(p_beta) + (1.0 - w) * mp
+    info = {
+        "p_beta": round(float(p_beta), 4),
+        "market_prob": round(mp, 4),
+        "beta_weight": round(w, 3),
+        "blended": round(float(blended), 4),
+    }
+    return blended, info
 
 
 # ── Main estimation function ──────────────────────────────────────────────────

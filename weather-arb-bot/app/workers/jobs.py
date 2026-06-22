@@ -769,7 +769,15 @@ async def job_run_analyzer():
             beta_opps = await detect_beta_opportunities(db)
             if beta_opps:
                 logger.info(f"job_run_analyzer [beta]: {len(beta_opps)} beta opportunities found")
+            # Throttle beta Telegram alerts: every beta opportunity is still
+            # recorded in the DB (for learning), but only high-certainty ones are
+            # pushed to Telegram so the user isn't flooded.
+            beta_alert_min = int(round(
+                float(getattr(settings, "min_confidence_beta_alert", 0.85)) * 100
+            ))
             for opp in beta_opps:
+                if (opp.confidence_score or 0) < beta_alert_min:
+                    continue
                 try:
                     await send_beta_opportunity_alert(opp, db)
                 except Exception as e:
@@ -1013,6 +1021,15 @@ def _mark_outcome_winners(outcomes: list, winning_outcome_ids: set) -> None:
         o.won = o.id in winning_outcome_ids
 
 
+def _estimator_tag(opp) -> str:
+    """[α]/[β] tag so resolution alerts show which estimator each row came from.
+
+    Legacy rows have estimator NULL — treated as alpha.
+    """
+    est = (getattr(opp, "estimator", None) or "alpha").lower()
+    return "[β]" if est == "beta" else "[α]"
+
+
 async def _send_resolution_alert(
     city: City, market: Market, actual_high_f: Optional[float], opps: list,
     winning_outcome_ids: set, db, outcomes: list, resolution_source: str = "METAR",
@@ -1078,6 +1095,7 @@ async def _send_resolution_alert(
     total_pnl = 0.0
     wins_n = 0
     losses_n = 0
+    est_pnl = {"alpha": 0.0, "beta": 0.0}
     for opp in opps:
         oc_res = await db.execute(select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id))
         oc = oc_res.scalar_one_or_none()
@@ -1091,13 +1109,15 @@ async def _send_resolution_alert(
             side_price = (1.0 - yes_price) if opp.side == "NO" else yes_price
             entry_cents = round(side_price * 100)
 
-        line = f"{emoji} {label[:35]} {opp.side} @ {entry_cents}¢ → {opp.outcome}"
+        line = f"{emoji} {_estimator_tag(opp)} {label[:35]} {opp.side} @ {entry_cents}¢ → {opp.outcome}"
 
         if opp.virtual_pnl is not None and opp.virtual_shares:
             cost = float(opp.virtual_cost or 0.0)
             payout = float(opp.virtual_payout or 0.0)
             pnl = float(opp.virtual_pnl)
             total_pnl += pnl
+            est_key = "beta" if (getattr(opp, "estimator", None) or "alpha").lower() == "beta" else "alpha"
+            est_pnl[est_key] += pnl
             if opp.outcome == "WIN":
                 wins_n += 1
             elif opp.outcome == "LOSS":
@@ -1113,6 +1133,13 @@ async def _send_resolution_alert(
         pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
         lines.append("")
         lines.append(f"\U0001f4ca Day P&L: {pnl_str} ({wins_n} wins, {losses_n} losses)")
+        # Split α/β only when beta actually contributed, to keep alpha-only
+        # resolutions visually identical to before.
+        if est_pnl["beta"] != 0.0:
+            a, b = est_pnl["alpha"], est_pnl["beta"]
+            a_str = f"+${a:.2f}" if a >= 0 else f"-${abs(a):.2f}"
+            b_str = f"+${b:.2f}" if b >= 0 else f"-${abs(b):.2f}"
+            lines.append(f"   α {a_str}  |  β {b_str}")
 
     text = "\n".join(lines)
     users_result = await db.execute(select(TelegramUser))

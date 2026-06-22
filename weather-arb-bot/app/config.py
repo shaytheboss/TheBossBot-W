@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # opened at alert time. Buy implies alert, so these must be >= alert thresholds.
     min_confidence_buy_near: float = 0.90
     min_confidence_buy_far: float = 0.90
+    # Beta-only Telegram throttle (0.0–1.0). Beta still RECORDS opportunities and
+    # virtual buys at the standard thresholds above (for learning), but only sends
+    # a Telegram alert when its certainty is at least this high. Reduces the flood
+    # of beta alerts without losing any data. Does not affect alpha.
+    min_confidence_beta_alert: float = 0.85
     alert_dedup_minutes: int = 30
     # Only alert for markets resolving within this many days.
     # 0 = same-day only, 1 = today+tomorrow, 3 = default.
