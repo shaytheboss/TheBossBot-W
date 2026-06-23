@@ -79,6 +79,7 @@ async def send_opportunity_alert(opportunity, db) -> None:
         city_timezone=city.timezone if city else None,
         prior_opportunity=prior_opportunity,
     )
+    text = f"[α] {text}"
 
     users_result = await db.execute(
         select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score)
@@ -170,7 +171,7 @@ async def send_beta_opportunity_alert(opportunity, db) -> None:
         if beta_notes:
             beta_footer = "\n\n" + "\n".join(beta_notes)
 
-        text = f"[β] *BETA ESTIMATOR*\n{base_text}{beta_footer}"
+        text = f"[β] {base_text}{beta_footer}"
 
         users_result = await db.execute(
             select(TelegramUser).where(TelegramUser.min_confidence <= opportunity.confidence_score)
