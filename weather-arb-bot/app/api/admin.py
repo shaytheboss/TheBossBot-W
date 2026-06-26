@@ -60,6 +60,7 @@ class SettingsIn(BaseModel):
     min_confidence_alert_far: Optional[float] = None
     min_confidence_buy_near: Optional[float] = None
     min_confidence_buy_far: Optional[float] = None
+    min_confidence_beta_alert: Optional[float] = None
 
 
 class CityCreateIn(BaseModel):
@@ -1854,6 +1855,7 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "min_confidence_alert_far": settings.min_confidence_alert_far,
         "min_confidence_buy_near": settings.min_confidence_buy_near,
         "min_confidence_buy_far": settings.min_confidence_buy_far,
+        "min_confidence_beta_alert": settings.min_confidence_beta_alert,
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -1893,6 +1895,9 @@ async def admin_set_settings(payload: SettingsIn, _: str = Depends(require_admin
     if payload.min_confidence_buy_far is not None:
         _validate_unit(payload.min_confidence_buy_far, "min_confidence_buy_far")
         settings.min_confidence_buy_far = payload.min_confidence_buy_far
+    if payload.min_confidence_beta_alert is not None:
+        _validate_unit(payload.min_confidence_beta_alert, "min_confidence_beta_alert")
+        settings.min_confidence_beta_alert = payload.min_confidence_beta_alert
     if settings.min_confidence_buy_near < settings.min_confidence_alert_near:
         logger.warning(
             f"min_confidence_buy_near ({settings.min_confidence_buy_near}) < "
