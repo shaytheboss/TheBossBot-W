@@ -785,6 +785,30 @@ async def job_run_analyzer():
         except Exception as e:
             logger.error(f"Beta analyzer job failed (non-critical): {e}", exc_info=True)
 
+    # Exit monitor runs in its own session so it CANNOT affect alpha or beta.
+    async with AsyncSessionLocal() as db:
+        try:
+            from app.analyzers.exit_monitor import check_open_positions
+            from app.bot.telegram_bot import send_exit_alert
+            exit_rows = await check_open_positions(db)
+            if exit_rows:
+                logger.info(f"[exit_monitor] {len(exit_rows)} exit signal(s) recorded")
+            for exit_row in exit_rows:
+                opp_result = await db.execute(
+                    select(Opportunity).where(Opportunity.id == exit_row.opportunity_id)
+                )
+                opp = opp_result.scalar_one_or_none()
+                if opp is None:
+                    continue
+                try:
+                    await send_exit_alert(exit_row, opp, db)
+                except Exception as e:
+                    logger.error(
+                        f"[exit_monitor] Failed to send exit alert for exit {exit_row.id}: {e}"
+                    )
+        except Exception as e:
+            logger.error(f"Exit monitor job failed (non-critical): {e}", exc_info=True)
+
 
 async def _fetch_polymarket_winning_outcomes(
     event_slug: str,

@@ -1964,3 +1964,115 @@ async def admin_prune_data(
     await db.commit()
     logger.info(f"Admin pruned data before {req.before_date}: {deleted}")
     return {"deleted": deleted, "before": req.before_date}
+
+
+# ── Virtual Exit Monitor endpoints ──────────────────────────────────────────────
+
+@router.get("/virtual-exits")
+async def admin_virtual_exits(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return virtual exit records for the dashboard, newest first."""
+    from app.models.virtual_exit import VirtualExit
+    from sqlalchemy.orm import selectinload
+
+    total_result = await db.execute(
+        select(func.count()).select_from(VirtualExit)
+    )
+    total = total_result.scalar_one()
+
+    rows_result = await db.execute(
+        select(VirtualExit)
+        .order_by(desc(VirtualExit.triggered_at))
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = rows_result.scalars().all()
+
+    # Enrich with opportunity + market context.
+    items = []
+    for row in rows:
+        opp_result = await db.execute(
+            select(Opportunity).where(Opportunity.id == row.opportunity_id)
+        )
+        opp = opp_result.scalar_one_or_none()
+        city_name = None
+        market_question = None
+        bucket_label = None
+        event_date = None
+        market_url = None
+
+        if opp is not None:
+            outcome_result = await db.execute(
+                select(MarketOutcome).where(MarketOutcome.id == opp.outcome_id)
+            )
+            outcome = outcome_result.scalar_one_or_none()
+            if outcome is not None:
+                market_result = await db.execute(
+                    select(Market).where(Market.id == outcome.market_id)
+                )
+                market = market_result.scalar_one_or_none()
+                if market is not None:
+                    city_result = await db.execute(
+                        select(City).where(City.id == market.city_id)
+                    )
+                    city = city_result.scalar_one_or_none()
+                    city_name = city.name if city else None
+                    market_question = market.question
+                    event_date = market.event_date.isoformat() if market.event_date else None
+                    market_url = (
+                        f"https://polymarket.com/event/{market.external_id}"
+                        if market.external_id else None
+                    )
+                bucket_label = outcome.bucket_label if outcome else None
+
+        items.append({
+            "id": row.id,
+            "opportunity_id": row.opportunity_id,
+            "triggered_at": row.triggered_at.isoformat() if row.triggered_at else None,
+            "city_name": city_name,
+            "market_question": market_question,
+            "bucket_label": bucket_label,
+            "event_date": event_date,
+            "side": opp.side if opp else None,
+            "entry_confidence": row.entry_confidence,
+            "exit_confidence": row.exit_confidence,
+            "forecast_shift_f": float(row.forecast_shift_f) if row.forecast_shift_f is not None else None,
+            "trigger_reason": row.trigger_reason,
+            "theoretical_exit_price": float(row.theoretical_exit_price) if row.theoretical_exit_price is not None else None,
+            "entry_price": float(opp.virtual_entry_price) if opp and opp.virtual_entry_price is not None else None,
+            "theoretical_pnl": float(row.theoretical_pnl) if row.theoretical_pnl is not None else None,
+            "market_url": market_url,
+        })
+
+    return {"total": total, "items": items, "limit": limit, "offset": offset}
+
+
+@router.post("/virtual-exits/run")
+async def admin_run_exit_monitor(_: str = Depends(require_admin)):
+    """Manually trigger the exit monitor job (runs in same process)."""
+    from app.analyzers.exit_monitor import check_open_positions
+    from app.bot.telegram_bot import send_exit_alert
+    from sqlalchemy import select as sa_select
+    from app.models.opportunity import Opportunity as _Opp
+
+    triggered = 0
+    async with AsyncSessionLocal() as db:
+        try:
+            exit_rows = await check_open_positions(db)
+            for exit_row in exit_rows:
+                opp_result = await db.execute(
+                    sa_select(_Opp).where(_Opp.id == exit_row.opportunity_id)
+                )
+                opp = opp_result.scalar_one_or_none()
+                if opp:
+                    await send_exit_alert(exit_row, opp, db)
+                    triggered += 1
+        except Exception as e:
+            logger.error(f"admin_run_exit_monitor: {e}", exc_info=True)
+            raise HTTPException(500, f"Exit monitor failed: {e}")
+
+    return {"ok": True, "exits_triggered": triggered}
