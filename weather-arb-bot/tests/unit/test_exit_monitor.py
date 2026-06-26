@@ -14,6 +14,7 @@ from app.analyzers.exit_monitor import (
     _should_trigger_exit,
     _extract_entry_forecast_high,
     _extract_entry_certainty,
+    _normalize_estimator,
     EXIT_CONFIDENCE_DROP_PP,
     EXIT_FORECAST_SHIFT_F,
     EXIT_CERTAINTY_FLOOR,
@@ -164,6 +165,24 @@ class TestExtractEntryForecastHigh:
         opp = self._opp({"_beta_breakdown": {"forecast_high_f": 85.0}})
         assert _extract_entry_forecast_high(opp) == pytest.approx(85.0)
 
+    def test_alpha_blend_key(self):
+        """Alpha stores the breakdown under '_blend', not '_beta_breakdown'."""
+        opp = self._opp({"_blend": {"forecast_high_f": 73.5}})
+        assert _extract_entry_forecast_high(opp) == pytest.approx(73.5)
+
+    def test_beta_key_takes_priority_when_both_present(self):
+        """If both keys exist, beta breakdown wins (beta rows never carry _blend,
+        but be deterministic regardless)."""
+        opp = self._opp({
+            "_beta_breakdown": {"forecast_high_f": 80.0},
+            "_blend": {"forecast_high_f": 60.0},
+        })
+        assert _extract_entry_forecast_high(opp) == pytest.approx(80.0)
+
+    def test_alpha_blend_missing_forecast_returns_none(self):
+        opp = self._opp({"_blend": {"final": 0.7}})
+        assert _extract_entry_forecast_high(opp) is None
+
     def test_integer_value(self):
         opp = self._opp({"_beta_breakdown": {"forecast_high_f": 72}})
         assert _extract_entry_forecast_high(opp) == pytest.approx(72.0)
@@ -191,6 +210,26 @@ class TestExtractEntryForecastHigh:
     def test_none_value_returns_none(self):
         opp = self._opp({"_beta_breakdown": {"forecast_high_f": None}})
         assert _extract_entry_forecast_high(opp) is None
+
+
+# ── _normalize_estimator ──────────────────────────────────────────────────────
+
+class TestNormalizeEstimator:
+    def test_none_is_alpha(self):
+        """Legacy rows with NULL estimator are treated as alpha."""
+        assert _normalize_estimator(None) == "alpha"
+
+    def test_blank_is_alpha(self):
+        assert _normalize_estimator("") == "alpha"
+
+    def test_beta_preserved(self):
+        assert _normalize_estimator("beta") == "beta"
+
+    def test_alpha_preserved(self):
+        assert _normalize_estimator("alpha") == "alpha"
+
+    def test_uppercase_normalized(self):
+        assert _normalize_estimator("BETA") == "beta"
 
 
 # ── _extract_entry_certainty ──────────────────────────────────────────────────
@@ -254,6 +293,18 @@ class TestFmtExitAlert:
     def test_contains_exit_signal_header(self):
         text = self._call()
         assert "EXIT SIGNAL" in text
+
+    def test_beta_tag(self):
+        text = self._call(estimator="beta")
+        assert "[β]" in text
+
+    def test_alpha_tag(self):
+        text = self._call(estimator="alpha")
+        assert "[α]" in text
+
+    def test_null_estimator_defaults_to_alpha_tag(self):
+        text = self._call(estimator=None)
+        assert "[α]" in text
 
     def test_contains_confidence_numbers(self):
         text = self._call()

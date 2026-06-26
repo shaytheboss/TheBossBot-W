@@ -800,8 +800,9 @@ def _fmt_exit_alert(
     theoretical_pnl: Optional[float],
     entry_price: Optional[float],
     market_url: Optional[str],
+    estimator: str = "beta",
 ) -> str:
-    """Format the prominent exit-signal Telegram message."""
+    """Format the prominent exit-signal Telegram message (legacy Markdown)."""
     exit_cents = int(round(theoretical_exit_price * 100)) if theoretical_exit_price is not None else None
     entry_cents = int(round(entry_price * 100)) if entry_price is not None else None
     pnl_str = ""
@@ -817,9 +818,10 @@ def _fmt_exit_alert(
 
     url_line = f"\n🔗 [Market]({market_url})" if market_url else ""
     date_str = event_date.strftime("%b %d") if event_date else "?"
+    tag = "β" if (estimator or "alpha").lower() == "beta" else "α"
 
     return (
-        f"⚠️🚨 *\\[β\\] EXIT SIGNAL* 🚨⚠️\n\n"
+        f"⚠️🚨 *[{tag}] EXIT SIGNAL* 🚨⚠️\n\n"
         f"📍 *{city_name}* — {side} on _{bucket_label}_\n"
         f"📅 {date_str}  |  _{market_question}_\n\n"
         f"📉 Confidence: *{entry_confidence}%* → *{exit_confidence}%*\n"
@@ -845,7 +847,6 @@ async def send_exit_alert(exit_row, opportunity, db) -> None:
     from app.models.alert import TelegramUser
     from app.models.market import MarketOutcome, Market
     from app.models.city import City
-    from typing import Optional as _Opt
 
     try:
         outcome_result = await db.execute(
@@ -890,6 +891,7 @@ async def send_exit_alert(exit_row, opportunity, db) -> None:
                 if opportunity.virtual_entry_price is not None else None
             ),
             market_url=market_url,
+            estimator=opportunity.estimator or "alpha",
         )
 
         # Broadcast to ALL users — exit signals are risk management, not alpha.
@@ -901,7 +903,7 @@ async def send_exit_alert(exit_row, opportunity, db) -> None:
                 await bot.send_message(
                     chat_id=user.chat_id,
                     text=text,
-                    parse_mode="MarkdownV2",
+                    parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
             except Exception as e:

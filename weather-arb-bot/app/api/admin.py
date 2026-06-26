@@ -1977,7 +1977,6 @@ async def admin_virtual_exits(
 ):
     """Return virtual exit records for the dashboard, newest first."""
     from app.models.virtual_exit import VirtualExit
-    from sqlalchemy.orm import selectinload
 
     total_result = await db.execute(
         select(func.count()).select_from(VirtualExit)
@@ -2038,6 +2037,7 @@ async def admin_virtual_exits(
             "bucket_label": bucket_label,
             "event_date": event_date,
             "side": opp.side if opp else None,
+            "estimator": (opp.estimator or "alpha") if opp else None,
             "entry_confidence": row.entry_confidence,
             "exit_confidence": row.exit_confidence,
             "forecast_shift_f": float(row.forecast_shift_f) if row.forecast_shift_f is not None else None,
