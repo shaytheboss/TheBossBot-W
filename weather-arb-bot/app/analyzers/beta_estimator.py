@@ -228,23 +228,44 @@ def _beta_source_bias(skill, signals_key: str, station_bias: dict) -> float:
 
 
 def _beta_source_sigma(skill, sigma_global: float) -> float:
-    """Per-source sigma based on historical MAE.
+    """Per-source sigma based on historical MAE, decomposed into residual noise.
 
-    Models with low MAE use a tighter sigma (up to the global floor).
-    Models with high MAE get a wider sigma automatically.
+    When mae ≈ |bias| (pure systematic error, e.g. Ankara ECMWF always cold
+    by 4°F), using raw MAE to set sigma double-counts the bias we already
+    corrected in _beta_source_bias. Instead we decompose:
+
+        σ_resid = sqrt(max(0, mae² − b_corrected²))
+
+    where b_corrected = bias × shrink (the portion actually removed). This
+    drives sigma from the *unpredictable* residual only. London (mae=4°F,
+    bias≈0) is unchanged; Ankara (mae≈|bias|) gets a tighter, earned sigma.
+
+    Uncertainty from the uncorrected bias portion and estimation noise are then
+    added back in quadrature, so thin-data cities stay conservatively wide.
     """
     if skill is not None and skill.mae_f is not None:
         mae = float(skill.mae_f)
-        mae_sigma = mae * BETA_MAE_SIGMA_SCALE
-        base = max(sigma_global, mae_sigma)
-        # Add the uncertainty of the bias correction itself in quadrature. A bias
-        # estimated from n resolutions has standard error ~ mae/sqrt(n); folding
-        # it in widens the CDF when the skill data is thin, killing false
-        # confidence (the source of beta's inverted high-confidence losses).
         n = float(skill.samples or 0)
+
+        if skill.bias_f is not None and n >= 1:
+            shrink = n / (n + BETA_BIAS_SHRINK_K)
+            b_corrected = abs(float(skill.bias_f)) * shrink
+            b_uncorrected = abs(float(skill.bias_f)) * (1.0 - shrink)
+            sigma_resid = math.sqrt(max(0.0, mae ** 2 - b_corrected ** 2))
+        else:
+            sigma_resid = mae
+            b_uncorrected = 0.0
+
+        mae_sigma = sigma_resid * BETA_MAE_SIGMA_SCALE
+        base = max(sigma_global, mae_sigma)
+
+        # Add in quadrature: uncorrected-bias uncertainty + estimation noise.
+        # mae/sqrt(n) is the standard error of the bias estimate itself.
         if n >= 1:
             sigma_bias_unc = mae / math.sqrt(n)
-            base = math.sqrt(base * base + sigma_bias_unc * sigma_bias_unc)
+            extra = math.sqrt(b_uncorrected ** 2 + sigma_bias_unc ** 2)
+            base = math.sqrt(base ** 2 + extra ** 2)
+
         return max(BETA_SIGMA_FLOOR, min(BETA_SIGMA_CAP, base))
     return sigma_global
 
