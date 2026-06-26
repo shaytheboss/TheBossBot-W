@@ -451,8 +451,9 @@
         <span id="exitsCount" class="small" style="margin-left:8px;"></span>
       </div>
       <p class="small">
-        Virtual stop-loss signals. When a fresh forecast diverges materially from the one used to open a beta position,
-        an exit is recorded here. <strong>Nothing in the original position is modified</strong> — this is a theoretical
+        Virtual stop-loss signals for <strong>both alpha and beta</strong> positions. When a fresh forecast diverges
+        materially from the one used to open a position, an exit is recorded here.
+        <strong>Nothing in the original position is modified</strong> — this is a theoretical
         audit trail for evaluating how much money the exit system would save.
         Trigger conditions: certainty drop ≥20pp <em>and</em> forecast shift ≥2°F,
         <em>or</em> certainty collapses below 55%, <em>or</em> forecast shifts ≥5°F alone.
@@ -461,6 +462,7 @@
         <thead>
           <tr>
             <th>Triggered</th>
+            <th>Est</th>
             <th>City</th>
             <th>Side</th>
             <th>Bucket</th>
@@ -1950,11 +1952,11 @@ let _exitsTotal = 0;
 async function loadVirtualExits() {
   const body = document.getElementById('exitsBody');
   const countEl = document.getElementById('exitsCount');
-  body.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim)">Loading…</td></tr>';
+  body.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--dim)">Loading…</td></tr>';
 
   const r = await api(`/virtual-exits?limit=${_exitsLimit}&offset=${_exitsOffset}`);
   if (!r.ok) {
-    body.innerHTML = '<tr><td colspan="12" style="color:red">Failed to load exits</td></tr>';
+    body.innerHTML = '<tr><td colspan="13" style="color:red">Failed to load exits</td></tr>';
     return;
   }
   const data = await r.json();
@@ -1962,7 +1964,7 @@ async function loadVirtualExits() {
   countEl.textContent = `${_exitsTotal} total exit signal${_exitsTotal !== 1 ? 's' : ''}`;
 
   if (!data.items || data.items.length === 0) {
-    body.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim)">No exit signals yet — open beta positions will be monitored each analyzer run.</td></tr>';
+    body.innerHTML = '<tr><td colspan="13" style="text-align:center;color:var(--dim)">No exit signals yet — open beta positions will be monitored each analyzer run.</td></tr>';
     document.getElementById('exitsPrev').disabled = true;
     document.getElementById('exitsNext').disabled = true;
     document.getElementById('exitsPageInfo').textContent = '';
@@ -1988,8 +1990,10 @@ async function loadVirtualExits() {
     const sideBadge = row.side === 'YES'
       ? `<span style="color:var(--green,#4c8)">YES</span>`
       : `<span style="color:var(--red,#e44)">NO</span>`;
+    const estTag = row.estimator === 'beta' ? 'β' : 'α';
     return `<tr>
       <td style="white-space:nowrap">${triggered}</td>
+      <td style="text-align:center">${estTag}</td>
       <td>${row.city_name ?? '—'}</td>
       <td>${sideBadge}</td>
       <td style="font-size:11px">${row.bucket_label ?? '—'}</td>
