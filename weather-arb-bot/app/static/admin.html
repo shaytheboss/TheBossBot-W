@@ -108,6 +108,7 @@
       <button data-tab="intradaypos">⚡ Intraday Positions</button>
       <button data-tab="lessons">Lessons</button>
       <button data-tab="cities">Cities</button>
+      <button data-tab="exits">🚨 Exit Signals</button>
       <button data-tab="settings">Settings</button>
       <button data-tab="logs">Logs</button>
     </nav>
@@ -443,6 +444,45 @@
       <div id="pruneStatus" class="small" style="margin-top:6px;"></div>
     </section>
 
+    <section id="tab-exits" class="hidden">
+      <div class="toolbar">
+        <button class="btn primary" onclick="runExitMonitor(this)" title="Manually trigger the exit monitor now">▶ Run exit monitor</button>
+        <button class="btn" onclick="loadVirtualExits()">↻ Refresh</button>
+        <span id="exitsCount" class="small" style="margin-left:8px;"></span>
+      </div>
+      <p class="small">
+        Virtual stop-loss signals. When a fresh forecast diverges materially from the one used to open a beta position,
+        an exit is recorded here. <strong>Nothing in the original position is modified</strong> — this is a theoretical
+        audit trail for evaluating how much money the exit system would save.
+        Trigger conditions: certainty drop ≥20pp <em>and</em> forecast shift ≥2°F,
+        <em>or</em> certainty collapses below 55%, <em>or</em> forecast shifts ≥5°F alone.
+      </p>
+      <table id="exitsTable">
+        <thead>
+          <tr>
+            <th>Triggered</th>
+            <th>City</th>
+            <th>Side</th>
+            <th>Bucket</th>
+            <th>Event date</th>
+            <th>Confidence</th>
+            <th>Shift °F</th>
+            <th>Entry ¢</th>
+            <th>Exit ¢</th>
+            <th>Theoretical P&amp;L</th>
+            <th>Reason</th>
+            <th>Market</th>
+          </tr>
+        </thead>
+        <tbody id="exitsBody"></tbody>
+      </table>
+      <div style="margin-top:12px;display:flex;gap:8px;align-items:center;">
+        <button class="btn small" id="exitsPrev" onclick="exitsPage(-1)" disabled>← Prev</button>
+        <span id="exitsPageInfo" class="small"></span>
+        <button class="btn small" id="exitsNext" onclick="exitsPage(+1)" disabled>Next →</button>
+      </div>
+    </section>
+
     <section id="tab-logs" class="hidden">
       <div class="toolbar">
         <select id="logLevel" onchange="loadLogs()">
@@ -657,6 +697,7 @@ function bindTabs() {
       if (tab === 'cities') loadCities();
       if (tab === 'settings') loadSettings();
       if (tab === 'logs') loadLogs();
+      if (tab === 'exits') loadVirtualExits();
     };
   });
 }
@@ -1898,6 +1939,102 @@ async function confirmPrune() {
   } catch (e) {
     statusEl.textContent = `❌ Error: ${e}`;
   }
+}
+
+// ── Virtual Exit Monitor ─────────────────────────────────────────────────────
+
+let _exitsOffset = 0;
+const _exitsLimit = 50;
+let _exitsTotal = 0;
+
+async function loadVirtualExits() {
+  const body = document.getElementById('exitsBody');
+  const countEl = document.getElementById('exitsCount');
+  body.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim)">Loading…</td></tr>';
+
+  const r = await api(`/virtual-exits?limit=${_exitsLimit}&offset=${_exitsOffset}`);
+  if (!r.ok) {
+    body.innerHTML = '<tr><td colspan="12" style="color:red">Failed to load exits</td></tr>';
+    return;
+  }
+  const data = await r.json();
+  _exitsTotal = data.total || 0;
+  countEl.textContent = `${_exitsTotal} total exit signal${_exitsTotal !== 1 ? 's' : ''}`;
+
+  if (!data.items || data.items.length === 0) {
+    body.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim)">No exit signals yet — open beta positions will be monitored each analyzer run.</td></tr>';
+    document.getElementById('exitsPrev').disabled = true;
+    document.getElementById('exitsNext').disabled = true;
+    document.getElementById('exitsPageInfo').textContent = '';
+    return;
+  }
+
+  body.innerHTML = data.items.map(row => {
+    const triggered = row.triggered_at ? new Date(row.triggered_at).toLocaleString() : '—';
+    const confArrow = `${row.entry_confidence ?? '?'}% → ${row.exit_confidence ?? '?'}%`;
+    const shift = row.forecast_shift_f != null ? `${row.forecast_shift_f >= 0 ? '+' : ''}${row.forecast_shift_f.toFixed(1)}°F` : '—';
+    const entryC = row.entry_price != null ? `${Math.round(row.entry_price * 100)}¢` : '—';
+    const exitC = row.theoretical_exit_price != null ? `${Math.round(row.theoretical_exit_price * 100)}¢` : '—';
+    const pnlRaw = row.theoretical_pnl;
+    const pnlStr = pnlRaw != null
+      ? `<span style="color:${pnlRaw >= 0 ? 'var(--green,#4c8)' : 'var(--red,#e44)'}">${pnlRaw >= 0 ? '+' : ''}${pnlRaw.toFixed(2)}</span>`
+      : '—';
+    const marketLink = row.market_url
+      ? `<a href="${row.market_url}" target="_blank" rel="noopener" style="font-size:11px">↗</a>`
+      : '—';
+    const reasonTruncated = row.trigger_reason
+      ? `<span title="${row.trigger_reason.replace(/"/g,'&quot;')}">${row.trigger_reason.length > 60 ? row.trigger_reason.slice(0,60) + '…' : row.trigger_reason}</span>`
+      : '—';
+    const sideBadge = row.side === 'YES'
+      ? `<span style="color:var(--green,#4c8)">YES</span>`
+      : `<span style="color:var(--red,#e44)">NO</span>`;
+    return `<tr>
+      <td style="white-space:nowrap">${triggered}</td>
+      <td>${row.city_name ?? '—'}</td>
+      <td>${sideBadge}</td>
+      <td style="font-size:11px">${row.bucket_label ?? '—'}</td>
+      <td>${row.event_date ?? '—'}</td>
+      <td style="white-space:nowrap">${confArrow}</td>
+      <td>${shift}</td>
+      <td>${entryC}</td>
+      <td>${exitC}</td>
+      <td>${pnlStr}</td>
+      <td style="font-size:11px">${reasonTruncated}</td>
+      <td>${marketLink}</td>
+    </tr>`;
+  }).join('');
+
+  const pageStart = _exitsOffset + 1;
+  const pageEnd = Math.min(_exitsOffset + data.items.length, _exitsTotal);
+  document.getElementById('exitsPageInfo').textContent = `${pageStart}–${pageEnd} of ${_exitsTotal}`;
+  document.getElementById('exitsPrev').disabled = _exitsOffset === 0;
+  document.getElementById('exitsNext').disabled = _exitsOffset + _exitsLimit >= _exitsTotal;
+}
+
+function exitsPage(dir) {
+  _exitsOffset = Math.max(0, _exitsOffset + dir * _exitsLimit);
+  loadVirtualExits();
+}
+
+async function runExitMonitor(btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ Running…';
+  try {
+    const r = await api('/virtual-exits/run', { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const n = data.exits_triggered ?? 0;
+      btn.textContent = `✅ Done — ${n} exit${n !== 1 ? 's' : ''} triggered`;
+      _exitsOffset = 0;
+      loadVirtualExits();
+    } else {
+      btn.textContent = `❌ ${data.detail || 'Error'}`;
+    }
+  } catch (e) {
+    btn.textContent = `❌ ${e}`;
+  }
+  setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 4000);
 }
 
 init();

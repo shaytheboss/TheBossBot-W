@@ -9,6 +9,7 @@ from app.models.alert import Alert, TelegramUser
 from app.models.forecast_accuracy import ForecastAccuracy
 from app.models.model_skill import ModelSkill
 from app.models.collector_miss import CollectorMiss
+from app.models.virtual_exit import VirtualExit
 
 __all__ = [
     "City",
@@ -25,4 +26,5 @@ __all__ = [
     "ForecastAccuracy",
     "ModelSkill",
     "CollectorMiss",
+    "VirtualExit",
 ]

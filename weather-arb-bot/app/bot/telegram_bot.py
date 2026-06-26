@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+from typing import Optional
 
 from telegram import Bot
 from telegram.ext import Application, CommandHandler
@@ -783,3 +784,128 @@ async def send_basket_alert(basket: dict, db) -> None:
             )
         except Exception as e:
             logger.error(f"Failed to send basket alert to {user.chat_id}: {e}")
+
+
+def _fmt_exit_alert(
+    city_name: str,
+    market_question: str,
+    bucket_label: str,
+    side: str,
+    event_date,
+    entry_confidence: int,
+    exit_confidence: int,
+    forecast_shift_f: float,
+    trigger_reason: str,
+    theoretical_exit_price: Optional[float],
+    theoretical_pnl: Optional[float],
+    entry_price: Optional[float],
+    market_url: Optional[str],
+) -> str:
+    """Format the prominent exit-signal Telegram message."""
+    exit_cents = int(round(theoretical_exit_price * 100)) if theoretical_exit_price is not None else None
+    entry_cents = int(round(entry_price * 100)) if entry_price is not None else None
+    pnl_str = ""
+    if theoretical_pnl is not None:
+        sign = "+" if theoretical_pnl >= 0 else ""
+        pnl_str = f"\n💰 Theoretical P&L: *{sign}{theoretical_pnl:.2f}*"
+
+    price_line = ""
+    if exit_cents is not None:
+        price_line = f"\n💸 Exit price: *{exit_cents}¢*"
+        if entry_cents is not None:
+            price_line += f" (entry: {entry_cents}¢)"
+
+    url_line = f"\n🔗 [Market]({market_url})" if market_url else ""
+    date_str = event_date.strftime("%b %d") if event_date else "?"
+
+    return (
+        f"⚠️🚨 *\\[β\\] EXIT SIGNAL* 🚨⚠️\n\n"
+        f"📍 *{city_name}* — {side} on _{bucket_label}_\n"
+        f"📅 {date_str}  |  _{market_question}_\n\n"
+        f"📉 Confidence: *{entry_confidence}%* → *{exit_confidence}%*\n"
+        f"🌡 Forecast shift: *{forecast_shift_f:+.1f}°F*\n"
+        f"🔍 Reason: {trigger_reason}"
+        f"{price_line}"
+        f"{pnl_str}"
+        f"{url_line}\n\n"
+        f"_This is a VIRTUAL exit signal only — no real position was modified. "
+        f"Review manually before acting._"
+    )
+
+
+async def send_exit_alert(exit_row, opportunity, db) -> None:
+    """Send a very prominent Telegram alert when a virtual exit is triggered.
+
+    Broadcasts to ALL Telegram subscribers regardless of min_confidence —
+    this is a risk-management signal, not a trading opportunity.
+    """
+    if not settings.telegram_bot_token:
+        return
+    from sqlalchemy import select
+    from app.models.alert import TelegramUser
+    from app.models.market import MarketOutcome, Market
+    from app.models.city import City
+    from typing import Optional as _Opt
+
+    try:
+        outcome_result = await db.execute(
+            select(MarketOutcome).where(MarketOutcome.id == opportunity.outcome_id)
+        )
+        outcome = outcome_result.scalar_one_or_none()
+        if not outcome:
+            return
+
+        market_result = await db.execute(select(Market).where(Market.id == outcome.market_id))
+        market = market_result.scalar_one_or_none()
+        if not market:
+            return
+
+        city_result = await db.execute(select(City).where(City.id == market.city_id))
+        city = city_result.scalar_one_or_none()
+
+        market_url = (
+            f"https://polymarket.com/event/{market.external_id}" if market.external_id else None
+        )
+
+        text = _fmt_exit_alert(
+            city_name=city.name if city else "Unknown",
+            market_question=market.question or "",
+            bucket_label=outcome.bucket_label or "",
+            side=opportunity.side or "YES",
+            event_date=market.event_date,
+            entry_confidence=exit_row.entry_confidence or 0,
+            exit_confidence=exit_row.exit_confidence or 0,
+            forecast_shift_f=float(exit_row.forecast_shift_f or 0),
+            trigger_reason=exit_row.trigger_reason or "",
+            theoretical_exit_price=(
+                float(exit_row.theoretical_exit_price)
+                if exit_row.theoretical_exit_price is not None else None
+            ),
+            theoretical_pnl=(
+                float(exit_row.theoretical_pnl)
+                if exit_row.theoretical_pnl is not None else None
+            ),
+            entry_price=(
+                float(opportunity.virtual_entry_price)
+                if opportunity.virtual_entry_price is not None else None
+            ),
+            market_url=market_url,
+        )
+
+        # Broadcast to ALL users — exit signals are risk management, not alpha.
+        users_result = await db.execute(select(TelegramUser))
+        users = users_result.scalars().all()
+        bot = Bot(token=settings.telegram_bot_token)
+        for user in users:
+            try:
+                await bot.send_message(
+                    chat_id=user.chat_id,
+                    text=text,
+                    parse_mode="MarkdownV2",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"[exit_monitor] Failed to send exit alert to {user.chat_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"[exit_monitor] send_exit_alert failed: {e}", exc_info=True)
