@@ -51,7 +51,11 @@ class Settings(BaseSettings):
     # virtual buys at the standard thresholds above (for learning), but only sends
     # a Telegram alert when its certainty is at least this high. Reduces the flood
     # of beta alerts without losing any data. Does not affect alpha.
-    min_confidence_beta_alert: float = 0.85
+    # Note: the market-blend step (60/40 raw/market) structurally reduces blended
+    # confidence by ~5–7pp vs raw. Setting this to 0.80 means a raw 90% signal at
+    # a typical 72¢ NO market price → 82.8% blended → clears the threshold.
+    # Previously 0.85 silenced virtually all 90–94% raw beta signals post-blend.
+    min_confidence_beta_alert: float = 0.80
     alert_dedup_minutes: int = 30
     # Only alert for markets resolving within this many days.
     # 0 = same-day only, 1 = today+tomorrow, 3 = default.
