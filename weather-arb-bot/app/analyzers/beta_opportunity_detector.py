@@ -10,6 +10,7 @@ Mirrors the structure of opportunity_detector.py but:
 The alpha path (opportunity_detector.py) is NOT imported here.
 """
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -107,17 +108,95 @@ async def _beta_has_opportunity_today(
     return q.scalar_one_or_none() is not None
 
 
+@dataclass(frozen=True)
+class _SkillSnapshot:
+    """Lightweight immutable substitute for a ModelSkill ORM row.
+
+    Used when aggregating across lead-times so that beta's per-city
+    corrections (bias, sigma, weight) activate even when any single
+    days_ahead slot has fewer than MIN_SAMPLES resolved markets.
+    The estimator accesses the same field names as ModelSkill via
+    duck typing — no changes needed there.
+    """
+    samples: int
+    hits: int
+    hit_rate: Optional[float]
+    mae_f: Optional[float]
+    bias_f: Optional[float]
+    weight: float = 1.0
+
+
 async def _load_city_skill(
     db: AsyncSession, city_id: int, days_ahead: int
 ) -> dict:
-    """Load ModelSkill rows for (city_id, days_ahead). Returns {source: row}."""
-    result = await db.execute(
-        select(ModelSkill).where(
-            ModelSkill.city_id == city_id,
-            ModelSkill.days_ahead == days_ahead,
+    """Load ModelSkill rows for (city_id, days_ahead). Returns {source: row}.
+
+    Primary path: exact days_ahead match with >= MIN_SAMPLES → use as-is.
+
+    Fallback (the key fix): when a source has fewer than MIN_SAMPLES at the
+    requested lead-time, aggregate across ALL available lead-times for that
+    (city, source) pair into a _SkillSnapshot.  This unlocks beta's per-city
+    bias/sigma/weight corrections after ~MIN_SAMPLES total resolved markets
+    instead of requiring MIN_SAMPLES *per lead-time bucket* — which was
+    effectively starving beta of calibration data for the first months of use.
+
+    When even the combined total is < MIN_SAMPLES, the thin exact row is
+    returned (if it exists) so the breakdown dict can log it; the estimator
+    naturally treats it as neutral via the MIN_SAMPLES guard in
+    _beta_source_weight.
+    """
+    from app.analyzers.model_skill import MIN_SAMPLES, skill_weight
+
+    # Load ALL lead-time rows for this city in a single query.
+    all_rows = (await db.execute(
+        select(ModelSkill).where(ModelSkill.city_id == city_id)
+    )).scalars().all()
+
+    exact: dict[str, ModelSkill] = {}
+    by_source: dict[str, list] = {}
+    for r in all_rows:
+        by_source.setdefault(r.source, []).append(r)
+        if r.days_ahead == days_ahead:
+            exact[r.source] = r
+
+    def _wgt_avg(pairs: list) -> Optional[float]:
+        total_n = sum(n for _, n in pairs)
+        return sum(v * n for v, n in pairs) / total_n if total_n > 0 else None
+
+    result: dict = {}
+    for source, rows in by_source.items():
+        exact_row = exact.get(source)
+        if exact_row is not None and (exact_row.samples or 0) >= MIN_SAMPLES:
+            # Exact lead-time has enough data — use it directly.
+            result[source] = exact_row
+            continue
+
+        # Aggregate all lead-times for this source.
+        total_samples = sum(r.samples or 0 for r in rows)
+        total_hits = sum(r.hits or 0 for r in rows)
+
+        if total_samples < MIN_SAMPLES:
+            # Still too thin combined — keep the thin exact row for breakdown
+            # logging but the estimator will treat it as neutral.
+            if exact_row is not None:
+                result[source] = exact_row
+            continue
+
+        mae_pairs = [(r.mae_f, r.samples or 0) for r in rows if r.mae_f is not None]
+        bias_pairs = [(r.bias_f, r.samples or 0) for r in rows if r.bias_f is not None]
+        agg_mae = _wgt_avg(mae_pairs)
+        agg_bias = _wgt_avg(bias_pairs)
+
+        result[source] = _SkillSnapshot(
+            samples=total_samples,
+            hits=total_hits,
+            hit_rate=round(total_hits / total_samples, 4),
+            mae_f=round(agg_mae, 2) if agg_mae is not None else None,
+            bias_f=round(agg_bias, 2) if agg_bias is not None else None,
+            weight=skill_weight(total_hits, total_samples),
         )
-    )
-    return {r.source: r for r in result.scalars().all()}
+
+    return result
 
 
 def _normalization_scale(raw_probs: list, n_market_outcomes: int) -> Optional[float]:
