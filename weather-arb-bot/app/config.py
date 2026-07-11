@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     wunderground_fetch_interval: int = 1800
     analyzer_run_interval: int = 300      # 5 min
     external_forecast_fetch_interval: int = 14400  # 4h — rate-limited external APIs
+    # Tomorrow.io budget-aware job (free tier: 25 req/h, 500/day).
+    # 20 req/run x hourly = 480/day, inside both caps.
+    tomorrowio_fetch_interval: int = 3600
+    tomorrowio_requests_per_run: int = 20
     # DWD ICON (via Open-Meteo). Written to forecasts table only — NOT yet
     # mixed into the deterministic blend. Safe to enable/disable freely.
     icon_enabled: bool = True
@@ -41,7 +45,11 @@ class Settings(BaseSettings):
     # "near" = market resolves within 1 day (days_ahead <= 1)
     # "far"  = market resolves 2+ days out (days_ahead >= 2)
     # Alert thresholds control whether an opportunity becomes a Telegram alert.
-    min_confidence_alert_near: float = 0.75
+    # NOTE: near was 0.75 which caused "why am I getting 7x% alerts when my
+    # threshold says 80" — these split values silently override
+    # min_confidence_for_alert. Defaults now aligned at 0.80; admin-set values
+    # persist in the app_settings table across restarts.
+    min_confidence_alert_near: float = 0.80
     min_confidence_alert_far: float = 0.80
     # Virtual-buy thresholds control whether a simulated 5-share position is
     # opened at alert time. Buy implies alert, so these must be >= alert thresholds.
@@ -56,6 +64,13 @@ class Settings(BaseSettings):
     # a typical 72¢ NO market price → 82.8% blended → clears the threshold.
     # Previously 0.85 silenced virtually all 90–94% raw beta signals post-blend.
     min_confidence_beta_alert: float = 0.80
+    # Beta-only VIRTUAL-BUY threshold (0.0–1.0). Beta positions are virtual —
+    # they cost nothing and are the ONLY calibration data beta gets. The alpha
+    # buy thresholds (0.90) became unreachable for beta after the market-blend
+    # step (60/40) structurally caps blended certainty around ~88%, which
+    # starved beta to ~1 virtual buy/week and froze its learning. 0.85 keeps
+    # the data flowing without touching alpha's real-alert thresholds.
+    min_confidence_beta_buy: float = 0.85
     alert_dedup_minutes: int = 30
     # Only alert for markets resolving within this many days.
     # 0 = same-day only, 1 = today+tomorrow, 3 = default.
@@ -83,8 +98,15 @@ class Settings(BaseSettings):
     model_skill_update_interval: int = 3600
 
     # Auto-suspend a city after this many consecutive high-conf (≥90%) losses.
-    # Set to 0 to disable auto-suspension entirely.
+    # Set to 0 to disable the streak rule.
     suspension_consecutive_losses: int = 3
+    # Chronic-loser rule: suspend when win rate over the last N settled
+    # high-conf trades falls below the minimum. Catches steady bleeders the
+    # streak rule never sees (a 55%-win city alternates W/L and never loses
+    # 3 in a row, yet loses money at every realistic entry price — breakeven
+    # at a 75¢ NO entry is 75% win rate). window=0 or rate=0 disables.
+    suspension_window_trades: int = 10
+    suspension_min_win_rate: float = 0.65
     # How many days to suspend. City resumes automatically when the timer expires.
     suspension_days: int = 7
     sentry_dsn: str = ""

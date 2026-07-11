@@ -640,7 +640,11 @@ async def job_fetch_models():
 
 
 async def job_fetch_external_forecasts():
-    if not tomorrowio_col.api_key and not meteosource_col.api_key:
+    """Meteosource only. Tomorrow.io moved to its own budget-aware hourly job
+    (app/workers/tomorrowio_job.py) — the free tier allows only ~25 req/h, so
+    bursting all cities from here rate-limited everyone except the first few.
+    """
+    if not meteosource_col.api_key:
         return
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
@@ -652,16 +656,10 @@ async def job_fetch_external_forecasts():
                 continue
             lat, lon = float(city.nws_lat), float(city.nws_lon)
             for d in dates:
-                if tomorrowio_col.api_key:
-                    try:
-                        await tomorrowio_col.collect_and_store(city.id, lat, lon, d, db)
-                    except Exception as e:
-                        logger.error(f"Tomorrow.io job failed for {city.name} {d}: {e}")
-                if meteosource_col.api_key:
-                    try:
-                        await meteosource_col.collect_and_store(city.id, lat, lon, d, db)
-                    except Exception as e:
-                        logger.error(f"Meteosource job failed for {city.name} {d}: {e}")
+                try:
+                    await meteosource_col.collect_and_store(city.id, lat, lon, d, db)
+                except Exception as e:
+                    logger.error(f"Meteosource job failed for {city.name} {d}: {e}")
 
 
 async def job_fetch_pireps():

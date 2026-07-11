@@ -61,6 +61,7 @@ class SettingsIn(BaseModel):
     min_confidence_buy_near: Optional[float] = None
     min_confidence_buy_far: Optional[float] = None
     min_confidence_beta_alert: Optional[float] = None
+    min_confidence_beta_buy: Optional[float] = None
 
 
 class CityCreateIn(BaseModel):
@@ -1856,6 +1857,7 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "min_confidence_buy_near": settings.min_confidence_buy_near,
         "min_confidence_buy_far": settings.min_confidence_buy_far,
         "min_confidence_beta_alert": settings.min_confidence_beta_alert,
+        "min_confidence_beta_buy": getattr(settings, "min_confidence_beta_buy", 0.85),
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -1870,34 +1872,41 @@ def _validate_unit(value: float, name: str) -> None:
 
 
 @router.patch("/settings")
-async def admin_set_settings(payload: SettingsIn, _: str = Depends(require_admin)):
+async def admin_set_settings(
+    payload: SettingsIn,
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.utils.settings_store import save_setting_override
+
+    changed: dict = {}
+
     if payload.min_confidence_for_alert is not None:
         if not (0 <= payload.min_confidence_for_alert <= 100):
             raise HTTPException(400, "min_confidence_for_alert must be 0-100")
-        settings.min_confidence_for_alert = payload.min_confidence_for_alert
+        changed["min_confidence_for_alert"] = payload.min_confidence_for_alert
     if payload.min_edge_for_alert is not None:
         if not (0.0 <= payload.min_edge_for_alert <= 1.0):
             raise HTTPException(400, "min_edge_for_alert must be 0.0-1.0")
-        settings.min_edge_for_alert = payload.min_edge_for_alert
+        changed["min_edge_for_alert"] = payload.min_edge_for_alert
     if payload.max_days_ahead_for_alert is not None:
         if not (0 <= payload.max_days_ahead_for_alert <= 14):
             raise HTTPException(400, "max_days_ahead_for_alert must be 0-14")
-        settings.max_days_ahead_for_alert = payload.max_days_ahead_for_alert
-    if payload.min_confidence_alert_near is not None:
-        _validate_unit(payload.min_confidence_alert_near, "min_confidence_alert_near")
-        settings.min_confidence_alert_near = payload.min_confidence_alert_near
-    if payload.min_confidence_alert_far is not None:
-        _validate_unit(payload.min_confidence_alert_far, "min_confidence_alert_far")
-        settings.min_confidence_alert_far = payload.min_confidence_alert_far
-    if payload.min_confidence_buy_near is not None:
-        _validate_unit(payload.min_confidence_buy_near, "min_confidence_buy_near")
-        settings.min_confidence_buy_near = payload.min_confidence_buy_near
-    if payload.min_confidence_buy_far is not None:
-        _validate_unit(payload.min_confidence_buy_far, "min_confidence_buy_far")
-        settings.min_confidence_buy_far = payload.min_confidence_buy_far
-    if payload.min_confidence_beta_alert is not None:
-        _validate_unit(payload.min_confidence_beta_alert, "min_confidence_beta_alert")
-        settings.min_confidence_beta_alert = payload.min_confidence_beta_alert
+        changed["max_days_ahead_for_alert"] = payload.max_days_ahead_for_alert
+    for unit_key in (
+        "min_confidence_alert_near", "min_confidence_alert_far",
+        "min_confidence_buy_near", "min_confidence_buy_far",
+        "min_confidence_beta_alert", "min_confidence_beta_buy",
+    ):
+        val = getattr(payload, unit_key, None)
+        if val is not None:
+            _validate_unit(val, unit_key)
+            changed[unit_key] = val
+
+    # Apply in-memory (immediate effect) AND persist (survives restart).
+    for key, val in changed.items():
+        setattr(settings, key, val)
+        await save_setting_override(db, key, val)
     if settings.min_confidence_buy_near < settings.min_confidence_alert_near:
         logger.warning(
             f"min_confidence_buy_near ({settings.min_confidence_buy_near}) < "
