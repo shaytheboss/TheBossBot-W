@@ -126,15 +126,61 @@ def _city_is_suspended(city: City) -> bool:
     return city.suspended_until > datetime.now(timezone.utc)
 
 
-async def _auto_suspend_check(db: AsyncSession, city: City) -> None:
-    """Auto-suspend city after N consecutive high-confidence losses.
+def _suspension_verdict(
+    statuses: list,
+    streak_threshold: int,
+    window_trades: int,
+    min_win_rate: float,
+) -> Optional[str]:
+    """Decide whether a city should be suspended based on its recent record.
 
-    Reads the last (threshold + 2) settled high-confidence opportunities for
-    the city.  If the tail is all losses, sets suspended_until and logs.
-    Clears an expired suspension silently.
+    statuses: settled high-conf virtual statuses, MOST-RECENT FIRST.
+    Two independent triggers (either fires):
+      1. Streak: the last `streak_threshold` trades are all losses — catches
+         sudden collapses fast.
+      2. Chronic: win rate over the last `window_trades` settled trades is
+         below `min_win_rate` — catches cities that bleed steadily without
+         ever losing N in a row (Kuala Lumpur archetype: W-L-W-L-L-W at 56%
+         never trips the streak rule but loses money at every realistic
+         entry price — breakeven at a 75¢ NO entry is 75% win rate).
+
+    Returns a human-readable reason string, or None. Pure for testability.
     """
-    threshold = int(getattr(settings, "suspension_consecutive_losses", 0))
-    if threshold <= 0:
+    if streak_threshold > 0:
+        streak = 0
+        for s in statuses:
+            if s == "loss":
+                streak += 1
+            else:
+                break
+        if streak >= streak_threshold:
+            return f"Auto-suspended: {streak} consecutive high-confidence losses"
+
+    if window_trades > 0 and 0.0 < min_win_rate <= 1.0:
+        window = statuses[:window_trades]
+        if len(window) >= window_trades:
+            wins = sum(1 for s in window if s == "win")
+            rate = wins / len(window)
+            if rate < min_win_rate:
+                return (
+                    f"Auto-suspended: chronic loser — {wins}/{len(window)} wins "
+                    f"({rate*100:.0f}%) over last {len(window)} high-conf trades "
+                    f"(minimum {min_win_rate*100:.0f}%)"
+                )
+    return None
+
+
+async def _auto_suspend_check(db: AsyncSession, city: City) -> None:
+    """Auto-suspend a city on a loss streak OR a chronically low win rate.
+
+    Reads the last max(streak+2, window) settled high-confidence opportunities
+    for the city and applies _suspension_verdict. Clears an expired suspension
+    silently.
+    """
+    streak_threshold = int(getattr(settings, "suspension_consecutive_losses", 0))
+    window_trades = int(getattr(settings, "suspension_window_trades", 0))
+    min_win_rate = float(getattr(settings, "suspension_min_win_rate", 0.0))
+    if streak_threshold <= 0 and (window_trades <= 0 or min_win_rate <= 0):
         return
 
     # Clear an expired suspension
@@ -148,7 +194,7 @@ async def _auto_suspend_check(db: AsyncSession, city: City) -> None:
     if _city_is_suspended(city):
         return  # still suspended, nothing to do
 
-    # Count consecutive losses at the tail (most-recent first)
+    fetch_n = max(streak_threshold + 2, window_trades)
     result = await db.execute(
         select(Opportunity.virtual_status)
         .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
@@ -159,28 +205,17 @@ async def _auto_suspend_check(db: AsyncSession, city: City) -> None:
             Opportunity.confidence_score >= 90,
         )
         .order_by(Opportunity.detected_at.desc())
-        .limit(threshold + 2)
+        .limit(fetch_n)
     )
     statuses = [r.virtual_status for r in result.all()]
 
-    streak = 0
-    for s in statuses:
-        if s == "loss":
-            streak += 1
-        else:
-            break
-
-    if streak >= threshold:
+    reason = _suspension_verdict(statuses, streak_threshold, window_trades, min_win_rate)
+    if reason:
         days = int(getattr(settings, "suspension_days", 7))
         city.suspended_until = datetime.now(timezone.utc) + timedelta(days=days)
-        city.suspension_reason = (
-            f"Auto-suspended: {streak} consecutive high-confidence losses"
-        )
+        city.suspension_reason = reason
         await db.commit()
-        logger.warning(
-            f"City {city.name} auto-suspended for {days} days "
-            f"({streak} consecutive high-conf losses)."
-        )
+        logger.warning(f"City {city.name} auto-suspended for {days} days — {reason}")
 
 
 async def _has_opportunity_today(db: AsyncSession, outcome_id: int, side: str) -> bool:

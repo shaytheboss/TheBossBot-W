@@ -309,7 +309,17 @@ async def _beta_evaluate_opportunity(
 
     is_blacklisted = bool(getattr(city, "blacklisted", False))
     is_suspended = _beta_city_is_suspended(city)
-    create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted and not is_suspended
+    # Beta uses its OWN virtual-buy threshold, not alpha's buy_thresh (0.90).
+    # The market-blend step (60/40 pull toward market price) structurally caps
+    # beta's blended certainty around ~88%, so alpha's gate became unreachable
+    # and beta collapsed from ~125 virtual buys/week to ~1/week — with no
+    # positions there is no calibration data. Beta buys are virtual-only, so
+    # the lower gate costs nothing and keeps the learning loop alive.
+    beta_buy_thresh = max(
+        float(getattr(settings, "min_confidence_beta_buy", 0.85)),
+        alert_thresh,
+    )
+    create_virtual_buy = (certainty >= beta_buy_thresh) and not is_blacklisted and not is_suspended
 
     # Beta-scoped dedup: only looks at beta rows
     if (

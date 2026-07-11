@@ -39,6 +39,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Startup seed failed: {e}", exc_info=True)
 
+    # Re-apply persisted admin-set thresholds BEFORE the scheduler starts, so
+    # the first analyzer run already uses them (previously every restart
+    # silently reverted to config defaults — e.g. alert threshold back to 0.75).
+    try:
+        from app.database import AsyncSessionLocal
+        from app.utils.settings_store import load_setting_overrides
+        async with AsyncSessionLocal() as db:
+            await load_setting_overrides(db)
+    except Exception as e:
+        logger.error(f"Failed to load persisted settings: {e}", exc_info=True)
+
     if settings.telegram_bot_token:
         from app.bot.telegram_bot import get_app
         _bot_app = get_app()
@@ -54,6 +65,8 @@ async def lifespan(app: FastAPI):
             job_run_analyzer, job_check_resolutions,
             job_fetch_external_forecasts, job_run_intraday,
         )
+        from app.workers.icon_job import job_fetch_icon
+        from app.workers.tomorrowio_job import job_fetch_tomorrowio
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
 
@@ -67,10 +80,25 @@ async def lifespan(app: FastAPI):
                            id="nws", next_run_time=now, max_instances=1, misfire_grace_time=300)
         _scheduler.add_job(job_fetch_models, IntervalTrigger(seconds=3600),
                            id="models", next_run_time=now, max_instances=1, misfire_grace_time=600)
+        # ICON (DWD via Open-Meteo). The job existed since day one but was never
+        # scheduled — collector_miss showed 100% no_data for all cities. Wired in
+        # with its own id so it can be tracked separately from GFS/ECMWF.
+        if getattr(settings, "icon_enabled", True):
+            _scheduler.add_job(job_fetch_icon,
+                               IntervalTrigger(seconds=getattr(settings, "icon_fetch_interval", 3600)),
+                               id="icon", next_run_time=now, max_instances=1, misfire_grace_time=600)
         _scheduler.add_job(job_fetch_external_forecasts,
                            IntervalTrigger(seconds=settings.external_forecast_fetch_interval),
                            id="external_forecasts", next_run_time=now,
                            max_instances=1, misfire_grace_time=600)
+        # Tomorrow.io runs on its own budget-aware hourly job (free tier allows
+        # only 25 req/h, 500/day). The old shared external job burst 144 calls
+        # at once and got rate-limited for every city except the first few.
+        if settings.tomorrowio_api_key:
+            _scheduler.add_job(job_fetch_tomorrowio,
+                               IntervalTrigger(seconds=getattr(settings, "tomorrowio_fetch_interval", 3600)),
+                               id="tomorrowio", next_run_time=now,
+                               max_instances=1, misfire_grace_time=600)
         _scheduler.add_job(job_fetch_pireps, IntervalTrigger(seconds=900),
                            id="pireps", next_run_time=now, max_instances=1, misfire_grace_time=120)
         _scheduler.add_job(job_fetch_polymarket, IntervalTrigger(seconds=settings.polymarket_fetch_interval),

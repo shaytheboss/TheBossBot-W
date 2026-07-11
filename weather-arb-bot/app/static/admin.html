@@ -1866,7 +1866,8 @@ async function loadSettings() {
       <tr><td colspan="2" class="small">Buy threshold must be ≥ alert threshold (since buy implies alert). The detector clamps automatically if not.</td></tr>
       <tr><td colspan="2" style="padding-top:14px;font-weight:600;">[β] Beta estimator alert gate (0.0–1.0)</td></tr>
       <tr><td>Beta alert threshold (post-blend)</td><td><input id="set-cba" type="number" step="0.01" min="0" max="1" value="${s.min_confidence_beta_alert}" /></td></tr>
-      <tr><td colspan="2" class="small">Applied after the 60/40 market-blend. At 72¢ NO market, 90% raw beta → 82.8% blended. Set to 0.80 to allow 90%+ signals through.</td></tr>
+      <tr><td>Beta virtual-buy threshold (post-blend)</td><td><input id="set-cbb" type="number" step="0.01" min="0" max="1" value="${s.min_confidence_beta_buy}" /></td></tr>
+      <tr><td colspan="2" class="small">Applied after the 60/40 market-blend. At 72¢ NO market, 90% raw beta → 82.8% blended. Beta buys are virtual-only (free learning data) — keep the buy gate low enough that beta keeps trading; alpha's real thresholds are unaffected. Settings now persist across restarts.</td></tr>
       <tr><td>METAR interval (s)</td><td>${s.metar_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Polymarket interval (s)</td><td>${s.polymarket_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Analyzer interval (s)</td><td>${s.analyzer_run_interval} <span class="small">(restart)</span></td></tr>
@@ -1887,6 +1888,7 @@ async function saveSettings() {
     min_confidence_buy_near: parseFloat(document.getElementById('set-cbn').value),
     min_confidence_buy_far: parseFloat(document.getElementById('set-cbf').value),
     min_confidence_beta_alert: parseFloat(document.getElementById('set-cba').value),
+    min_confidence_beta_buy: parseFloat(document.getElementById('set-cbb').value),
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
