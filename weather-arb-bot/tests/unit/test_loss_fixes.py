@@ -151,9 +151,11 @@ def test_near_money_warning_absent_when_flag_not_set():
     assert "NEAR-MONEY BUCKET" not in text
 
 
-def test_calibration_gate_note_shown_when_flag_set():
-    signals = _make_signals(calibration_gated=True)
-    # Slightly lower calibrated confidence to surface the gate note
+def test_calibration_caution_when_gated_but_buy_opened():
+    """Calibration is display-only: when the flag is set BUT a virtual buy was
+    actually opened, the footer must be a caution — never the false 'no virtual
+    buy' claim it used to print."""
+    signals = _make_signals(calibration_gated=True)   # _create_virtual_buy=True
     signals["_calibrated_confidence"] = 88
     text = fmt_opportunity(
         city_name="Denver",
@@ -167,7 +169,30 @@ def test_calibration_gate_note_shown_when_flag_set():
         side="NO",
         event_date=date(2026, 6, 15),
     )
+    assert "Calibration caution" in text
+    assert "no virtual buy" not in text
+
+
+def test_calibration_gate_block_when_no_buy():
+    """When the buy truly was NOT created, the real block wording is shown."""
+    signals = _make_signals(calibration_gated=True)
+    signals["_calibrated_confidence"] = 88
+    signals["_create_virtual_buy"] = False
+    signals["_city_blacklisted"] = True
+    text = fmt_opportunity(
+        city_name="Denver",
+        market_question="What will Denver's high be on Jun 15?",
+        bucket_label="92-93°F",
+        market_price=0.10,
+        true_prob=0.07,
+        edge=0.08,
+        confidence=93,
+        signals=signals,
+        side="NO",
+        event_date=date(2026, 6, 15),
+    )
     assert "Calibration gate" in text
+    assert "no virtual buy" in text
 
 
 def test_calibration_gate_note_absent_when_not_gated():
