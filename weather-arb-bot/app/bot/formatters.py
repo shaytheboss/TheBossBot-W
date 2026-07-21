@@ -87,6 +87,8 @@ def _risk_scorecard(
     entry_cost: Optional[float],
     alert_threshold: float,
     buy_threshold: float,
+    virtual_buy_opened: Optional[bool] = None,
+    no_buy_reason: Optional[str] = None,
 ) -> str:
     """Build the full decision scorecard that appears at the top of each alert.
 
@@ -128,7 +130,18 @@ def _risk_scorecard(
     margin_pp = side_prob_pct - thresh_pct
     if side_prob_pct >= buy_pct:
         conf_level = 0
-        conf_note = f"above buy threshold ({buy_pct}%) — virtual position opened"
+        # Reflect the ACTUAL buy decision, not just the threshold. A confidence
+        # above the buy threshold does not guarantee a buy — the city may be
+        # blacklisted/suspended. (Calibration is display-only and does NOT block
+        # the buy.) Saying "virtual position opened" when none was opened — or
+        # vice-versa — is the contradiction users hit ("opened" up top, "no buy"
+        # at the bottom). virtual_buy_opened=None keeps the legacy wording for
+        # callers that don't pass the real status.
+        if virtual_buy_opened is False:
+            reason = f" ({no_buy_reason})" if no_buy_reason else ""
+            conf_note = f"above buy threshold ({buy_pct}%) — no virtual buy{reason}"
+        else:
+            conf_note = f"above buy threshold ({buy_pct}%) — virtual position opened"
     elif side_prob_pct >= thresh_pct + 5:
         conf_level = 0
         conf_note = f"+{margin_pp}pp above alert threshold ({thresh_pct}%)"
@@ -142,9 +155,17 @@ def _risk_scorecard(
 
     # ── 2. Source coverage ──────────────────────────────────────────────────
     sparse = blend.get("sparse_sources") or {}
-    n_global = int(sparse.get("n_global_det") or
-                   len(blend.get("deterministic") or []))  # fallback
-    baseline = int(sparse.get("baseline") or 5)
+    # "X/N global models" counts GLOBAL sources only. Prefer the always-present
+    # breakdown field; fall back to the legacy sparse dict; last resort count
+    # the deterministic rows but never claim MORE than the baseline (the old
+    # fallback counted all 7 det models incl. CONUS-only HRRR/NWS → "7/5").
+    baseline = int(blend.get("n_global_baseline") or sparse.get("baseline") or 5)
+    n_global = blend.get("n_global_det")
+    if n_global is None:
+        n_global = sparse.get("n_global_det")
+    if n_global is None:
+        n_global = min(len(blend.get("deterministic") or []), baseline)
+    n_global = int(n_global)
     missing_global = blend.get("missing_sources") or []
     missing_no_key = blend.get("missing_no_key") or []
     missing_conus = blend.get("missing_conus_only") or []
@@ -714,6 +735,14 @@ def fmt_opportunity(
     bottom_line_section = f"\n\n\U0001f4a1 *Bottom line*\n{bottom_line}" if bottom_line else ""
 
     # ── Risk scorecard ──────────────────────────────────────────────────────
+    # Real buy status + reason, so the scorecard matches what actually happened.
+    _buy_opened = signals.get("_create_virtual_buy")
+    _no_buy_reason = None
+    if _buy_opened is False:
+        if signals.get("_city_blacklisted"):
+            _no_buy_reason = "city blacklisted"
+        elif signals.get("_city_suspended"):
+            _no_buy_reason = "city suspended"
     risk_line = _risk_scorecard(
         blend=blend,
         side=side,
@@ -724,6 +753,8 @@ def fmt_opportunity(
         entry_cost=signals.get("_entry_cost"),
         alert_threshold=float(signals.get("_alert_threshold") or 0.75),
         buy_threshold=float(signals.get("_buy_threshold") or 0.90),
+        virtual_buy_opened=(None if _buy_opened is None else bool(_buy_opened)),
+        no_buy_reason=_no_buy_reason,
     )
 
     # ── Per-source forecast breakdown ─────────────────────────────────────────
@@ -1079,12 +1110,27 @@ def fmt_opportunity(
     if calibrated_conf is not None and abs(calibrated_conf - confidence) >= 2:
         direction = "↓" if calibrated_conf < confidence else "↑"
         calib_note = f" → calibrated {direction}{calibrated_conf}%"
+    # Calibration is DISPLAY-ONLY: _calibration_gated flags that the empirical
+    # win rate for this band is below the buy threshold, but it does NOT block
+    # the buy (create_virtual_buy ignores it). The old text claimed "no virtual
+    # buy", contradicting the position that was actually opened above. Only call
+    # it a real block when the buy truly wasn't created; otherwise word it as a
+    # caution.
     calibration_gated = signals.get("_calibration_gated", False)
-    calib_gate_note = (
-        "\n⛔ _Calibration gate: raw confidence cleared the buy threshold but "
-        "historical win rate for this confidence band is lower — no virtual buy._"
-        if calibration_gated else ""
-    )
+    buy_opened = signals.get("_create_virtual_buy")
+    if calibration_gated and buy_opened is False:
+        calib_gate_note = (
+            "\n⛔ _Calibration gate: raw confidence cleared the buy threshold but "
+            "historical win rate for this band is lower — no virtual buy._"
+        )
+    elif calibration_gated:
+        calib_gate_note = (
+            "\n⚠️ _Calibration caution: historical win rate for this confidence "
+            "band is below the raw estimate — treat the edge as thinner than it "
+            "looks._"
+        )
+    else:
+        calib_gate_note = ""
     certainty_note = (
         f"\n⚠️ Certainty: {confidence}%{calib_note} "
         f"(directional confidence = max(P(YES), P(NO)) of our blend)"

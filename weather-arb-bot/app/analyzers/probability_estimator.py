@@ -569,6 +569,13 @@ def estimate_with_breakdown(
     breakdown["missing_sources"] = missing_sources          # global, no data
     breakdown["missing_no_key"] = missing_no_key            # global, API key not configured
     breakdown["missing_conus_only"] = missing_conus_only    # CONUS-only, N/A for intl cities
+    # Always expose the global-source coverage so the formatter never has to
+    # guess. Previously these lived only inside breakdown["sparse_sources"],
+    # which is populated ONLY when a source is missing — so on full coverage
+    # the formatter fell back to counting ALL deterministic models (incl.
+    # CONUS-only HRRR/NWS) and printed nonsense like "7/5 global models".
+    breakdown["n_global_det"] = n_global_det
+    breakdown["n_global_baseline"] = _SPARSE_SOURCE_BASELINE
 
     # ensemble_vals was pooled (and bias-shifted per parent model) above, before
     # sigma was derived from its spread.

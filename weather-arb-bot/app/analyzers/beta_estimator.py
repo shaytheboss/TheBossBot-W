@@ -510,6 +510,10 @@ def beta_estimate_with_breakdown(
     breakdown["missing_sources"] = missing_sources
     breakdown["missing_no_key"] = missing_no_key
     breakdown["missing_conus_only"] = missing_conus_only
+    # Always expose global-source coverage (see probability_estimator note): the
+    # formatter reads these directly instead of over-counting all det models.
+    breakdown["n_global_det"] = n_global_det
+    breakdown["n_global_baseline"] = _SPARSE_SOURCE_BASELINE
 
     ens_p = _ensemble_bucket_prob(ensemble_vals, bucket_min, bucket_max, unit=bucket_unit)
     if ens_p is not None:
