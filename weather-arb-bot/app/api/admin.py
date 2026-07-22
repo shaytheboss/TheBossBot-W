@@ -131,6 +131,14 @@ async def admin_discover(_: str = Depends(require_admin)):
     return {"ok": True, **stats}
 
 
+@router.post("/prune-old-data")
+async def admin_prune_old_data(_: str = Depends(require_admin)):
+    """Run the retention/de-dup job on demand (also runs daily on a schedule)."""
+    from app.workers.retention_job import job_prune_old_data
+    summary = await job_prune_old_data()
+    return {"ok": True, **summary}
+
+
 # Resolution uses the shared temp_in_bucket() helper (app/utils/units.py) so the
 # admin force-resolve path and the scheduled job_check_resolutions path apply
 # identical, float-dust-safe bucket math.

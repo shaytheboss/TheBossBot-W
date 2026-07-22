@@ -109,6 +109,23 @@ class Settings(BaseSettings):
     suspension_min_win_rate: float = 0.65
     # How many days to suspend. City resumes automatically when the timer expires.
     suspension_days: int = 7
+    # ── Data retention (cost control) ───────────────────────────────────────
+    # A daily job de-dups forecasts (keeps the latest per city/source/target/
+    # made-day — exactly what the analyzer and model_skill read) and prunes old
+    # rows. Windows exceed every computation window so no feature loses data:
+    # model_skill reads 90d of forecasts, bias_estimator 14d of METAR.
+    # De-dup is lossless (removes only intra-day duplicate forecasts no reader
+    # uses) → safe, ON by default. Hard prune DESTROYS old history → OFF by
+    # default until backups exist. retention_enabled kept as a master switch.
+    retention_enabled: bool = True
+    retention_dedup_enabled: bool = True
+    retention_prune_enabled: bool = False
+    retention_run_interval: int = 86400   # daily
+    forecast_retention_days: int = 120
+    metar_retention_days: int = 45
+    market_price_retention_days: int = 45
+    pirep_retention_days: int = 21
+    collector_miss_retention_days: int = 90
     sentry_dsn: str = ""
 
     @property
