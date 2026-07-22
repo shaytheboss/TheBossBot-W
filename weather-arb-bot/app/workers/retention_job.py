@@ -34,9 +34,66 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import text
 
 from app.config import settings
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, engine
 
 logger = logging.getLogger(__name__)
+
+# Maps a delete-summary key to the physical table it affected, so we VACUUM
+# exactly the tables that changed.
+_SUMMARY_KEY_TO_TABLE = {
+    "forecasts_deduped": "forecasts",
+    "forecasts_pruned": "forecasts",
+    "metar_observations_pruned": "metar_observations",
+    "market_prices_pruned": "market_prices",
+    "pireps_pruned": "pireps",
+    "collector_miss_pruned": "collector_miss",
+}
+
+
+def vacuum_targets(deleted: dict, vacuum_full: bool) -> list[str]:
+    """Pure helper: which tables to VACUUM after a prune run.
+
+    VACUUM only the tables that actually had rows removed. For a full vacuum
+    (one-time disk reclaim) always include `forecasts` — the big bloated table —
+    even if this particular run deleted nothing new. Pure → unit-testable.
+    """
+    tables: list[str] = []
+    for key, n in (deleted or {}).items():
+        table = _SUMMARY_KEY_TO_TABLE.get(key)
+        if n and table and table not in tables:
+            tables.append(table)
+    if vacuum_full and "forecasts" not in tables:
+        tables.append("forecasts")
+    return tables
+
+
+async def _run_vacuum(tables: list[str], full: bool = False) -> int:
+    """Run VACUUM on the given tables. Never raises.
+
+    Plain VACUUM (default) does NOT take an exclusive lock — safe on a live DB;
+    it reclaims dead tuples for reuse so the table stops bloating. VACUUM FULL
+    rewrites the table to a fresh file and RETURNS disk to the OS (shrinks the
+    Volume), but takes an exclusive lock for its duration — intended for a
+    one-time reclaim right after the first big de-dup.
+
+    VACUUM cannot run inside a transaction, so we use an AUTOCOMMIT engine.
+    """
+    if not tables:
+        return 0
+    mode = "FULL, ANALYZE" if full else "ANALYZE"
+    done = 0
+    try:
+        ac_engine = engine.execution_options(isolation_level="AUTOCOMMIT")
+        async with ac_engine.connect() as conn:
+            for t in tables:
+                try:
+                    await conn.execute(text(f"VACUUM ({mode}) {t}"))
+                    done += 1
+                except Exception as e:
+                    logger.error(f"[retention] VACUUM {t} failed: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"[retention] VACUUM setup failed: {e}", exc_info=True)
+    return done
 
 
 def compute_cutoffs(now: datetime, today: date, cfg) -> dict:
@@ -79,8 +136,8 @@ async def _exec_count(db, sql: str, params: dict | None = None) -> int:
         return 0
 
 
-async def job_prune_old_data() -> dict:
-    """Daily maintenance. Two independent, separately-gated steps:
+async def job_prune_old_data(vacuum_full: bool = False) -> dict:
+    """Daily maintenance. Independent, separately-gated steps:
 
       • DE-DUP (settings.retention_dedup_enabled, default ON): lossless — removes
         only intra-day duplicate forecast rows no reader ever uses. Safe to run
@@ -135,4 +192,18 @@ async def job_prune_old_data() -> dict:
     total = sum(summary.values())
     if total:
         logger.info(f"[retention] deduped/pruned {total} rows: {summary}")
+
+    # ── 3. VACUUM (outside any transaction, autocommit) ─────────────────────────
+    # Plain VACUUM keeps bloat in check (safe, non-locking). vacuum_full=True does
+    # a one-time disk reclaim (locks the table briefly) — use it once after the
+    # first big de-dup to actually shrink the Railway Volume.
+    if getattr(settings, "retention_vacuum_enabled", True) or vacuum_full:
+        targets = vacuum_targets(summary, vacuum_full)
+        if targets:
+            n = await _run_vacuum(targets, full=vacuum_full)
+            summary["tables_vacuumed"] = n
+            logger.info(
+                f"[retention] VACUUM{' FULL' if vacuum_full else ''} on {targets} "
+                f"({n} table(s))"
+            )
     return summary

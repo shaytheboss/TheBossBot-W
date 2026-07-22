@@ -120,6 +120,9 @@ class Settings(BaseSettings):
     retention_enabled: bool = True
     retention_dedup_enabled: bool = True
     retention_prune_enabled: bool = False
+    # Plain VACUUM after each run keeps table bloat in check (safe, non-locking).
+    # A one-time VACUUM FULL (via the admin endpoint) actually shrinks the disk.
+    retention_vacuum_enabled: bool = True
     retention_run_interval: int = 86400   # daily
     forecast_retention_days: int = 120
     metar_retention_days: int = 45
