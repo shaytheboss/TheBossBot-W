@@ -132,10 +132,18 @@ async def admin_discover(_: str = Depends(require_admin)):
 
 
 @router.post("/prune-old-data")
-async def admin_prune_old_data(_: str = Depends(require_admin)):
-    """Run the retention/de-dup job on demand (also runs daily on a schedule)."""
+async def admin_prune_old_data(
+    full: bool = Query(default=False, description="Run VACUUM FULL to reclaim disk (locks tables briefly)"),
+    _: str = Depends(require_admin),
+):
+    """Run the retention/de-dup job on demand (also runs daily on a schedule).
+
+    Pass ?full=true ONCE after the first big de-dup to actually shrink the disk
+    (Railway Volume). VACUUM FULL takes a brief exclusive lock on the table; the
+    fetch/analyzer jobs simply wait and retry, so it is safe to run live.
+    """
     from app.workers.retention_job import job_prune_old_data
-    summary = await job_prune_old_data()
+    summary = await job_prune_old_data(vacuum_full=full)
     return {"ok": True, **summary}
 
 

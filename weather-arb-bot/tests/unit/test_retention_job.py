@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from app.workers.retention_job import compute_cutoffs
+from app.workers.retention_job import compute_cutoffs, vacuum_targets
 from app.config import settings
 import app.analyzers.model_skill as ms
 import app.analyzers.bias_estimator as be
@@ -39,6 +39,39 @@ class TestRetentionWindowsSafe:
         the user turns it on (after backups)."""
         assert settings.retention_dedup_enabled is True
         assert settings.retention_prune_enabled is False
+
+
+# ── 1b. VACUUM target selection ────────────────────────────────────────────────
+
+class TestVacuumTargets:
+    def test_only_tables_with_deletes(self):
+        summary = {"forecasts_deduped": 1000, "metar_observations_pruned": 0}
+        assert vacuum_targets(summary, vacuum_full=False) == ["forecasts"]
+
+    def test_nothing_deleted_no_vacuum(self):
+        assert vacuum_targets({"forecasts_deduped": 0}, vacuum_full=False) == []
+
+    def test_full_always_includes_forecasts(self):
+        """A one-time full reclaim vacuums forecasts even if nothing was deleted
+        this run (the bloat is from prior runs)."""
+        assert vacuum_targets({}, vacuum_full=True) == ["forecasts"]
+
+    def test_no_duplicate_forecasts_entry(self):
+        summary = {"forecasts_deduped": 5, "forecasts_pruned": 3}
+        assert vacuum_targets(summary, vacuum_full=True) == ["forecasts"]
+
+    def test_multiple_pruned_tables(self):
+        summary = {
+            "forecasts_deduped": 10, "market_prices_pruned": 4,
+            "pireps_pruned": 2, "collector_miss_pruned": 0,
+        }
+        t = vacuum_targets(summary, vacuum_full=False)
+        assert set(t) == {"forecasts", "market_prices", "pireps"}
+        assert "collector_miss" not in t
+
+    def test_ignores_non_table_keys(self):
+        """Keys like tables_vacuumed must not be treated as tables."""
+        assert vacuum_targets({"tables_vacuumed": 3}, vacuum_full=False) == []
 
 
 # ── 2. compute_cutoffs is correct arithmetic ───────────────────────────────────
