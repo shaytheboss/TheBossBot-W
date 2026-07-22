@@ -80,44 +80,59 @@ async def _exec_count(db, sql: str, params: dict | None = None) -> int:
 
 
 async def job_prune_old_data() -> dict:
-    """Daily de-dup + retention prune. Returns a summary dict for logging/admin."""
-    if not getattr(settings, "retention_enabled", True):
+    """Daily maintenance. Two independent, separately-gated steps:
+
+      • DE-DUP (settings.retention_dedup_enabled, default ON): lossless — removes
+        only intra-day duplicate forecast rows no reader ever uses. Safe to run
+        without any backup.
+
+      • HARD PRUNE (settings.retention_prune_enabled, default OFF): deletes rows
+        older than the retention windows. This DESTROYS historical data, so it
+        stays off until backups are in place (see backup_job / archive plan).
+
+    Returns a summary dict for logging/admin.
+    """
+    dedup_on = bool(getattr(settings, "retention_dedup_enabled", True))
+    prune_on = bool(getattr(settings, "retention_prune_enabled", False))
+    if not dedup_on and not prune_on:
         return {}
 
     summary: dict[str, int] = {}
     async with AsyncSessionLocal() as db:
-        # ── 1. De-duplicate forecasts (keep latest per city/source/target/made-day)
-        #    Postgres window function; matches exactly what the readers use.
-        summary["forecasts_deduped"] = await _exec_count(db, f"""
-            DELETE FROM forecasts f
-            USING (
-                SELECT id, ROW_NUMBER() OVER (
-                    PARTITION BY city_id, source, forecast_for_date,
-                                 (retrieved_at AT TIME ZONE 'UTC')::date
-                    ORDER BY retrieved_at DESC
-                ) AS rn
-                FROM forecasts
-                WHERE retrieved_at < now() - {_DEDUP_SETTLE}
-            ) d
-            WHERE f.id = d.id AND d.rn > 1
-        """)
-        await db.commit()
-
-        # ── 2. Retention deletes (Python-computed cutoffs → portable & tested) ──
-        cutoffs = compute_cutoffs(datetime.now(timezone.utc), date.today(), settings)
-        for key, table, col in (
-            ("forecast_date",     "forecasts",           "forecast_for_date"),
-            ("metar_ts",          "metar_observations",  "observed_at"),
-            ("market_price_ts",   "market_prices",       "timestamp"),
-            ("pirep_ts",          "pireps",              "observed_at"),
-            ("collector_miss_ts", "collector_miss",      "detected_at"),
-        ):
-            summary[f"{table}_pruned"] = await _exec_count(
-                db, f"DELETE FROM {table} WHERE {col} < :c", {"c": cutoffs[key]}
-            )
+        # ── 1. De-duplicate forecasts (lossless — keep latest per
+        #    city/source/target/made-day, exactly what the readers use) ──────────
+        if dedup_on:
+            summary["forecasts_deduped"] = await _exec_count(db, f"""
+                DELETE FROM forecasts f
+                USING (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY city_id, source, forecast_for_date,
+                                     (retrieved_at AT TIME ZONE 'UTC')::date
+                        ORDER BY retrieved_at DESC
+                    ) AS rn
+                    FROM forecasts
+                    WHERE retrieved_at < now() - {_DEDUP_SETTLE}
+                ) d
+                WHERE f.id = d.id AND d.rn > 1
+            """)
             await db.commit()
+
+        # ── 2. Retention deletes — OFF by default (destroys history) ────────────
+        if prune_on:
+            cutoffs = compute_cutoffs(datetime.now(timezone.utc), date.today(), settings)
+            for key, table, col in (
+                ("forecast_date",     "forecasts",           "forecast_for_date"),
+                ("metar_ts",          "metar_observations",  "observed_at"),
+                ("market_price_ts",   "market_prices",       "timestamp"),
+                ("pirep_ts",          "pireps",              "observed_at"),
+                ("collector_miss_ts", "collector_miss",      "detected_at"),
+            ):
+                summary[f"{table}_pruned"] = await _exec_count(
+                    db, f"DELETE FROM {table} WHERE {col} < :c", {"c": cutoffs[key]}
+                )
+                await db.commit()
 
     total = sum(summary.values())
     if total:
-        logger.info(f"[retention] pruned/deduped {total} rows: {summary}")
+        logger.info(f"[retention] deduped/pruned {total} rows: {summary}")
     return summary

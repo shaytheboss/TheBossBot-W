@@ -34,6 +34,12 @@ class TestRetentionWindowsSafe:
         ):
             assert getattr(settings, attr) > 0
 
+    def test_dedup_on_prune_off_by_default(self):
+        """Lossless de-dup ships enabled; destructive hard-prune stays OFF until
+        the user turns it on (after backups)."""
+        assert settings.retention_dedup_enabled is True
+        assert settings.retention_prune_enabled is False
+
 
 # ── 2. compute_cutoffs is correct arithmetic ───────────────────────────────────
 
