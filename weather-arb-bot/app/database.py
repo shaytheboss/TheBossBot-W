@@ -17,12 +17,20 @@ def _async_url(url: str) -> str:
 import os
 _ECHO = os.getenv("SQLALCHEMY_ECHO", "").lower() in ("1", "true", "yes")
 
+# Pool sized for a single low-traffic instance. The old 10+20 (up to 30
+# connections) held far more asyncpg buffers than this workload needs and was a
+# standing RAM cost on Railway. 5+2 is ample for the scheduler + admin UI +
+# webhook; overridable via env if a burst ever needs more.
+_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
+
 engine = create_async_engine(
     _async_url(settings.database_url),
     echo=_ECHO,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=_POOL_SIZE,
+    max_overflow=_MAX_OVERFLOW,
+    pool_recycle=1800,   # drop idle conns after 30 min so RAM doesn't sit pinned
 )
 
 AsyncSessionLocal = async_sessionmaker(

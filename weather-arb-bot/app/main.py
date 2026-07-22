@@ -1,7 +1,7 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import sentry_sdk
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -67,6 +67,7 @@ async def lifespan(app: FastAPI):
         )
         from app.workers.icon_job import job_fetch_icon
         from app.workers.tomorrowio_job import job_fetch_tomorrowio
+        from app.workers.retention_job import job_prune_old_data
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
 
@@ -107,6 +108,15 @@ async def lifespan(app: FastAPI):
                            id="analyzer", next_run_time=now, max_instances=1, misfire_grace_time=60)
         _scheduler.add_job(job_check_resolutions, IntervalTrigger(seconds=86400),
                            id="resolutions", next_run_time=now, max_instances=1, misfire_grace_time=3600)
+        # Data retention / de-dup — the RAM-cost control job. First run cleans the
+        # accumulated backlog; delay it 10 min so it doesn't fight startup.
+        if getattr(settings, "retention_enabled", True):
+            _scheduler.add_job(
+                job_prune_old_data,
+                IntervalTrigger(seconds=getattr(settings, "retention_run_interval", 86400)),
+                id="retention", next_run_time=now + timedelta(minutes=10),
+                max_instances=1, misfire_grace_time=3600,
+            )
         if getattr(settings, "intraday_enabled", True):
             _scheduler.add_job(job_run_intraday,
                                IntervalTrigger(seconds=getattr(settings, "intraday_run_interval", 300)),
