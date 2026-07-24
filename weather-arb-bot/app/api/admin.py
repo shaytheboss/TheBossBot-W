@@ -963,6 +963,109 @@ async def admin_model_skill_csv(
     )
 
 
+# Deterministic models we flatten into per-model columns for the backtest export.
+_BACKTEST_SOURCES = ["GFS (global)", "ECMWF", "HRRR (3km CONUS)", "NWS (official)",
+                     "Tomorrow.io", "Meteosource", "ICON (DWD)"]
+
+
+@router.get("/export/backtest-csv")
+async def admin_export_backtest_csv(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=90, ge=1, le=400),
+    estimator: Optional[str] = Query(default=None, description="alpha, beta, or omit for both"),
+):
+    """Export settled opportunities WITH their per-model forecast breakdown.
+
+    This is the backtest training set: for every resolved (win/loss) opportunity
+    in the last `days`, one row containing the decision-time inputs (each model's
+    bias-corrected forecast and its P(in bucket), the ensemble stats, sigma, the
+    per-city model weights) plus the entry price, stated confidence, and the
+    ACTUAL outcome. Everything needed to reconstruct how the % was computed and
+    to backtest alternative scoring — nothing is inferred, it is exactly what the
+    estimator saw at decision time (stored in Opportunity.signals).
+
+    Download: curl -b admin_session=... "/admin/export/backtest-csv?days=90" > backtest.csv
+    """
+    import csv as _csv
+    import io as _io
+    from fastapi.responses import StreamingResponse
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    q = (
+        select(Opportunity, MarketOutcome, Market, City.name)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .join(City, City.id == Market.city_id)
+        .where(
+            Opportunity.virtual_status.in_(["win", "loss"]),
+            Opportunity.detected_at >= cutoff,
+        )
+        .order_by(Opportunity.detected_at)
+    )
+    if estimator in ("alpha", "beta"):
+        q = q.where(Opportunity.estimator == estimator)
+    rows = (await db.execute(q)).all()
+
+    base_cols = [
+        "detected_at", "estimator", "city", "bucket_label", "side", "days_ahead",
+        "confidence", "calibrated_confidence", "entry_price", "market_yes_price",
+        "edge", "sigma_used", "ensemble_n", "ensemble_hits", "ensemble_smoothed_pct",
+        "det_avg", "n_global_det", "forecast_std_dev_f", "virtual_status", "pnl",
+    ]
+    model_cols = []
+    for s in _BACKTEST_SOURCES:
+        key = s.split(" ")[0].lower().replace(".", "")
+        model_cols += [f"{key}_fc", f"{key}_p", f"{key}_wt"]
+
+    buf = _io.StringIO()
+    writer = _csv.DictWriter(buf, fieldnames=base_cols + model_cols)
+    writer.writeheader()
+
+    for opp, outcome, market, city_name in rows:
+        sig = opp.signals or {}
+        blend = sig.get("_blend") or sig.get("_beta_breakdown") or {}
+        ens = blend.get("ensemble") or {}
+        det = {d.get("source"): d for d in (blend.get("deterministic") or [])}
+        days_ahead = blend.get("days_ahead")
+        row = {
+            "detected_at": opp.detected_at.isoformat() if opp.detected_at else "",
+            "estimator": opp.estimator or "alpha",
+            "city": city_name,
+            "bucket_label": outcome.bucket_label,
+            "side": opp.side,
+            "days_ahead": days_ahead if days_ahead is not None else "",
+            "confidence": opp.confidence_score,
+            "calibrated_confidence": sig.get("_calibrated_confidence", ""),
+            "entry_price": sig.get("_entry_cost", ""),
+            "market_yes_price": (sig.get("market_price") or {}).get("yes_price", ""),
+            "edge": float(opp.edge) if opp.edge is not None else "",
+            "sigma_used": blend.get("sigma_used", ""),
+            "ensemble_n": ens.get("n", ""),
+            "ensemble_hits": ens.get("hits", ""),
+            "ensemble_smoothed_pct": ens.get("smoothed_pct", ""),
+            "det_avg": blend.get("det_avg", ""),
+            "n_global_det": blend.get("n_global_det", ""),
+            "forecast_std_dev_f": blend.get("forecast_std_dev_f", ""),
+            "virtual_status": opp.virtual_status,
+            "pnl": opp.virtual_pnl if opp.virtual_pnl is not None else "",
+        }
+        for s in _BACKTEST_SOURCES:
+            key = s.split(" ")[0].lower().replace(".", "")
+            d = det.get(s) or {}
+            row[f"{key}_fc"] = d.get("value_f", "")
+            row[f"{key}_p"] = d.get("p_in_bucket", "")
+            row[f"{key}_wt"] = d.get("weight", "")
+        writer.writerow(row)
+
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=backtest.csv"},
+    )
+
+
 @router.get("/collector-miss/csv")
 async def admin_collector_miss_csv(
     _: str = Depends(require_admin),
