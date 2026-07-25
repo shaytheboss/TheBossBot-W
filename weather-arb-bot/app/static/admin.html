@@ -149,6 +149,18 @@
         <button class="btn primary small" onclick="downloadServerCsv('/export/backtest-csv?days=90', 'backtest', this)" title="Download every settled bet of the last 90 days WITH each model's forecast and the real outcome — the dataset used to rebuild and validate the confidence scoring">⬇ Download backtest CSV</button>
       </h3>
       <p class="small">One row per settled bet (last 90 days) with <strong>each model's forecast, its probability, the per-city weights, sigma, stated confidence, entry price — and the actual win/loss</strong>. This is the full decision-time record used to reconstruct exactly how the % is computed and to backtest scoring improvements against real results.</p>
+      <h3 style="margin-top:24px;">💾 Database size &amp; maintenance
+        <button class="btn primary small" onclick="showDbSize(this)" title="Total database size, largest tables, and how much space is dead rows waiting to be reclaimed">📊 Check DB size</button>
+        <button class="btn small" onclick="runPrune(this,false)" title="Run the de-dup now: removes duplicate hourly forecast rows. Lossless — nothing the bot reads is lost.">🧹 Run de-dup</button>
+        <button class="btn small" onclick="runPrune(this,true)" title="VACUUM FULL: physically returns deleted space to disk. Pauses DB writes for up to a few minutes.">🗜️ Shrink DB (VACUUM FULL)</button>
+      </h3>
+      <p class="small">
+        The Railway bill is driven by the <strong>Postgres</strong> service (the app itself is only ~360&nbsp;MB), and Postgres caches whatever data it holds — so the only real lever is a smaller database.
+        <strong>Check DB size</strong> is read-only and safe.
+        <strong>Run de-dup</strong> deletes duplicate forecast rows (lossless).
+        <strong>Shrink DB</strong> then returns that freed space to disk — deleting rows alone does <em>not</em> shrink Postgres. Run de-dup first, then Shrink. Shrink briefly locks the tables it rewrites, so prefer a quiet moment.
+      </p>
+      <pre id="dbOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:340px;overflow:auto"></pre>
       <h3 style="margin-top:24px;">🧠 Memory diagnostic
         <button class="btn small" onclick="showMemory(this,false)" title="Safe: reads RAM + allocator counters only. Sub-millisecond, cannot affect trading.">📸 Quick check (safe)</button>
         <button class="btn small" onclick="showMemory(this,true)" title="Full heap census. FREEZES the bot for ~1 second — do not use during an active market close.">🔬 Deep scan (~1s freeze)</button>
@@ -1349,6 +1361,46 @@ async function loadLessons() {
 // Fetches the endpoint with the auth cookie and saves the streamed CSV. Use for
 // data that the server exports in full (model-skill, collector-miss) rather than
 // re-serializing the on-screen table.
+async function showDbSize(btn) {
+  const out = document.getElementById('dbOut');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await api('/db-size');
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok || j.error) { out.textContent = 'Failed: ' + (j.error || r.status); return; }
+    const stamp = new Date().toLocaleTimeString();
+    let s = `[${stamp}]  TOTAL DATABASE = ${j.total_mb} MB   |   dead rows waiting to reclaim = ${(j.dead_rows_total||0).toLocaleString()}\n`;
+    if (j.vacuum_full_recommended) s += `⚠️  Large dead-row count — "Shrink DB (VACUUM FULL)" would reclaim real space.\n`;
+    s += `\n${'table'.padEnd(22)}${'total MB'.padStart(10)}${'index MB'.padStart(10)}${'live rows'.padStart(13)}${'dead rows'.padStart(13)}\n`;
+    s += '-'.repeat(68) + '\n';
+    (j.tables || []).forEach(t => {
+      s += `${String(t.table).padEnd(22)}${String(t.total_mb).padStart(10)}${String(t.index_mb).padStart(10)}`
+         + `${t.live_rows.toLocaleString().padStart(13)}${t.dead_rows.toLocaleString().padStart(13)}\n`;
+    });
+    out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+async function runPrune(btn, full) {
+  const out = document.getElementById('dbOut');
+  if (full && !confirm('VACUUM FULL rewrites the big tables to return deleted space to disk.\n\n'
+      + 'It briefly locks each table it rewrites (seconds to a few minutes on a large DB); '
+      + 'the bot\'s jobs simply wait and retry.\n\nRun it now?')) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = full ? 'Shrinking…' : 'Cleaning…';
+  try {
+    const r = await api('/prune-old-data' + (full ? '?full=true' : ''), { method: 'POST' });
+    const j = await r.json().catch(()=>({}));
+    const stamp = new Date().toLocaleTimeString();
+    if (!r.ok) { out.textContent = `[${stamp}] Failed: ${j.detail || r.status}\n\n` + out.textContent; return; }
+    let s = `[${stamp}] ${full ? 'VACUUM FULL' : 'De-dup'} finished:\n`;
+    Object.entries(j).forEach(([k,v]) => { if (k !== 'ok') s += `   ${k}: ${typeof v === 'number' ? v.toLocaleString() : v}\n`; });
+    s += `   → click "Check DB size" to see the new size.\n`;
+    out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
+
 async function showMemory(btn, deep) {
   const out = document.getElementById('memOut');
   if (deep && !confirm('Deep scan walks the whole heap and PAUSES the bot for about a second '
