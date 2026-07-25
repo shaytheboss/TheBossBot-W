@@ -1400,16 +1400,23 @@ async function showDbSize(btn, exact) {
       s += `⚠️  "Shrink DB (VACUUM FULL)" would reclaim real space.\n`;
     }
     const hasExact = (j.tables || []).some(t => t.exact_rows !== undefined);
-    s += `\n${'table'.padEnd(22)}${'total MB'.padStart(10)}${'index MB'.padStart(10)}${'live rows'.padStart(13)}`
-       + (hasExact ? `${'EXACT rows'.padStart(13)}` : '') + `${'B/row'.padStart(10)}\n`;
-    s += '-'.repeat(hasExact ? 78 : 65) + '\n';
+    const pad = (v, n) => String(v).padStart(n) + ' ';   // trailing space: columns can never merge
+    s += `\n${'table'.padEnd(24)}${pad('total MB',10)}${pad('index MB',10)}`
+       + (hasExact ? pad('EXACT rows',14) : pad('est. rows',12))
+       + pad('B/row',11) + `\n`;
+    s += '-'.repeat(hasExact ? 74 : 70) + '\n';
     (j.tables || []).forEach(t => {
-      const bpr = t.bytes_per_row ? t.bytes_per_row.toLocaleString() : '-';
-      s += `${(t.bloated ? '⚠ ' : '  ') + String(t.table).padEnd(20)}${String(t.total_mb).padStart(10)}${String(t.index_mb).padStart(10)}`
-         + `${t.live_rows.toLocaleString().padStart(13)}`
-         + (hasExact ? `${(t.exact_rows !== undefined ? t.exact_rows.toLocaleString() : '-').padStart(13)}` : '')
-         + `${bpr.padStart(10)}\n`;
+      const rows = hasExact && t.exact_rows !== undefined ? t.exact_rows : t.live_rows;
+      const bprVal = t.bytes_per_row;
+      // Mark estimated figures with ~ so a bad pg_stat guess is never read as fact.
+      const bpr = bprVal == null ? '-'
+        : (t.bytes_per_row_is_estimate ? '~' : '') + bprVal.toLocaleString();
+      s += `${(t.bloated ? '⚠ ' : '  ') + String(t.table).padEnd(22)}`
+         + pad(t.total_mb, 10) + pad(t.index_mb, 10)
+         + pad((rows == null ? '-' : rows.toLocaleString()) + (hasExact && t.exact_rows === undefined ? '~' : ''), hasExact ? 14 : 12)
+         + pad(bpr, 11) + `\n`;
     });
+    if (!hasExact) s += `\n(row counts are pg_stat ESTIMATES and can be very wrong — use "🔢 + exact row counts" for the truth)\n`;
     out.textContent = s + '\n' + out.textContent;
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
