@@ -131,6 +131,18 @@ async def admin_discover(_: str = Depends(require_admin)):
     return {"ok": True, **stats}
 
 
+@router.get("/memory")
+async def admin_memory(_: str = Depends(require_admin)):
+    """Live memory diagnostic: RSS, GC, top object types, DB pool, tracemalloc.
+
+    Call it now and again in a few hours — a type whose count climbs is the leak.
+    Read-only and cheap. Enable deep allocation tracing by setting env
+    TRACEMALLOC=1 before start (adds overhead, off by default).
+    """
+    from app.utils.memdiag import snapshot
+    return snapshot()
+
+
 @router.post("/prune-old-data")
 async def admin_prune_old_data(
     full: bool = Query(default=False, description="Run VACUUM FULL to reclaim disk (locks tables briefly)"),
