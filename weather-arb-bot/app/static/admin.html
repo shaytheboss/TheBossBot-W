@@ -160,6 +160,7 @@
         <strong>Run de-dup</strong> deletes duplicate forecast rows (lossless).
         <strong>Shrink DB</strong> then returns that freed space to disk — deleting rows alone does <em>not</em> shrink Postgres. Run de-dup first, then Shrink. Shrink briefly locks the tables it rewrites, so prefer a quiet moment.
       </p>
+      <div><button class="btn small" onclick="copyPre('dbOut', this)" title="Copy this output to the clipboard">📋 Copy</button></div>
       <pre id="dbOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:340px;overflow:auto"></pre>
       <h3 style="margin-top:24px;">🧠 Memory diagnostic
         <button class="btn small" onclick="showMemory(this,false)" title="Safe: reads RAM + allocator counters only. Sub-millisecond, cannot affect trading.">📸 Quick check (safe)</button>
@@ -170,6 +171,7 @@
         <strong>Deep scan</strong> additionally lists which object types are accumulating, but it <strong>pauses the whole bot for about a second</strong> (Telegram, price fetches and the analyzer all wait) — use it once or twice, at a quiet moment, only after Quick check confirms RAM is climbing.
         The automatic 15-minute heartbeat in the Logs tab uses the safe path only.
       </p>
+      <div><button class="btn small" onclick="copyPre('memOut', this)" title="Copy this output to the clipboard">📋 Copy</button></div>
       <pre id="memOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:320px;overflow:auto"></pre>
       <h3 style="margin-top:24px;">🔍 Missing model coverage <button class="btn small" onclick="downloadServerCsv('/collector-miss/csv' + (document.getElementById('statsCity').value ? '?city_id=' + document.getElementById('statsCity').value : ''), 'collector-miss', this)" title="Download which weather sources returned no data per city/date (respects the City filter; opens in Excel)">⬇ CSV</button></h3>
       <p class="small">Which weather models returned <strong>no data</strong> for which city/date — the gaps behind a weak per-city blend. Grouped by city + source with a miss count and the date range seen. Use it to spot systematic holes like "ECMWF never responds for Tokyo" or an unconfigured API key.</p>
@@ -1361,6 +1363,25 @@ async function loadLessons() {
 // Fetches the endpoint with the auth cookie and saves the streamed CSV. Use for
 // data that the server exports in full (model-skill, collector-miss) rather than
 // re-serializing the on-screen table.
+// Copy a <pre> block's text to the clipboard (for pasting diagnostics elsewhere).
+async function copyPre(elId, btn) {
+  const el = document.getElementById(elId);
+  if (!el || !el.textContent.trim()) return;
+  const orig = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(el.textContent);
+    btn.textContent = '✅ Copied';
+  } catch (e) {
+    // Clipboard API needs HTTPS / permission — fall back to a manual selection.
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    btn.textContent = document.execCommand('copy') ? '✅ Copied' : '⚠️ Select+Ctrl+C';
+  }
+  setTimeout(() => { btn.textContent = orig; }, 1800);
+}
+
 async function showDbSize(btn) {
   const out = document.getElementById('dbOut');
   const orig = btn.textContent;
@@ -1370,13 +1391,19 @@ async function showDbSize(btn) {
     const j = await r.json().catch(()=>({}));
     if (!r.ok || j.error) { out.textContent = 'Failed: ' + (j.error || r.status); return; }
     const stamp = new Date().toLocaleTimeString();
-    let s = `[${stamp}]  TOTAL DATABASE = ${j.total_mb} MB   |   dead rows waiting to reclaim = ${(j.dead_rows_total||0).toLocaleString()}\n`;
-    if (j.vacuum_full_recommended) s += `⚠️  Large dead-row count — "Shrink DB (VACUUM FULL)" would reclaim real space.\n`;
-    s += `\n${'table'.padEnd(22)}${'total MB'.padStart(10)}${'index MB'.padStart(10)}${'live rows'.padStart(13)}${'dead rows'.padStart(13)}\n`;
-    s += '-'.repeat(68) + '\n';
+    let s = `[${stamp}]  TOTAL DATABASE = ${j.total_mb} MB   |   dead rows = ${(j.dead_rows_total||0).toLocaleString()}\n`;
+    if (j.bloated_tables && j.bloated_tables.length) {
+      s += `⚠️  BLOATED (space freed internally but never returned to disk): ${j.bloated_tables.join(', ')}\n`
+         + `    → "Shrink DB (VACUUM FULL)" will reclaim it.\n`;
+    } else if (j.vacuum_full_recommended) {
+      s += `⚠️  "Shrink DB (VACUUM FULL)" would reclaim real space.\n`;
+    }
+    s += `\n${'table'.padEnd(22)}${'total MB'.padStart(10)}${'index MB'.padStart(10)}${'live rows'.padStart(13)}${'B/row'.padStart(10)}\n`;
+    s += '-'.repeat(65) + '\n';
     (j.tables || []).forEach(t => {
-      s += `${String(t.table).padEnd(22)}${String(t.total_mb).padStart(10)}${String(t.index_mb).padStart(10)}`
-         + `${t.live_rows.toLocaleString().padStart(13)}${t.dead_rows.toLocaleString().padStart(13)}\n`;
+      const bpr = t.bytes_per_row ? t.bytes_per_row.toLocaleString() : '-';
+      s += `${(t.bloated ? '⚠ ' : '  ') + String(t.table).padEnd(20)}${String(t.total_mb).padStart(10)}${String(t.index_mb).padStart(10)}`
+         + `${t.live_rows.toLocaleString().padStart(13)}${bpr.padStart(10)}\n`;
     });
     out.textContent = s + '\n' + out.textContent;
   } finally { btn.disabled = false; btn.textContent = orig; }

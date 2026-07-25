@@ -93,3 +93,36 @@ async def test_clean_db_does_not_recommend_vacuum():
     light = [_Row("forecasts", 1024**2, 1024**2, 0, 1000, 5)]
     out = await dbdiag.database_size(_FakeDB(1024**2, light))
     assert out["vacuum_full_recommended"] is False
+    assert out["bloated_tables"] == []
+
+
+@pytest.mark.asyncio
+async def test_bloat_detected_when_dead_rows_are_zero():
+    """Real production case: after a big delete, autovacuum clears dead tuples
+    (dead_rows→0) but the file stays huge. market_prices measured 2,962 MB for
+    38,800 live rows ≈ 76 KB/row, while a real row is ~100 bytes. The old
+    dead-row-only rule said 'no vacuum needed' — exactly backwards."""
+    rows = [_Row("market_prices", 2962 * 1024**2, 1143 * 1024**2, 1819 * 1024**2, 38_800, 0)]
+    out = await dbdiag.database_size(_FakeDB(3870 * 1024**2, rows))
+    t = out["tables"][0]
+    assert t["bloated"] is True
+    assert t["bytes_per_row"] > 50_000
+    assert out["bloated_tables"] == ["market_prices"]
+    assert out["vacuum_full_recommended"] is True
+
+
+@pytest.mark.asyncio
+async def test_healthy_large_table_not_flagged():
+    """A big table with a sane bytes-per-row must NOT be called bloated."""
+    rows = [_Row("market_prices", 200 * 1024**2, 150 * 1024**2, 50 * 1024**2, 3_000_000, 10)]
+    out = await dbdiag.database_size(_FakeDB(200 * 1024**2, rows))
+    assert out["tables"][0]["bloated"] is False
+    assert out["vacuum_full_recommended"] is False
+
+
+@pytest.mark.asyncio
+async def test_small_tables_never_flagged():
+    """Tiny tables can have odd ratios; they are irrelevant to cost."""
+    rows = [_Row("app_settings", 1024, 1024, 0, 0, 0)]
+    out = await dbdiag.database_size(_FakeDB(1024, rows))
+    assert out["tables"][0]["bloated"] is False
