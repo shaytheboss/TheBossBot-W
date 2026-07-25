@@ -150,9 +150,14 @@
       </h3>
       <p class="small">One row per settled bet (last 90 days) with <strong>each model's forecast, its probability, the per-city weights, sigma, stated confidence, entry price — and the actual win/loss</strong>. This is the full decision-time record used to reconstruct exactly how the % is computed and to backtest scoring improvements against real results.</p>
       <h3 style="margin-top:24px;">🧠 Memory diagnostic
-        <button class="btn small" onclick="showMemory(this)" title="Live RAM usage, top object types, and DB pool — to hunt the memory leak driving the Railway RAM bill">📸 Snapshot memory</button>
+        <button class="btn small" onclick="showMemory(this,false)" title="Safe: reads RAM + allocator counters only. Sub-millisecond, cannot affect trading.">📸 Quick check (safe)</button>
+        <button class="btn small" onclick="showMemory(this,true)" title="Full heap census. FREEZES the bot for ~1 second — do not use during an active market close.">🔬 Deep scan (~1s freeze)</button>
       </h3>
-      <p class="small">Live process RAM (RSS), the object types with the most live instances, and the DB pool. Take a snapshot now and another in a few hours — a type whose count keeps climbing is the leak.</p>
+      <p class="small">
+        <strong>Quick check</strong> is safe to click any time — it reads process RAM and the allocator block count without touching the heap, so it cannot slow the bot or affect results.
+        <strong>Deep scan</strong> additionally lists which object types are accumulating, but it <strong>pauses the whole bot for about a second</strong> (Telegram, price fetches and the analyzer all wait) — use it once or twice, at a quiet moment, only after Quick check confirms RAM is climbing.
+        The automatic 15-minute heartbeat in the Logs tab uses the safe path only.
+      </p>
       <pre id="memOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:320px;overflow:auto"></pre>
       <h3 style="margin-top:24px;">🔍 Missing model coverage <button class="btn small" onclick="downloadServerCsv('/collector-miss/csv' + (document.getElementById('statsCity').value ? '?city_id=' + document.getElementById('statsCity').value : ''), 'collector-miss', this)" title="Download which weather sources returned no data per city/date (respects the City filter; opens in Excel)">⬇ CSV</button></h3>
       <p class="small">Which weather models returned <strong>no data</strong> for which city/date — the gaps behind a weak per-city blend. Grouped by city + source with a miss count and the date range seen. Use it to spot systematic holes like "ECMWF never responds for Tokyo" or an unconfigured API key.</p>
@@ -1344,18 +1349,24 @@ async function loadLessons() {
 // Fetches the endpoint with the auth cookie and saves the streamed CSV. Use for
 // data that the server exports in full (model-skill, collector-miss) rather than
 // re-serializing the on-screen table.
-async function showMemory(btn) {
+async function showMemory(btn, deep) {
   const out = document.getElementById('memOut');
+  if (deep && !confirm('Deep scan walks the whole heap and PAUSES the bot for about a second '
+      + '(Telegram, price fetches and the analyzer all wait).\n\nRun it now?')) return;
   const orig = btn ? btn.textContent : null;
   if (btn) { btn.disabled = true; btn.textContent = '…'; }
   try {
-    const r = await api('/memory');
+    const r = await api('/memory' + (deep ? '?deep=true' : ''));
     if (!r.ok) { out.textContent = 'Failed: ' + r.status; return; }
     const j = await r.json();
     const stamp = new Date().toLocaleTimeString();
-    let s = `[${stamp}]  RSS = ${j.rss_mb} MB   |   tracked objects = ${j.gc_tracked_objects}\n`;
-    s += `DB pool: ${j.db_pool}\n\nTop object types:\n`;
-    (j.top_object_types || []).forEach(t => { s += `  ${String(t.count).padStart(9)}  ${t.type}\n`; });
+    let s = `[${stamp}] (${j.mode})  RSS = ${j.rss_mb} MB   |   allocated blocks = ${(j.allocated_blocks||0).toLocaleString()}\n`;
+    s += `DB pool: ${j.db_pool}\n`;
+    if (j.gc_tracked_objects !== undefined) s += `GC-tracked objects: ${j.gc_tracked_objects.toLocaleString()}\n`;
+    if (j.top_object_types) {
+      s += `\nTop object types:\n`;
+      j.top_object_types.forEach(t => { s += `  ${String(t.count).padStart(9)}  ${t.type}\n`; });
+    }
     if (j.tracemalloc_top) {
       s += `\nTop allocations:\n`;
       j.tracemalloc_top.forEach(t => { s += `  ${String(t.size_mb).padStart(7)} MB  ${t.file}\n`; });
