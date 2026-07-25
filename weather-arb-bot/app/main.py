@@ -30,6 +30,11 @@ async def lifespan(app: FastAPI):
     global _bot_app, _scheduler
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     install_buffer_handler()
+    # Optional deep allocation tracing to hunt the RAM leak (adds overhead → opt-in).
+    if os.getenv("TRACEMALLOC", "").lower() in ("1", "true", "yes"):
+        import tracemalloc
+        tracemalloc.start(15)
+        logger.info("tracemalloc enabled (memory leak tracing)")
     logger.info("Weather Arbitrage Bot starting up...")
 
     try:
@@ -117,6 +122,20 @@ async def lifespan(app: FastAPI):
                 id="retention", next_run_time=now + timedelta(minutes=10),
                 max_instances=1, misfire_grace_time=3600,
             )
+        # Memory heartbeat — logs process RSS every 15 min so the Logs tab shows
+        # the RAM curve and which job precedes each jump. Cheap; helps locate the
+        # leak the DB-side retention work did not address.
+        async def _mem_heartbeat():
+            try:
+                from app.utils.memdiag import rss_mb
+                import gc as _gc
+                _gc.collect()
+                logger.info(f"[mem] RSS={rss_mb()} MB tracked_objs={len(_gc.get_objects())}")
+            except Exception as e:
+                logger.debug(f"[mem] heartbeat failed: {e}")
+        _scheduler.add_job(_mem_heartbeat, IntervalTrigger(seconds=900),
+                           id="mem_heartbeat", next_run_time=now, max_instances=1,
+                           misfire_grace_time=120)
         if getattr(settings, "intraday_enabled", True):
             _scheduler.add_job(job_run_intraday,
                                IntervalTrigger(seconds=getattr(settings, "intraday_run_interval", 300)),
