@@ -102,14 +102,61 @@ class PolymarketCollector(BaseCollector):
         }
 
     async def collect_and_store(
-        self, outcome_id: int, token_id: str, db: AsyncSession
+        self,
+        outcome_id: int,
+        token_id: str,
+        db: AsyncSession,
+        last: Optional[tuple] = None,
+        commit: bool = True,
+        heartbeat_seconds: int = 3600,
     ) -> Optional[dict]:
+        """Fetch the midpoint and store it — but only when it carries information.
+
+        `last` is the previously stored (yes_price, timestamp) for this outcome,
+        supplied by the caller from a single bulk query. Behaviour:
+
+          - price CHANGED           → write (nothing is lost)
+          - price identical, and the last write is younger than
+            `heartbeat_seconds` → SKIP the write
+          - price identical but the last write is older than the heartbeat
+            → write anyway, so the series always has at least hourly coverage
+            and a long flat stretch stays explicit rather than a data gap.
+
+        Why: polling every 5 minutes and writing unconditionally produced
+        ~290,000 rows/day (17.5M rows, ~3 GB) even though most outcomes do not
+        move between polls. Writing only on change keeps every price transition
+        — the analyzer reads the latest price and the intraday trend, both of
+        which are unaffected — while removing the overwhelming majority of rows.
+
+        `commit=False` lets the caller batch many outcomes into one commit
+        instead of one transaction per outcome.
+        """
         yes_price = await self.get_midpoint(token_id)
         if yes_price is None:
             return None
 
-        no_price = round(1.0 - yes_price, 4)
         now = datetime.now(timezone.utc)
+
+        if last is not None:
+            last_price, last_ts = last
+            unchanged = last_price is not None and abs(float(last_price) - float(yes_price)) < 1e-9
+            fresh = False
+            if last_ts is not None:
+                age = (now - last_ts).total_seconds()
+                fresh = age < heartbeat_seconds
+            if unchanged and fresh:
+                logger.debug(
+                    f"Polymarket price unchanged for outcome {outcome_id} "
+                    f"({yes_price}) — skipping write"
+                )
+                return {
+                    "yes_price": yes_price,
+                    "no_price": round(1.0 - yes_price, 4),
+                    "timestamp": last_ts,
+                    "skipped": True,
+                }
+
+        no_price = round(1.0 - yes_price, 4)
         stmt = (
             insert(MarketPrice)
             .values(
@@ -121,8 +168,10 @@ class PolymarketCollector(BaseCollector):
             .on_conflict_do_nothing(constraint="uq_price_outcome_time")
         )
         await db.execute(stmt)
-        await db.commit()
+        if commit:
+            await db.commit()
 
-        result = {"yes_price": yes_price, "no_price": no_price, "timestamp": now}
-        logger.info(f"Polymarket price stored: outcome {outcome_id} = {yes_price}")
-        return result
+        # debug, not info: this fires for every outcome on every poll and was a
+        # significant share of the Railway log volume.
+        logger.debug(f"Polymarket price stored: outcome {outcome_id} = {yes_price}")
+        return {"yes_price": yes_price, "no_price": no_price, "timestamp": now, "skipped": False}
