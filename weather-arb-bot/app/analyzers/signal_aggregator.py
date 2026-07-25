@@ -107,7 +107,19 @@ class SignalAggregator:
             unavailable_api.append("meteosource_forecast")
         signals["_unavailable_api"] = unavailable_api
         signals["market_price"] = await self._latest_price(db, outcome.id)
-        signals["price_trend"] = await self._price_trend(db, outcome.id, minutes=60)
+        # price_trend is DELIBERATELY not computed here.
+        #
+        # _price_trend runs a 60-minute RANGE scan over market_prices (17.5M
+        # rows) for EVERY outcome on EVERY analyzer run — ~800 outcomes x 288
+        # runs/day ≈ 230,000 range queries per day against the largest table.
+        # An exhaustive search of the repo shows nothing ever reads
+        # signals["price_trend"]: no estimator, no detector, no formatter, no
+        # template. It was pure cost with no consumer.
+        #
+        # The key is kept (as None) so the signals shape is unchanged for any
+        # caller doing signals.get("price_trend"), and _price_trend() is kept
+        # available should a consumer ever actually need it.
+        signals["price_trend"] = None
         signals["is_low_market"] = is_low_market
 
         bucket_unit = resolve_bucket_unit(outcome)
