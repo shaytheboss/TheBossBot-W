@@ -42,12 +42,27 @@ LIMIT :limit
 """
 
 
+# Bloat heuristic. Ignore small tables; above that, a table whose average
+# bytes-per-live-row is huge (or that reports no live rows at all while holding
+# real space) is carrying free-but-unreleased space that only VACUUM FULL
+# returns to the OS.
+_BLOAT_MIN_BYTES = 50 * 1024 * 1024      # only consider tables >= 50 MB
+_BLOAT_BYTES_PER_ROW = 5_000             # >5 KB per row is far above any real row
+
+
 def _mb(v: Optional[int]) -> Optional[float]:
     return round(v / 1024 / 1024, 1) if v is not None else None
 
 
-async def database_size(db, limit: int = 20) -> dict:
-    """Total DB size + the largest tables, with dead-tuple bloat. Never raises."""
+async def database_size(
+    db, limit: int = 20, exact_counts: bool = False, exact_limit: int = 5
+) -> dict:
+    """Total DB size + the largest tables, with bloat detection. Never raises.
+
+    exact_counts=True adds a real COUNT(*) for the `exact_limit` biggest tables
+    (slow on bloated tables, but definitive — the pg_stat estimates can be wildly
+    wrong or reset to 0 right after a vacuum).
+    """
     out: dict = {}
     try:
         total = (await db.execute(
@@ -67,21 +82,56 @@ async def database_size(db, limit: int = 20) -> dict:
 
     tables = []
     dead_total = 0
+    bloated = []
     for r in rows:
-        dead_total += int(r.dead_rows or 0)
+        dead = int(r.dead_rows or 0)
+        live = int(r.live_rows or 0)
+        total_b = int(r.total_bytes or 0)
+        dead_total += dead
+        # Bytes per live row exposes bloat that dead-row counts CANNOT see:
+        # after a big delete, autovacuum clears the dead tuples (dead_rows→0) but
+        # the file stays large — the space is merely marked reusable, never
+        # returned to the OS. Only VACUUM FULL rewrites the file. A market_prices
+        # row (6 numbers) should be ~100 bytes; tens of KB/row means bloat.
+        bpr = (total_b / live) if live > 0 else None
+        is_bloated = total_b >= _BLOAT_MIN_BYTES and (live == 0 or (bpr or 0) > _BLOAT_BYTES_PER_ROW)
+        if is_bloated:
+            bloated.append(r.table_name)
         tables.append({
             "table": r.table_name,
             "total_mb": _mb(r.total_bytes),
             "table_mb": _mb(r.table_bytes),
             "index_mb": _mb(r.index_bytes),
-            "live_rows": int(r.live_rows or 0),
-            "dead_rows": int(r.dead_rows or 0),
+            "live_rows": live,
+            "dead_rows": dead,
+            "bytes_per_row": round(bpr) if bpr else None,
+            "bloated": is_bloated,
             "last_vacuum": r.last_vacuum.isoformat() if r.last_vacuum else None,
             "last_autovacuum": r.last_autovacuum.isoformat() if r.last_autovacuum else None,
         })
     out["tables"] = tables
     out["dead_rows_total"] = dead_total
-    # A large dead-row count means deleted space is still occupying disk and
-    # cache — VACUUM FULL would return it to the OS.
-    out["vacuum_full_recommended"] = dead_total > 100_000
+    out["bloated_tables"] = bloated
+
+    # live_rows above comes from pg_stat (an ESTIMATE that ANALYZE refreshes and
+    # that can read 0 right after a vacuum). When the caller needs certainty —
+    # e.g. before deciding whether a 3 GB table actually holds anything — run an
+    # exact COUNT(*) on the biggest tables. Opt-in: a seq scan over a bloated
+    # table reads every page, so it is slow on a large file.
+    if exact_counts:
+        exact: dict = {}
+        for t in tables[:exact_limit]:
+            name = t["table"]
+            try:
+                # Table names come from the catalog, not user input.
+                n = (await db.execute(text(f'SELECT count(*) FROM "{name}"'))).scalar_one()
+                exact[name] = int(n)
+                t["exact_rows"] = int(n)
+            except Exception as e:
+                logger.warning(f"[dbdiag] count failed for {name}: {e}")
+                exact[name] = None
+        out["exact_rows"] = exact
+    # Recommend VACUUM FULL on EITHER signal: lots of dead tuples, or bloated
+    # files whose space autovacuum already freed internally but never released.
+    out["vacuum_full_recommended"] = bool(bloated) or dead_total > 100_000
     return out
