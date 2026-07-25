@@ -156,15 +156,16 @@ async def admin_db_size(
     _: str = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     limit: int = Query(default=20, ge=1, le=100),
+    exact: bool = Query(default=False, description="Exact COUNT(*) on the biggest tables (slower, definitive)"),
 ):
-    """Database size breakdown: total, largest tables, and dead-tuple bloat.
+    """Database size breakdown: total, largest tables, bloat, and row counts.
 
-    Read-only and cheap (Postgres catalog views). This is what identifies where
-    the Railway RAM/Volume cost actually lives, and whether a VACUUM FULL would
-    reclaim meaningful space.
+    Read-only. Catalog views are cheap; `exact=true` additionally runs COUNT(*)
+    on the largest tables, which is slow on a bloated table but settles what is
+    really stored (the pg_stat row estimates can read 0 right after a vacuum).
     """
     from app.utils.dbdiag import database_size
-    return await database_size(db, limit=limit)
+    return await database_size(db, limit=limit, exact_counts=exact)
 
 
 @router.post("/prune-old-data")

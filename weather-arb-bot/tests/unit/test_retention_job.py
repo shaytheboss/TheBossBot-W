@@ -51,14 +51,27 @@ class TestVacuumTargets:
     def test_nothing_deleted_no_vacuum(self):
         assert vacuum_targets({"forecasts_deduped": 0}, vacuum_full=False) == []
 
-    def test_full_always_includes_forecasts(self):
-        """A one-time full reclaim vacuums forecasts even if nothing was deleted
-        this run (the bloat is from prior runs)."""
-        assert vacuum_targets({}, vacuum_full=True) == ["forecasts"]
+    def test_full_covers_market_prices_the_biggest_table(self):
+        """REGRESSION: the first version returned only ['forecasts'] for a full
+        vacuum, so market_prices — measured at 2,963 MB, by far the largest —
+        was never reclaimed and the run reported success having freed nothing."""
+        t = vacuum_targets({}, vacuum_full=True)
+        assert "market_prices" in t
+        assert "forecasts" in t
+        assert len(t) > 5, "a full reclaim must cover all bloatable tables"
 
-    def test_no_duplicate_forecasts_entry(self):
-        summary = {"forecasts_deduped": 5, "forecasts_pruned": 3}
-        assert vacuum_targets(summary, vacuum_full=True) == ["forecasts"]
+    def test_full_orders_smallest_first(self):
+        """VACUUM FULL rewrites a table, needing free disk equal to its size. On
+        a nearly-full volume the biggest table fails unless the small ones are
+        reclaimed first."""
+        t = vacuum_targets({}, vacuum_full=True)
+        assert t.index("market_prices") > t.index("collector_miss")
+        assert t[-1] == "market_prices"
+
+    def test_full_has_no_duplicates(self):
+        summary = {"forecasts_deduped": 5, "forecasts_pruned": 3, "market_prices_pruned": 2}
+        t = vacuum_targets(summary, vacuum_full=True)
+        assert len(t) == len(set(t))
 
     def test_multiple_pruned_tables(self):
         summary = {
@@ -72,6 +85,53 @@ class TestVacuumTargets:
     def test_ignores_non_table_keys(self):
         """Keys like tables_vacuumed must not be treated as tables."""
         assert vacuum_targets({"tables_vacuumed": 3}, vacuum_full=False) == []
+
+
+class TestVacuumErrorReporting:
+    """A failed VACUUM must report WHY, not just a bare count of 0."""
+
+    @pytest.mark.asyncio
+    async def test_errors_are_returned_not_swallowed(self, monkeypatch):
+        import app.workers.retention_job as rj
+
+        class _Conn:
+            async def execute(self, *a, **kw):
+                raise RuntimeError("could not extend file: No space left on device")
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class _Eng:
+            def execution_options(self, **kw): return self
+            def connect(self): return _Conn()
+
+        monkeypatch.setattr(rj, "engine", _Eng())
+        done, errors = await rj._run_vacuum(["market_prices"], full=True)
+        assert done == 0
+        assert len(errors) == 1
+        assert "market_prices" in errors[0]
+        assert "No space left on device" in errors[0]
+
+    @pytest.mark.asyncio
+    async def test_success_reports_no_errors(self, monkeypatch):
+        import app.workers.retention_job as rj
+
+        class _Conn:
+            async def execute(self, *a, **kw): return None
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class _Eng:
+            def execution_options(self, **kw): return self
+            def connect(self): return _Conn()
+
+        monkeypatch.setattr(rj, "engine", _Eng())
+        done, errors = await rj._run_vacuum(["forecasts", "market_prices"], full=True)
+        assert done == 2 and errors == []
+
+    @pytest.mark.asyncio
+    async def test_empty_targets_short_circuits(self):
+        import app.workers.retention_job as rj
+        assert await rj._run_vacuum([], full=True) == (0, [])
 
 
 # ── 2. compute_cutoffs is correct arithmetic ───────────────────────────────────

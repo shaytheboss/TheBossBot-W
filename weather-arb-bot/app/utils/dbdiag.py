@@ -54,8 +54,15 @@ def _mb(v: Optional[int]) -> Optional[float]:
     return round(v / 1024 / 1024, 1) if v is not None else None
 
 
-async def database_size(db, limit: int = 20) -> dict:
-    """Total DB size + the largest tables, with dead-tuple bloat. Never raises."""
+async def database_size(
+    db, limit: int = 20, exact_counts: bool = False, exact_limit: int = 5
+) -> dict:
+    """Total DB size + the largest tables, with bloat detection. Never raises.
+
+    exact_counts=True adds a real COUNT(*) for the `exact_limit` biggest tables
+    (slow on bloated tables, but definitive — the pg_stat estimates can be wildly
+    wrong or reset to 0 right after a vacuum).
+    """
     out: dict = {}
     try:
         total = (await db.execute(
@@ -105,6 +112,25 @@ async def database_size(db, limit: int = 20) -> dict:
     out["tables"] = tables
     out["dead_rows_total"] = dead_total
     out["bloated_tables"] = bloated
+
+    # live_rows above comes from pg_stat (an ESTIMATE that ANALYZE refreshes and
+    # that can read 0 right after a vacuum). When the caller needs certainty —
+    # e.g. before deciding whether a 3 GB table actually holds anything — run an
+    # exact COUNT(*) on the biggest tables. Opt-in: a seq scan over a bloated
+    # table reads every page, so it is slow on a large file.
+    if exact_counts:
+        exact: dict = {}
+        for t in tables[:exact_limit]:
+            name = t["table"]
+            try:
+                # Table names come from the catalog, not user input.
+                n = (await db.execute(text(f'SELECT count(*) FROM "{name}"'))).scalar_one()
+                exact[name] = int(n)
+                t["exact_rows"] = int(n)
+            except Exception as e:
+                logger.warning(f"[dbdiag] count failed for {name}: {e}")
+                exact[name] = None
+        out["exact_rows"] = exact
     # Recommend VACUUM FULL on EITHER signal: lots of dead tuples, or bloated
     # files whose space autovacuum already freed internally but never released.
     out["vacuum_full_recommended"] = bool(bloated) or dead_total > 100_000

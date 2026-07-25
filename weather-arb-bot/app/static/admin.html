@@ -150,7 +150,8 @@
       </h3>
       <p class="small">One row per settled bet (last 90 days) with <strong>each model's forecast, its probability, the per-city weights, sigma, stated confidence, entry price — and the actual win/loss</strong>. This is the full decision-time record used to reconstruct exactly how the % is computed and to backtest scoring improvements against real results.</p>
       <h3 style="margin-top:24px;">💾 Database size &amp; maintenance
-        <button class="btn primary small" onclick="showDbSize(this)" title="Total database size, largest tables, and how much space is dead rows waiting to be reclaimed">📊 Check DB size</button>
+        <button class="btn primary small" onclick="showDbSize(this,false)" title="Total database size, largest tables, and bloat">📊 Check DB size</button>
+        <button class="btn small" onclick="showDbSize(this,true)" title="Same, plus an exact COUNT(*) on the biggest tables — slower but definitive">🔢 + exact row counts</button>
         <button class="btn small" onclick="runPrune(this,false)" title="Run the de-dup now: removes duplicate hourly forecast rows. Lossless — nothing the bot reads is lost.">🧹 Run de-dup</button>
         <button class="btn small" onclick="runPrune(this,true)" title="VACUUM FULL: physically returns deleted space to disk. Pauses DB writes for up to a few minutes.">🗜️ Shrink DB (VACUUM FULL)</button>
       </h3>
@@ -1382,12 +1383,12 @@ async function copyPre(elId, btn) {
   setTimeout(() => { btn.textContent = orig; }, 1800);
 }
 
-async function showDbSize(btn) {
+async function showDbSize(btn, exact) {
   const out = document.getElementById('dbOut');
   const orig = btn.textContent;
-  btn.disabled = true; btn.textContent = '…';
+  btn.disabled = true; btn.textContent = exact ? 'Counting…' : '…';
   try {
-    const r = await api('/db-size');
+    const r = await api('/db-size' + (exact ? '?exact=true' : ''));
     const j = await r.json().catch(()=>({}));
     if (!r.ok || j.error) { out.textContent = 'Failed: ' + (j.error || r.status); return; }
     const stamp = new Date().toLocaleTimeString();
@@ -1398,12 +1399,16 @@ async function showDbSize(btn) {
     } else if (j.vacuum_full_recommended) {
       s += `⚠️  "Shrink DB (VACUUM FULL)" would reclaim real space.\n`;
     }
-    s += `\n${'table'.padEnd(22)}${'total MB'.padStart(10)}${'index MB'.padStart(10)}${'live rows'.padStart(13)}${'B/row'.padStart(10)}\n`;
-    s += '-'.repeat(65) + '\n';
+    const hasExact = (j.tables || []).some(t => t.exact_rows !== undefined);
+    s += `\n${'table'.padEnd(22)}${'total MB'.padStart(10)}${'index MB'.padStart(10)}${'live rows'.padStart(13)}`
+       + (hasExact ? `${'EXACT rows'.padStart(13)}` : '') + `${'B/row'.padStart(10)}\n`;
+    s += '-'.repeat(hasExact ? 78 : 65) + '\n';
     (j.tables || []).forEach(t => {
       const bpr = t.bytes_per_row ? t.bytes_per_row.toLocaleString() : '-';
       s += `${(t.bloated ? '⚠ ' : '  ') + String(t.table).padEnd(20)}${String(t.total_mb).padStart(10)}${String(t.index_mb).padStart(10)}`
-         + `${t.live_rows.toLocaleString().padStart(13)}${bpr.padStart(10)}\n`;
+         + `${t.live_rows.toLocaleString().padStart(13)}`
+         + (hasExact ? `${(t.exact_rows !== undefined ? t.exact_rows.toLocaleString() : '-').padStart(13)}` : '')
+         + `${bpr.padStart(10)}\n`;
     });
     out.textContent = s + '\n' + out.textContent;
   } finally { btn.disabled = false; btn.textContent = orig; }
@@ -1422,7 +1427,15 @@ async function runPrune(btn, full) {
     const stamp = new Date().toLocaleTimeString();
     if (!r.ok) { out.textContent = `[${stamp}] Failed: ${j.detail || r.status}\n\n` + out.textContent; return; }
     let s = `[${stamp}] ${full ? 'VACUUM FULL' : 'De-dup'} finished:\n`;
-    Object.entries(j).forEach(([k,v]) => { if (k !== 'ok') s += `   ${k}: ${typeof v === 'number' ? v.toLocaleString() : v}\n`; });
+    Object.entries(j).forEach(([k,v]) => {
+      if (k === 'ok') return;
+      if (k === 'vacuum_errors') {
+        s += `   ❌ FAILURES (${v.length}):\n`;
+        v.forEach(e => { s += `        ${e}\n`; });
+      } else {
+        s += `   ${k}: ${typeof v === 'number' ? v.toLocaleString() : v}\n`;
+      }
+    });
     s += `   → click "Check DB size" to see the new size.\n`;
     out.textContent = s + '\n' + out.textContent;
   } finally { btn.disabled = false; btn.textContent = orig; }

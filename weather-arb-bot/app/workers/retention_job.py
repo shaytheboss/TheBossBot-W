@@ -50,24 +50,44 @@ _SUMMARY_KEY_TO_TABLE = {
 }
 
 
+# Every table a retention/de-dup pass can bloat. A one-time VACUUM FULL must
+# cover ALL of them — the first version only ever vacuumed `forecasts`, so
+# market_prices (measured at 2,963 MB, by far the largest) was never reclaimed.
+_VACUUM_FULL_TABLES = [
+    "collector_miss", "model_skill", "virtual_exits", "markets",
+    "intraday_opportunities", "market_outcomes", "metar_observations",
+    "alerts", "opportunities", "pireps", "forecasts", "market_prices",
+]
+
+
 def vacuum_targets(deleted: dict, vacuum_full: bool) -> list[str]:
     """Pure helper: which tables to VACUUM after a prune run.
 
-    VACUUM only the tables that actually had rows removed. For a full vacuum
-    (one-time disk reclaim) always include `forecasts` — the big bloated table —
-    even if this particular run deleted nothing new. Pure → unit-testable.
+    Routine pass: only the tables that actually had rows removed.
+
+    vacuum_full: ALL known tables, ordered SMALLEST-FIRST. Order matters —
+    VACUUM FULL rewrites a table into a new file, so it needs free disk equal to
+    the table size. On a nearly-full volume the biggest table can fail for lack
+    of space; reclaiming the small ones first frees room for the big one.
+    Pure → unit-testable.
     """
+    if vacuum_full:
+        tables = list(_VACUUM_FULL_TABLES)
+        for key, n in (deleted or {}).items():
+            t = _SUMMARY_KEY_TO_TABLE.get(key)
+            if n and t and t not in tables:
+                tables.append(t)
+        return tables
+
     tables: list[str] = []
     for key, n in (deleted or {}).items():
         table = _SUMMARY_KEY_TO_TABLE.get(key)
         if n and table and table not in tables:
             tables.append(table)
-    if vacuum_full and "forecasts" not in tables:
-        tables.append("forecasts")
     return tables
 
 
-async def _run_vacuum(tables: list[str], full: bool = False) -> int:
+async def _run_vacuum(tables: list[str], full: bool = False) -> tuple[int, list[str]]:
     """Run VACUUM on the given tables. Never raises.
 
     Plain VACUUM (default) does NOT take an exclusive lock — safe on a live DB;
@@ -77,9 +97,15 @@ async def _run_vacuum(tables: list[str], full: bool = False) -> int:
     one-time reclaim right after the first big de-dup.
 
     VACUUM cannot run inside a transaction, so we use an AUTOCOMMIT engine.
+
+    Returns (succeeded_count, errors). Errors are RETURNED, not just logged: the
+    first version swallowed them, so a fully-failed run reported a bare
+    "tables_vacuumed: 0" with no way to see why (e.g. insufficient disk for the
+    rewrite, or a permission problem).
     """
+    errors: list[str] = []
     if not tables:
-        return 0
+        return 0, errors
     mode = "FULL, ANALYZE" if full else "ANALYZE"
     done = 0
     try:
@@ -90,10 +116,14 @@ async def _run_vacuum(tables: list[str], full: bool = False) -> int:
                     await conn.execute(text(f"VACUUM ({mode}) {t}"))
                     done += 1
                 except Exception as e:
-                    logger.error(f"[retention] VACUUM {t} failed: {e}", exc_info=True)
+                    msg = f"{t}: {type(e).__name__}: {e}"
+                    errors.append(msg)
+                    logger.error(f"[retention] VACUUM {msg}", exc_info=True)
     except Exception as e:
-        logger.error(f"[retention] VACUUM setup failed: {e}", exc_info=True)
-    return done
+        msg = f"connect: {type(e).__name__}: {e}"
+        errors.append(msg)
+        logger.error(f"[retention] VACUUM {msg}", exc_info=True)
+    return done, errors
 
 
 def compute_cutoffs(now: datetime, today: date, cfg) -> dict:
@@ -189,21 +219,26 @@ async def job_prune_old_data(vacuum_full: bool = False) -> dict:
                 )
                 await db.commit()
 
-    total = sum(summary.values())
+    total = sum(v for v in summary.values() if isinstance(v, int))
     if total:
         logger.info(f"[retention] deduped/pruned {total} rows: {summary}")
 
     # ── 3. VACUUM (outside any transaction, autocommit) ─────────────────────────
     # Plain VACUUM keeps bloat in check (safe, non-locking). vacuum_full=True does
-    # a one-time disk reclaim (locks the table briefly) — use it once after the
-    # first big de-dup to actually shrink the Railway Volume.
+    # a one-time disk reclaim (locks each table briefly) — this is what actually
+    # returns space to the OS and shrinks the Railway Volume.
     if getattr(settings, "retention_vacuum_enabled", True) or vacuum_full:
         targets = vacuum_targets(summary, vacuum_full)
         if targets:
-            n = await _run_vacuum(targets, full=vacuum_full)
+            n, errors = await _run_vacuum(targets, full=vacuum_full)
             summary["tables_vacuumed"] = n
+            summary["tables_attempted"] = len(targets)
+            if errors:
+                # Surface failures to the caller/UI instead of silently reporting 0.
+                summary["vacuum_errors"] = errors
             logger.info(
-                f"[retention] VACUUM{' FULL' if vacuum_full else ''} on {targets} "
-                f"({n} table(s))"
+                f"[retention] VACUUM{' FULL' if vacuum_full else ''}: "
+                f"{n}/{len(targets)} succeeded"
+                + (f", {len(errors)} failed" if errors else "")
             )
     return summary
