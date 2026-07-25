@@ -122,15 +122,17 @@ async def lifespan(app: FastAPI):
                 id="retention", next_run_time=now + timedelta(minutes=10),
                 max_instances=1, misfire_grace_time=3600,
             )
-        # Memory heartbeat — logs process RSS every 15 min so the Logs tab shows
-        # the RAM curve and which job precedes each jump. Cheap; helps locate the
-        # leak the DB-side retention work did not address.
+        # Memory heartbeat — logs the RAM curve so the Logs tab shows growth over
+        # time and which job precedes each jump.
+        # STRICTLY CHEAP: reads /proc + the allocator block counter only. No
+        # gc.collect() and no gc.get_objects() — those hold the GIL for ~1s on a
+        # large heap and would stall the webhook / price fetches / analyzer every
+        # 15 minutes. The heap census is on-demand only (/admin/memory?deep=true).
         async def _mem_heartbeat():
             try:
-                from app.utils.memdiag import rss_mb
-                import gc as _gc
-                _gc.collect()
-                logger.info(f"[mem] RSS={rss_mb()} MB tracked_objs={len(_gc.get_objects())}")
+                from app.utils.memdiag import light_snapshot
+                s = light_snapshot()
+                logger.info(f"[mem] RSS={s['rss_mb']} MB blocks={s['allocated_blocks']:,}")
             except Exception as e:
                 logger.debug(f"[mem] heartbeat failed: {e}")
         _scheduler.add_job(_mem_heartbeat, IntervalTrigger(seconds=900),

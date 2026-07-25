@@ -132,15 +132,23 @@ async def admin_discover(_: str = Depends(require_admin)):
 
 
 @router.get("/memory")
-async def admin_memory(_: str = Depends(require_admin)):
-    """Live memory diagnostic: RSS, GC, top object types, DB pool, tracemalloc.
+async def admin_memory(
+    deep: bool = Query(default=False, description="Full heap census — FREEZES the app ~1s. Opt-in."),
+    _: str = Depends(require_admin),
+):
+    """Memory diagnostic.
 
-    Call it now and again in a few hours — a type whose count climbs is the leak.
-    Read-only and cheap. Enable deep allocation tracing by setting env
-    TRACEMALLOC=1 before start (adds overhead, off by default).
+    Default (deep=false) is the LIGHT snapshot: RSS, allocator block count, GC
+    counters and DB pool. Sub-millisecond, no GC pass, no heap walk — safe to
+    call any time, it cannot disturb trading.
+
+    deep=true additionally walks the whole heap to census object types. That
+    holds the GIL for roughly 0.7-1.3s on a large heap, freezing the Telegram
+    webhook, Polymarket fetches and the analyzer for that moment. Use it
+    deliberately, when a short pause is acceptable.
     """
     from app.utils.memdiag import snapshot
-    return snapshot()
+    return snapshot(deep=deep)
 
 
 @router.post("/prune-old-data")
