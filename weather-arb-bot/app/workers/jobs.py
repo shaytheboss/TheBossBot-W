@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-from sqlalchemy import select, func as sqlfunc
+from sqlalchemy import select, text, func as sqlfunc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -684,12 +684,55 @@ async def job_fetch_polymarket():
         if not outcomes:
             logger.debug("job_fetch_polymarket: no outcomes with token_id")
             return
+
+        # Load the latest stored price for every outcome in ONE query, so each
+        # poll can skip writing a row when the price has not moved. Previously
+        # this job inserted a row per outcome per run unconditionally and
+        # committed each one separately — ~290k rows/day and one transaction per
+        # outcome. DISTINCT ON rides the (outcome_id, timestamp) unique index.
+        ids = [o.id for o in outcomes]
+        last_map: dict = {}
+        try:
+            rows = (await db.execute(
+                text(
+                    "SELECT DISTINCT ON (outcome_id) outcome_id, yes_price, timestamp "
+                    "FROM market_prices WHERE outcome_id = ANY(:ids) "
+                    "ORDER BY outcome_id, timestamp DESC"
+                ),
+                {"ids": ids},
+            )).all()
+            last_map = {r.outcome_id: (r.yes_price, r.timestamp) for r in rows}
+        except Exception as e:
+            # Without the map every price is treated as new — correct, just less
+            # efficient. Never let this optimisation break price collection.
+            logger.warning(f"job_fetch_polymarket: last-price lookup failed: {e}")
+
         logger.info(f"job_fetch_polymarket: fetching prices for {len(outcomes)} outcomes")
+        written = skipped = 0
         for outcome in outcomes:
             try:
-                await poly_col.collect_and_store(outcome.id, outcome.token_id, db)
+                res = await poly_col.collect_and_store(
+                    outcome.id, outcome.token_id, db,
+                    last=last_map.get(outcome.id),
+                    commit=False,          # one commit for the whole batch
+                )
+                if res is None:
+                    continue
+                if res.get("skipped"):
+                    skipped += 1
+                else:
+                    written += 1
             except Exception as e:
                 logger.error(f"Polymarket job failed for outcome {outcome.id}: {e}")
+        try:
+            await db.commit()
+        except Exception as e:
+            logger.error(f"job_fetch_polymarket: commit failed: {e}")
+            await db.rollback()
+        logger.info(
+            f"job_fetch_polymarket: {written} price rows written, "
+            f"{skipped} unchanged (skipped)"
+        )
 
 
 async def job_run_intraday():

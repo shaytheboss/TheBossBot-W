@@ -67,6 +67,9 @@ class MarketPrice(Base):
     outcome = relationship("MarketOutcome", back_populates="prices")
 
     __table_args__ = (
+        # The unique constraint IS a unique btree index on (outcome_id, timestamp)
+        # and already serves every lookup/range/ORDER BY on those columns. A
+        # second plain index on the same columns was pure overhead (~650 MB at
+        # 17.5M rows) — dropped in migration 020.
         UniqueConstraint("outcome_id", "timestamp", name="uq_price_outcome_time"),
-        Index("idx_prices_outcome_time", "outcome_id", "timestamp"),
     )

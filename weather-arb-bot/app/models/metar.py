@@ -20,6 +20,8 @@ class MetarObservation(Base):
     raw_metar = Column(Text)
 
     __table_args__ = (
+        # The unique constraint already provides a btree index on
+        # (icao, observed_at); the duplicate plain index was dropped in
+        # migration 020.
         UniqueConstraint("icao", "observed_at", name="uq_metar_icao_time"),
-        Index("idx_metar_icao_time", "icao", "observed_at"),
     )

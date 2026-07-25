@@ -93,10 +93,14 @@ async def database_size(
         # the file stays large — the space is merely marked reusable, never
         # returned to the OS. Only VACUUM FULL rewrites the file. A market_prices
         # row (6 numbers) should be ~100 bytes; tens of KB/row means bloat.
+        # NOTE: `live` is pg_stat's ESTIMATE and can be wildly wrong — in
+        # production market_prices reported 3,561 live rows while COUNT(*)
+        # returned 17,532,604. Deriving bloat from it produced a false
+        # "BLOATED" alarm on tables that were simply full of real data, so the
+        # estimate is NEVER used to declare bloat. A verdict is only issued
+        # once exact_counts has supplied a real number (filled in below).
         bpr = (total_b / live) if live > 0 else None
-        is_bloated = total_b >= _BLOAT_MIN_BYTES and (live == 0 or (bpr or 0) > _BLOAT_BYTES_PER_ROW)
-        if is_bloated:
-            bloated.append(r.table_name)
+        is_bloated = False
         tables.append({
             "table": r.table_name,
             "total_mb": _mb(r.total_bytes),
@@ -105,7 +109,9 @@ async def database_size(
             "live_rows": live,
             "dead_rows": dead,
             "bytes_per_row": round(bpr) if bpr else None,
+            "bytes_per_row_is_estimate": True,
             "bloated": is_bloated,
+            "_total_bytes": total_b,
             "last_vacuum": r.last_vacuum.isoformat() if r.last_vacuum else None,
             "last_autovacuum": r.last_autovacuum.isoformat() if r.last_autovacuum else None,
         })
@@ -124,13 +130,35 @@ async def database_size(
             name = t["table"]
             try:
                 # Table names come from the catalog, not user input.
-                n = (await db.execute(text(f'SELECT count(*) FROM "{name}"'))).scalar_one()
-                exact[name] = int(n)
-                t["exact_rows"] = int(n)
+                n = int((await db.execute(text(f'SELECT count(*) FROM "{name}"'))).scalar_one())
+                exact[name] = n
+                t["exact_rows"] = n
+                # Recompute bytes-per-row from the TRUE count, and only now
+                # decide bloat. A table storing real rows at a sane size is not
+                # bloated no matter what pg_stat estimated.
+                total_b = t.pop("_total_bytes", 0)
+                if n > 0:
+                    real_bpr = total_b / n
+                    t["bytes_per_row"] = round(real_bpr)
+                    t["bytes_per_row_is_estimate"] = False
+                    if total_b >= _BLOAT_MIN_BYTES and real_bpr > _BLOAT_BYTES_PER_ROW:
+                        t["bloated"] = True
+                        bloated.append(name)
+                elif total_b >= _BLOAT_MIN_BYTES:
+                    # Genuinely empty yet occupying real space → true bloat.
+                    t["bytes_per_row"] = None
+                    t["bytes_per_row_is_estimate"] = False
+                    t["bloated"] = True
+                    bloated.append(name)
             except Exception as e:
                 logger.warning(f"[dbdiag] count failed for {name}: {e}")
                 exact[name] = None
         out["exact_rows"] = exact
+        out["bloated_tables"] = bloated
+        out["vacuum_full_recommended"] = bool(bloated) or dead_total > 100_000
+
+    for t in tables:
+        t.pop("_total_bytes", None)
     # Recommend VACUUM FULL on EITHER signal: lots of dead tuples, or bloated
     # files whose space autovacuum already freed internally but never released.
     out["vacuum_full_recommended"] = bool(bloated) or dead_total > 100_000
