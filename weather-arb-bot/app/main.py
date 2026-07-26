@@ -29,6 +29,14 @@ _scheduler = None
 async def lifespan(app: FastAPI):
     global _bot_app, _scheduler
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Third-party request loggers are extremely chatty here: httpx logs EVERY
+    # HTTP call at INFO, including the full URL with a 78-char Polymarket
+    # token_id. The bot makes ~1,600 calls per 5-minute cycle (midpoint + book
+    # per outcome), i.e. roughly 460,000 log lines / ~70 MB per day of pure
+    # noise that also buries the bot's own messages. Warnings and errors from
+    # these libraries are still shown.
+    for _noisy in ("httpx", "httpcore", "urllib3", "telegram.ext", "apscheduler.executors"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     install_buffer_handler()
     # Optional deep allocation tracing to hunt the RAM leak (adds overhead → opt-in).
     if os.getenv("TRACEMALLOC", "").lower() in ("1", "true", "yes"):
