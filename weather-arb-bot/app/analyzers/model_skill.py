@@ -164,14 +164,32 @@ async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[tuple, dict
 
     # 2. כל תחזיות המודלים לימי-האירוע הרלוונטיים
     event_days = sorted({market_dates[mid] for mid in winners_by_market})
+    # Select ONLY the four columns this function actually uses, never the whole
+    # Forecast entity.
+    #
+    # select(Forecast) loads every column including raw_data (JSONB holding the
+    # ensemble member arrays), which is by far the largest part of a row and is
+    # TOASTed out-of-line. This job runs hourly for all 48 cities over a 90-day
+    # window, so loading full entities dragged most of the 692 MB forecasts
+    # table — TOAST pages and all — through the page cache every hour. That is
+    # what kept Postgres's cache (and therefore the Railway RAM bill) hot.
+    #
+    # Reading just these columns keeps the scan on the main heap and skips TOAST
+    # entirely. Identical results: only source, forecast_for_date, retrieved_at
+    # and predicted_high_f are read below.
     fc_rows = (await db.execute(
-        select(Forecast).where(
+        select(
+            Forecast.source,
+            Forecast.forecast_for_date,
+            Forecast.retrieved_at,
+            Forecast.predicted_high_f,
+        ).where(
             Forecast.city_id == city_id,
             Forecast.source.in_(SKILL_SOURCES),
             Forecast.forecast_for_date.in_(event_days),
             Forecast.predicted_high_f.isnot(None),
         )
-    )).scalars().all()
+    )).all()
 
     # 3. לכל (source, event_date, days_ahead) — שמור את התחזית עם retrieved_at
     #    המאוחר ביותר בתוך אותו יום-הקדמה.
