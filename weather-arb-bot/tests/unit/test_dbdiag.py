@@ -108,6 +108,10 @@ class _CountingDB(_FakeDB):
             return _FakeResult(scalar=self._total)
         if self._calls == 2:
             return _FakeResult(rows=self._rows)
+        # From here the refresh path alternates: ANALYZE, then reltuples.
+        self._refresh_calls = getattr(self, "_refresh_calls", 0) + 1
+        if self._refresh_calls % 2 == 1:
+            return _FakeResult(scalar=None)          # ANALYZE returns nothing
         return _FakeResult(scalar=self._counts.pop(0))
 
 
