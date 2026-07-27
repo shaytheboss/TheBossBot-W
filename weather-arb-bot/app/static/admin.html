@@ -151,7 +151,7 @@
       <p class="small">One row per settled bet (last 90 days) with <strong>each model's forecast, its probability, the per-city weights, sigma, stated confidence, entry price — and the actual win/loss</strong>. This is the full decision-time record used to reconstruct exactly how the % is computed and to backtest scoring improvements against real results.</p>
       <h3 style="margin-top:24px;">💾 Database size &amp; maintenance
         <button class="btn primary small" onclick="showDbSize(this,false)" title="Total database size, largest tables, and bloat">📊 Check DB size</button>
-        <button class="btn small" onclick="showDbSize(this,true)" title="Same, plus an exact COUNT(*) on the biggest tables — slower but definitive">🔢 + exact row counts</button>
+        <button class="btn small" onclick="showDbSize(this,true)" title="Refresh the row statistics (ANALYZE) on the biggest tables — cheap, and fixes wildly stale estimates">🔄 Refresh row counts</button>
         <button class="btn small" onclick="runPrune(this,false)" title="Run the de-dup now: removes duplicate hourly forecast rows. Lossless — nothing the bot reads is lost.">🧹 Run de-dup</button>
         <button class="btn small" onclick="runPrune(this,true)" title="VACUUM FULL: physically returns deleted space to disk. Pauses DB writes for up to a few minutes.">🗜️ Shrink DB (VACUUM FULL)</button>
       </h3>
@@ -1402,7 +1402,7 @@ async function showDbSize(btn, exact) {
     const hasExact = (j.tables || []).some(t => t.exact_rows !== undefined);
     const pad = (v, n) => String(v).padStart(n) + ' ';   // trailing space: columns can never merge
     s += `\n${'table'.padEnd(24)}${pad('total MB',10)}${pad('index MB',10)}`
-       + (hasExact ? pad('EXACT rows',14) : pad('est. rows',12))
+       + (hasExact ? pad('rows (fresh)',14) : pad('est. rows',12))
        + pad('B/row',11) + `\n`;
     s += '-'.repeat(hasExact ? 74 : 70) + '\n';
     (j.tables || []).forEach(t => {
@@ -1416,7 +1416,7 @@ async function showDbSize(btn, exact) {
          + pad((rows == null ? '-' : rows.toLocaleString()) + (hasExact && t.exact_rows === undefined ? '~' : ''), hasExact ? 14 : 12)
          + pad(bpr, 11) + `\n`;
     });
-    if (!hasExact) s += `\n(row counts are pg_stat ESTIMATES and can be very wrong — use "🔢 + exact row counts" for the truth)\n`;
+    if (!hasExact) s += `\n(row counts are pg_stat estimates and can be very stale — use "🔄 Refresh row counts" to update them)\n`;
     out.textContent = s + '\n' + out.textContent;
   } finally { btn.disabled = false; btn.textContent = orig; }
 }

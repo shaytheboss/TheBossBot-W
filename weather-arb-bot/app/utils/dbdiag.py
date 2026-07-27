@@ -59,9 +59,11 @@ async def database_size(
 ) -> dict:
     """Total DB size + the largest tables, with bloat detection. Never raises.
 
-    exact_counts=True adds a real COUNT(*) for the `exact_limit` biggest tables
-    (slow on bloated tables, but definitive — the pg_stat estimates can be wildly
-    wrong or reset to 0 right after a vacuum).
+    exact_counts=True REFRESHES the row statistics for the `exact_limit` biggest
+    tables (ANALYZE + pg_class.reltuples) instead of trusting stale pg_stat
+    numbers, which can be wildly wrong — market_prices once reported 3,561 rows
+    when it held 17.5M. ANALYZE samples a bounded number of pages, so this stays
+    cheap; a literal COUNT(*) would read the entire multi-GB table on every call.
     """
     out: dict = {}
     try:
@@ -130,7 +132,20 @@ async def database_size(
             name = t["table"]
             try:
                 # Table names come from the catalog, not user input.
-                n = int((await db.execute(text(f'SELECT count(*) FROM "{name}"'))).scalar_one())
+                # ANALYZE + reltuples instead of COUNT(*).
+                #
+                # COUNT(*) sequentially scans the WHOLE table: on market_prices
+                # that reads ~3 GB from disk into the page cache on every click,
+                # which measurably drove up the Railway bill during diagnosis.
+                # ANALYZE samples a bounded number of pages (fast, light lock)
+                # and refreshes pg_class.reltuples, giving a count accurate to a
+                # few percent — far more than enough to tell 3,561 apart from
+                # 17.5M, which is the whole point of this readout.
+                await db.execute(text(f'ANALYZE "{name}"'))
+                n = int((await db.execute(
+                    text("SELECT reltuples::bigint FROM pg_class WHERE relname = :n"),
+                    {"n": name},
+                )).scalar_one())
                 exact[name] = n
                 t["exact_rows"] = n
                 # Recompute bytes-per-row from the TRUE count, and only now
