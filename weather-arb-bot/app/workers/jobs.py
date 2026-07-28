@@ -673,14 +673,48 @@ async def job_fetch_pireps():
                 logger.error(f"PIREP job failed for {city.name}: {e}")
 
 
+FAR_MARKET_POLL_SECONDS = 1800   # distant markets: refresh at most every 30 min
+
+
+def should_poll_now(
+    event_date,
+    today,
+    horizon_days: int,
+    last_ts,
+    now,
+    far_interval_seconds: int = FAR_MARKET_POLL_SECONDS,
+) -> bool:
+    """Decide whether an outcome needs a price poll on this run.
+
+    The analyzer only trades markets within `max_days_ahead_for_alert` (3 days),
+    but this job polled EVERY unresolved market every 5 minutes — including ones
+    a week out that will not be traded for days. Each poll is an HTTP call
+    (CPU + egress) and a potential row.
+
+    Near markets (inside the trading horizon) keep full 5-minute resolution.
+    Far markets are refreshed at most every `far_interval_seconds`, which still
+    builds price history for when they enter the horizon. Pure → unit-testable.
+    """
+    if event_date is None:
+        return True                      # unknown horizon: never skip
+    days_ahead = (event_date - today).days
+    if days_ahead <= horizon_days:
+        return True                      # tradeable soon → full resolution
+    if last_ts is None:
+        return True                      # no history yet → seed it
+    return (now - last_ts).total_seconds() >= far_interval_seconds
+
+
 async def job_fetch_polymarket():
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(MarketOutcome)
-            .join(Market)
+            select(MarketOutcome, Market.event_date)
+            .join(Market, Market.id == MarketOutcome.market_id)
             .where(Market.resolved == False, MarketOutcome.token_id != None)
         )
-        outcomes = result.scalars().all()
+        rows_oc = result.all()
+        outcomes = [oc for oc, _ev in rows_oc]
+        event_by_outcome = {oc.id: ev for oc, ev in rows_oc}
         if not outcomes:
             logger.debug("job_fetch_polymarket: no outcomes with token_id")
             return
@@ -707,9 +741,25 @@ async def job_fetch_polymarket():
             # efficient. Never let this optimisation break price collection.
             logger.warning(f"job_fetch_polymarket: last-price lookup failed: {e}")
 
-        logger.info(f"job_fetch_polymarket: fetching prices for {len(outcomes)} outcomes")
+        # Skip distant markets on most runs — no HTTP call at all for them.
+        today = date.today()
+        now = datetime.now(timezone.utc)
+        horizon = int(getattr(settings, "max_days_ahead_for_alert", 3))
+        due = [
+            oc for oc in outcomes
+            if should_poll_now(
+                event_by_outcome.get(oc.id), today, horizon,
+                (last_map.get(oc.id) or (None, None))[1], now,
+            )
+        ]
+        deferred = len(outcomes) - len(due)
+
+        logger.info(
+            f"job_fetch_polymarket: polling {len(due)} of {len(outcomes)} outcomes "
+            f"({deferred} beyond the {horizon}-day horizon deferred)"
+        )
         written = skipped = 0
-        for outcome in outcomes:
+        for outcome in due:
             try:
                 res = await poly_col.collect_and_store(
                     outcome.id, outcome.token_id, db,
