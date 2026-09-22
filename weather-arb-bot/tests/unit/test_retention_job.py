@@ -105,8 +105,8 @@ class TestVacuumErrorReporting:
             def connect(self): return _Conn()
 
         monkeypatch.setattr(rj, "engine", _Eng())
-        done, errors = await rj._run_vacuum(["market_prices"], full=True)
-        assert done == 0
+        done, errors, skipped = await rj._run_vacuum(["market_prices"], full=True)
+        assert done == 0 and skipped == []
         assert len(errors) == 1
         assert "market_prices" in errors[0]
         assert "No space left on device" in errors[0]
@@ -125,13 +125,13 @@ class TestVacuumErrorReporting:
             def connect(self): return _Conn()
 
         monkeypatch.setattr(rj, "engine", _Eng())
-        done, errors = await rj._run_vacuum(["forecasts", "market_prices"], full=True)
-        assert done == 2 and errors == []
+        done, errors, skipped = await rj._run_vacuum(["forecasts", "market_prices"], full=True)
+        assert done == 2 and errors == [] and skipped == []
 
     @pytest.mark.asyncio
     async def test_empty_targets_short_circuits(self):
         import app.workers.retention_job as rj
-        assert await rj._run_vacuum([], full=True) == (0, [])
+        assert await rj._run_vacuum([], full=True) == (0, [], [])
 
 
 # ── 2. compute_cutoffs is correct arithmetic ───────────────────────────────────
@@ -262,3 +262,106 @@ async def test_retention_delete_is_portable_and_correct(db):
     await db.commit()
     remaining = (await db.execute(select(func.count()).select_from(MetarObservation))).scalar_one()
     assert remaining == 1, "only the 5-day-old row survives a 45-day window"
+
+
+# ── VACUUM FULL size guard ────────────────────────────────────────────────────
+
+class TestVacuumFullSizeGuard:
+    """VACUUM FULL must refuse a table it cannot rewrite safely.
+
+    The rewrite builds a complete new copy — heap and every index — and only
+    drops the original once it finishes. market_prices measured 2,754 MB
+    against ~750 MB free: Postgres would write until the volume hit 100%, then
+    fail and roll back. The rollback is clean, but while the disk is full the
+    bot's own INSERTs fail too. Not reclaiming the space is strictly better.
+    """
+
+    @staticmethod
+    def _engine(monkeypatch, sizes_mb: dict, executed: list):
+        import app.workers.retention_job as rj
+
+        class _Res:
+            def __init__(self, rows): self._rows = rows
+            def all(self): return self._rows
+
+        class _Row:
+            def __init__(self, name, mb): self.name, self.bytes = name, int(mb * 1024 * 1024)
+
+        class _Conn:
+            async def execute(self, stmt, *a, **kw):
+                sql = str(stmt)
+                if "pg_total_relation_size" in sql:
+                    return _Res([_Row(n, mb) for n, mb in sizes_mb.items()])
+                executed.append(sql)
+                return None
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class _Eng:
+            def execution_options(self, **kw): return self
+            def connect(self): return _Conn()
+
+        monkeypatch.setattr(rj, "engine", _Eng())
+        return rj
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_table_is_skipped_not_attempted(self, monkeypatch):
+        executed: list = []
+        rj = self._engine(monkeypatch, {"market_prices": 2754.0, "forecasts": 56.0}, executed)
+
+        done, errors, skipped = await rj._run_vacuum(
+            ["forecasts", "market_prices"], full=True, max_table_mb=1000
+        )
+        assert done == 1 and errors == []
+        assert len(skipped) == 1 and "market_prices" in skipped[0]
+        assert not any("market_prices" in s for s in executed), (
+            "the statement must never be sent — attempting it is what fills the disk"
+        )
+        assert any("forecasts" in s for s in executed)
+
+    @pytest.mark.asyncio
+    async def test_the_skip_message_names_the_numbers(self, monkeypatch):
+        rj = self._engine(monkeypatch, {"market_prices": 2754.0}, [])
+        _, _, skipped = await rj._run_vacuum(["market_prices"], full=True, max_table_mb=1000)
+        assert "2754" in skipped[0] and "1000" in skipped[0]
+
+    @pytest.mark.asyncio
+    async def test_a_table_that_fits_is_rewritten(self, monkeypatch):
+        executed: list = []
+        rj = self._engine(monkeypatch, {"forecasts": 999.0}, executed)
+        done, _, skipped = await rj._run_vacuum(["forecasts"], full=True, max_table_mb=1000)
+        assert done == 1 and skipped == []
+
+    @pytest.mark.asyncio
+    async def test_plain_vacuum_is_never_size_limited(self, monkeypatch):
+        """Plain VACUUM rewrites nothing and needs no extra disk, so the cap
+        must not stop it from keeping a huge table's bloat in check."""
+        executed: list = []
+        rj = self._engine(monkeypatch, {"market_prices": 2754.0}, executed)
+        done, _, skipped = await rj._run_vacuum(["market_prices"], full=False, max_table_mb=1000)
+        assert done == 1 and skipped == []
+        assert "FULL" not in executed[0]
+
+    @pytest.mark.asyncio
+    async def test_no_cap_means_no_guard(self, monkeypatch):
+        executed: list = []
+        rj = self._engine(monkeypatch, {"market_prices": 2754.0}, executed)
+        done, _, skipped = await rj._run_vacuum(["market_prices"], full=True, max_table_mb=None)
+        assert done == 1 and skipped == []
+
+    @pytest.mark.asyncio
+    async def test_an_unmeasurable_table_is_allowed_through(self, monkeypatch):
+        """If the size lookup fails or omits a table, maintenance proceeds. The
+        guard is a safety net, not a gate that can block all vacuuming."""
+        executed: list = []
+        rj = self._engine(monkeypatch, {}, executed)
+        done, _, skipped = await rj._run_vacuum(["forecasts"], full=True, max_table_mb=1000)
+        assert done == 1 and skipped == []
+
+    def test_the_cap_is_configurable_and_sane(self):
+        from app.config import settings
+        from app.workers.retention_job import VACUUM_FULL_MAX_TABLE_MB
+        cap = type(settings).model_fields["vacuum_full_max_table_mb"].default
+        assert cap == VACUUM_FULL_MAX_TABLE_MB
+        # Must sit below the measured market_prices size, or the guard is a no-op.
+        assert 100 <= cap < 2754

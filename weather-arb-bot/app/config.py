@@ -131,6 +131,12 @@ class Settings(BaseSettings):
     # Plain VACUUM after each run keeps table bloat in check (safe, non-locking).
     # A one-time VACUUM FULL (via the admin endpoint) actually shrinks the disk.
     retention_vacuum_enabled: bool = True
+    # VACUUM FULL rewrites a table into a new file before dropping the old one,
+    # so it transiently needs free disk for the whole relation. Anything bigger
+    # than this is skipped and reported instead of attempted: market_prices is
+    # 2,754 MB against ~750 MB free, and the attempt would fill the volume —
+    # taking the bot's own writes down — before failing anyway.
+    vacuum_full_max_table_mb: int = 1000
     retention_run_interval: int = 86400   # daily
     forecast_retention_days: int = 120
     metar_retention_days: int = 45

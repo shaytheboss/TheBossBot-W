@@ -29,6 +29,7 @@ Isolated module (like icon_job/tomorrowio_job) so it can never regress the
 existing jobs. Every statement is guarded; a failure logs and moves on.
 """
 import logging
+from typing import Optional
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import text
@@ -61,6 +62,36 @@ _VACUUM_FULL_TABLES = [
 ]
 
 
+# VACUUM FULL rewrites a table into a NEW file and only drops the old one when
+# the rewrite completes, so it transiently needs free disk of roughly the whole
+# relation — heap plus every index. market_prices measured 2,754 MB against
+# ~750 MB free: Postgres would write until the volume hit 100%, fail, and roll
+# back. The rollback is clean, but while the disk is full the bot's own writes
+# fail too, which is a far worse outcome than simply not reclaiming the space.
+#
+# So a table is only rewritten when it comfortably fits. This is a size cap, not
+# a free-space check, because the app runs in a different container from
+# Postgres and cannot see that volume — the cap is the honest approximation.
+VACUUM_FULL_MAX_TABLE_MB = 1_000
+
+_RELATION_SIZE_SQL = """
+SELECT c.relname AS name, pg_total_relation_size(c.oid) AS bytes
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind = 'r'
+"""
+
+
+async def _relation_sizes(conn) -> dict[str, float]:
+    """{table: total MB}. Empty on any failure — the caller then skips the
+    guard rather than blocking maintenance on a diagnostic query."""
+    try:
+        rows = (await conn.execute(text(_RELATION_SIZE_SQL))).all()
+    except Exception as e:
+        logger.warning(f"[retention] relation-size lookup failed: {e}")
+        return {}
+    return {r.name: (r.bytes or 0) / 1024 / 1024 for r in rows}
+
+
 def vacuum_targets(deleted: dict, vacuum_full: bool) -> list[str]:
     """Pure helper: which tables to VACUUM after a prune run.
 
@@ -88,7 +119,11 @@ def vacuum_targets(deleted: dict, vacuum_full: bool) -> list[str]:
     return tables
 
 
-async def _run_vacuum(tables: list[str], full: bool = False) -> tuple[int, list[str]]:
+async def _run_vacuum(
+    tables: list[str],
+    full: bool = False,
+    max_table_mb: Optional[float] = None,
+) -> tuple[int, list[str], list[str]]:
     """Run VACUUM on the given tables. Never raises.
 
     Plain VACUUM (default) does NOT take an exclusive lock — safe on a live DB;
@@ -99,20 +134,35 @@ async def _run_vacuum(tables: list[str], full: bool = False) -> tuple[int, list[
 
     VACUUM cannot run inside a transaction, so we use an AUTOCOMMIT engine.
 
-    Returns (succeeded_count, errors). Errors are RETURNED, not just logged: the
-    first version swallowed them, so a fully-failed run reported a bare
-    "tables_vacuumed: 0" with no way to see why (e.g. insufficient disk for the
-    rewrite, or a permission problem).
+    `max_table_mb` applies to VACUUM FULL only: a relation bigger than this is
+    SKIPPED rather than attempted, because the rewrite would fill the volume
+    before failing and take the bot's writes down with it. Skipped tables are
+    reported, never silently dropped.
+
+    Returns (succeeded_count, errors, skipped). Errors are RETURNED, not just
+    logged: the first version swallowed them, so a fully-failed run reported a
+    bare "tables_vacuumed: 0" with no way to see why.
     """
     errors: list[str] = []
+    skipped: list[str] = []
     if not tables:
-        return 0, errors
+        return 0, errors, skipped
     mode = "FULL, ANALYZE" if full else "ANALYZE"
     done = 0
     try:
         ac_engine = engine.execution_options(isolation_level="AUTOCOMMIT")
         async with ac_engine.connect() as conn:
+            sizes = await _relation_sizes(conn) if (full and max_table_mb) else {}
             for t in tables:
+                size_mb = sizes.get(t)
+                if full and max_table_mb and size_mb and size_mb > max_table_mb:
+                    skipped.append(f"{t}: {size_mb:.0f} MB > {max_table_mb:.0f} MB cap")
+                    logger.warning(
+                        f"[retention] skipping VACUUM FULL on {t} ({size_mb:.0f} MB): "
+                        f"the rewrite needs that much free disk again and would "
+                        f"fill the volume before failing"
+                    )
+                    continue
                 try:
                     await conn.execute(text(f"VACUUM ({mode}) {t}"))
                     done += 1
@@ -124,7 +174,7 @@ async def _run_vacuum(tables: list[str], full: bool = False) -> tuple[int, list[
         msg = f"connect: {type(e).__name__}: {e}"
         errors.append(msg)
         logger.error(f"[retention] VACUUM {msg}", exc_info=True)
-    return done, errors
+    return done, errors, skipped
 
 
 def compute_cutoffs(now: datetime, today: date, cfg) -> dict:
@@ -310,15 +360,24 @@ async def job_prune_old_data(vacuum_full: bool = False) -> dict:
     if getattr(settings, "retention_vacuum_enabled", True) or vacuum_full:
         targets = vacuum_targets(summary, vacuum_full)
         if targets:
-            n, errors = await _run_vacuum(targets, full=vacuum_full)
+            cap = float(getattr(settings, "vacuum_full_max_table_mb",
+                                VACUUM_FULL_MAX_TABLE_MB))
+            n, errors, skipped = await _run_vacuum(
+                targets, full=vacuum_full, max_table_mb=cap
+            )
             summary["tables_vacuumed"] = n
             summary["tables_attempted"] = len(targets)
             if errors:
                 # Surface failures to the caller/UI instead of silently reporting 0.
                 summary["vacuum_errors"] = errors
+            if skipped:
+                # A skip is a decision, not a failure — say so explicitly so the
+                # screen does not read it as "nothing happened".
+                summary["vacuum_skipped_too_large"] = skipped
             logger.info(
                 f"[retention] VACUUM{' FULL' if vacuum_full else ''}: "
                 f"{n}/{len(targets)} succeeded"
                 + (f", {len(errors)} failed" if errors else "")
+                + (f", {len(skipped)} skipped (too large)" if skipped else "")
             )
     return summary

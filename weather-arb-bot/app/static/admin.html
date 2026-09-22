@@ -1457,6 +1457,14 @@ async function runPrune(btn, full) {
       if (k === 'vacuum_errors') {
         s += `   ❌ FAILURES (${v.length}):\n`;
         v.forEach(e => { s += `        ${e}\n`; });
+      } else if (k === 'vacuum_skipped_too_large') {
+        // A deliberate skip, not a failure. Rewriting one of these needs free
+        // disk equal to the whole table, which would fill the volume and take
+        // the bot's writes down before failing anyway.
+        s += `   ⏭  SKIPPED — too large to rewrite safely (${v.length}):\n`;
+        v.forEach(e => { s += `        ${e}\n`; });
+        s += `        (a rewrite needs that much free disk again; grow the\n`
+           + `         volume first if you want these reclaimed)\n`;
       } else {
         s += `   ${k}: ${typeof v === 'number' ? v.toLocaleString() : v}\n`;
       }
