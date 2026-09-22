@@ -50,8 +50,61 @@ _BLOAT_MIN_BYTES = 50 * 1024 * 1024      # only consider tables >= 50 MB
 _BLOAT_BYTES_PER_ROW = 5_000             # >5 KB per row is far above any real row
 
 
+# Per-index sizes. `pg_total_relation_size - pg_relation_size - pg_indexes_size`
+# is the TOAST side, which the table query already implies — but indexes it does
+# not break down, and on this database that is where the space went:
+# market_prices measured 2,754 MB total of which 1,348 MB (49%) is indexes.
+# Knowing WHICH index costs what is the difference between dropping a redundant
+# one and guessing.
+_INDEX_SIZE_SQL = """
+SELECT
+    i.relname                    AS index_name,
+    t.relname                    AS table_name,
+    pg_relation_size(i.oid)      AS index_bytes,
+    ix.indisunique               AS is_unique,
+    ix.indisprimary              AS is_primary,
+    pg_get_indexdef(i.oid)       AS definition,
+    COALESCE(s.idx_scan, 0)      AS scans
+FROM pg_index ix
+JOIN pg_class i  ON i.oid = ix.indexrelid
+JOIN pg_class t  ON t.oid = ix.indrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = i.oid
+WHERE n.nspname = 'public'
+ORDER BY pg_relation_size(i.oid) DESC
+LIMIT :limit
+"""
+
+
 def _mb(v: Optional[int]) -> Optional[float]:
     return round(v / 1024 / 1024, 1) if v is not None else None
+
+
+async def index_sizes(db, limit: int = 25) -> list[dict]:
+    """Largest indexes, with their scan counts. Read-only; never raises.
+
+    `scans` is the number of index scans since the last stats reset. An index
+    that is large and has never been scanned is pure cost — but read the number
+    carefully: a unique index also enforces a constraint, so a zero scan count
+    is a reason to investigate, not to drop.
+    """
+    try:
+        rows = (await db.execute(text(_INDEX_SIZE_SQL), {"limit": limit})).all()
+    except Exception as e:
+        logger.warning(f"[dbdiag] index query failed: {e}")
+        return []
+    return [
+        {
+            "index": r.index_name,
+            "table": r.table_name,
+            "size_mb": _mb(r.index_bytes),
+            "unique": bool(r.is_unique),
+            "primary": bool(r.is_primary),
+            "scans": int(r.scans or 0),
+            "definition": r.definition,
+        }
+        for r in rows
+    ]
 
 
 async def database_size(

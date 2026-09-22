@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 _SUMMARY_KEY_TO_TABLE = {
     "forecasts_deduped": "forecasts",
     "forecasts_pruned": "forecasts",
+    "forecasts_raw_data_stripped": "forecasts",
     "metar_observations_pruned": "metar_observations",
     "market_prices_pruned": "market_prices",
     "pireps_pruned": "pireps",
@@ -154,6 +155,33 @@ COLLECTOR_MISS_RETENTION_DAYS = 90
 # happening concurrently with the prune is never touched.
 _DEDUP_SETTLE = "interval '90 minutes'"
 
+# ── raw_data stripping ────────────────────────────────────────────────────
+# `forecasts.raw_data` holds the provider's untouched payload — ensemble member
+# arrays (30-50 floats), NWS period objects with their prose forecasts. Measured
+# 2026-09-22: forecasts is 696 MB over 267,471 rows, i.e. ~2.7 KB per row. The
+# scalar columns account for roughly 100 bytes of that, so raw_data is ~640 MB,
+# about a sixth of the whole database.
+#
+# It has exactly ONE reader: SignalAggregator._latest_forecast, which pulls the
+# ensemble percentiles and the NWS grid identifiers out of it — and only for the
+# forecast_for_date currently being analysed, which is never more than
+# max_days_ahead_for_alert (3) in the future. Once a target date is in the past
+# no code path can ask for it again: model_skill selects four scalar columns
+# (PR #101), and no dashboard, admin route or CSV export touches the column.
+#
+# So clearing raw_data on past dates removes no row and changes no answer. The
+# scalar forecast — the thing accuracy scoring and the screens actually read —
+# is untouched.
+RAW_DATA_KEEP_DAYS = 7            # 2x the 3-day trading horizon, as a margin
+
+# Batching matters here, not just for lock duration. Each UPDATE leaves the old
+# row version behind as a dead tuple and writes the change to WAL; rewriting
+# 267k TOASTed rows in one statement would spike WAL by more than the free space
+# on a volume that is already at 85%. Small committed batches keep the peak flat
+# and let autovacuum reclaim as it goes.
+_RAW_DATA_BATCH = 2_000
+_RAW_DATA_MAX_BATCHES = 200       # ≤400k rows per run — a full pass, bounded
+
 
 async def _exec_count(db, sql: str, params: dict | None = None) -> int:
     """Run a DELETE and return affected row count; never raises."""
@@ -164,6 +192,51 @@ async def _exec_count(db, sql: str, params: dict | None = None) -> int:
         logger.error(f"[retention] statement failed: {e}", exc_info=True)
         await db.rollback()
         return 0
+
+
+def raw_data_cutoff(today: date, cfg=None) -> date:
+    """Target date before which `raw_data` is dead weight. Pure, testable."""
+    days = int(getattr(cfg, "raw_data_keep_days", RAW_DATA_KEEP_DAYS)) if cfg else RAW_DATA_KEEP_DAYS
+    return today - timedelta(days=days)
+
+
+async def strip_raw_data(
+    db,
+    cutoff: date,
+    *,
+    batch: int = _RAW_DATA_BATCH,
+    max_batches: int = _RAW_DATA_MAX_BATCHES,
+) -> int:
+    """NULL out `forecasts.raw_data` for target dates older than `cutoff`.
+
+    Deletes nothing. Returns the number of rows cleared. Never raises — a
+    failure mid-way keeps the batches already committed, which is fine because
+    the operation is idempotent and resumes on the next run.
+    """
+    cleared = 0
+    for _ in range(max_batches):
+        n = await _exec_count(
+            db,
+            """
+            UPDATE forecasts SET raw_data = NULL
+            WHERE id IN (
+                SELECT id FROM forecasts
+                WHERE forecast_for_date < :cutoff AND raw_data IS NOT NULL
+                LIMIT :batch
+            )
+            """,
+            {"cutoff": cutoff, "batch": batch},
+        )
+        if n == 0:
+            break
+        await db.commit()
+        cleared += n
+    if cleared:
+        logger.info(
+            f"[retention] cleared raw_data on {cleared} forecast rows "
+            f"older than {cutoff} (no rows deleted)"
+        )
+    return cleared
 
 
 async def job_prune_old_data(vacuum_full: bool = False) -> dict:
@@ -181,7 +254,8 @@ async def job_prune_old_data(vacuum_full: bool = False) -> dict:
     """
     dedup_on = bool(getattr(settings, "retention_dedup_enabled", True))
     prune_on = bool(getattr(settings, "retention_prune_enabled", False))
-    if not dedup_on and not prune_on:
+    strip_on = bool(getattr(settings, "retention_strip_raw_data_enabled", True))
+    if not dedup_on and not prune_on and not strip_on:
         return {}
 
     summary: dict[str, int] = {}
@@ -203,6 +277,12 @@ async def job_prune_old_data(vacuum_full: bool = False) -> dict:
                 WHERE f.id = d.id AND d.rn > 1
             """)
             await db.commit()
+
+        # ── 1.5 Strip raw_data from past target dates (lossless, no deletes) ────
+        if strip_on:
+            summary["forecasts_raw_data_stripped"] = await strip_raw_data(
+                db, raw_data_cutoff(date.today(), settings)
+            )
 
         # ── 2. Retention deletes — OFF by default (destroys history) ────────────
         if prune_on:

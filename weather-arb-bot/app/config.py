@@ -120,6 +120,14 @@ class Settings(BaseSettings):
     retention_enabled: bool = True
     retention_dedup_enabled: bool = True
     retention_prune_enabled: bool = False
+    # Clear forecasts.raw_data once the target date has passed. Lossless: the
+    # column's only reader (SignalAggregator._latest_forecast) asks for dates
+    # at most max_days_ahead_for_alert in the FUTURE, so a past date's payload
+    # can never be read again. No rows are deleted and every scalar forecast
+    # stays, which is what accuracy scoring and the screens use. Measured at
+    # ~640 MB of a 3,892 MB database, so this is ON by default.
+    retention_strip_raw_data_enabled: bool = True
+    raw_data_keep_days: int = 7      # 2x the 3-day trading horizon, as a margin
     # Plain VACUUM after each run keeps table bloat in check (safe, non-locking).
     # A one-time VACUUM FULL (via the admin endpoint) actually shrinks the disk.
     retention_vacuum_enabled: bool = True

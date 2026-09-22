@@ -157,15 +157,23 @@ async def admin_db_size(
     db: AsyncSession = Depends(get_db),
     limit: int = Query(default=20, ge=1, le=100),
     exact: bool = Query(default=False, description="Exact COUNT(*) on the biggest tables (slower, definitive)"),
+    indexes: bool = Query(default=True, description="Also break the space down per index"),
 ):
     """Database size breakdown: total, largest tables, bloat, and row counts.
 
     Read-only. Catalog views are cheap; `exact=true` additionally runs COUNT(*)
     on the largest tables, which is slow on a bloated table but settles what is
     really stored (the pg_stat row estimates can read 0 right after a vacuum).
+
+    `indexes=true` adds the per-index breakdown, which the table-level view
+    cannot give: market_prices measured 2,754 MB of which 1,348 MB is indexes,
+    and deciding what to do about that needs to know which index holds it.
     """
-    from app.utils.dbdiag import database_size
-    return await database_size(db, limit=limit, exact_counts=exact)
+    from app.utils.dbdiag import database_size, index_sizes
+    out = await database_size(db, limit=limit, exact_counts=exact)
+    if indexes:
+        out["indexes"] = await index_sizes(db)
+    return out
 
 
 @router.post("/prune-old-data")
