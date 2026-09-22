@@ -959,9 +959,7 @@ async def admin_model_skill_csv(
 
     Download with: curl -b admin_session=... /admin/model-skill/csv > model_skill.csv
     """
-    import csv
-    import io
-    from fastapi.responses import StreamingResponse
+    from app.utils.csv_stream import stream_csv, stream_rows
     from app.models.model_skill import ModelSkill
     from app.analyzers.model_skill import MIN_SAMPLES
 
@@ -972,40 +970,34 @@ async def admin_model_skill_csv(
     )
     if city_id is not None:
         q = q.where(ModelSkill.city_id == city_id)
-    rows = (await db.execute(q)).all()
 
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=[
+    fields = [
         "city_id", "city", "source", "days_ahead", "samples", "hits",
         "hit_rate", "mae_f", "bias_f", "weight", "active",
         "window_days", "last_event_date", "updated_at",
-    ])
-    writer.writeheader()
-    for r in rows:
-        ms = r.ModelSkill
-        writer.writerow({
-            "city_id": ms.city_id,
-            "city": r.name,
-            "source": ms.source,
-            "days_ahead": ms.days_ahead,
-            "samples": ms.samples,
-            "hits": ms.hits,
-            "hit_rate": round(ms.hit_rate, 4) if ms.hit_rate is not None else "",
-            "mae_f": round(ms.mae_f, 4) if ms.mae_f is not None else "",
-            "bias_f": round(ms.bias_f, 4) if ms.bias_f is not None else "",
-            "weight": round(ms.weight, 4) if ms.weight is not None else "",
-            "active": ms.samples >= MIN_SAMPLES,
-            "window_days": ms.window_days,
-            "last_event_date": ms.last_event_date.isoformat() if ms.last_event_date else "",
-            "updated_at": ms.updated_at.isoformat() if ms.updated_at else "",
-        })
-    buf.seek(0)
+    ]
 
-    return StreamingResponse(
-        iter([buf.read()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=model_skill.csv"},
-    )
+    async def rows_for(session):
+        async for r in stream_rows(session, q):
+            ms = r.ModelSkill
+            yield {
+                "city_id": ms.city_id,
+                "city": r.name,
+                "source": ms.source,
+                "days_ahead": ms.days_ahead,
+                "samples": ms.samples,
+                "hits": ms.hits,
+                "hit_rate": round(ms.hit_rate, 4) if ms.hit_rate is not None else "",
+                "mae_f": round(ms.mae_f, 4) if ms.mae_f is not None else "",
+                "bias_f": round(ms.bias_f, 4) if ms.bias_f is not None else "",
+                "weight": round(ms.weight, 4) if ms.weight is not None else "",
+                "active": ms.samples >= MIN_SAMPLES,
+                "window_days": ms.window_days,
+                "last_event_date": ms.last_event_date.isoformat() if ms.last_event_date else "",
+                "updated_at": ms.updated_at.isoformat() if ms.updated_at else "",
+            }
+
+    return await stream_csv("model_skill.csv", fields, rows_for)
 
 
 # Deterministic models we flatten into per-model columns for the backtest export.
@@ -1032,9 +1024,7 @@ async def admin_export_backtest_csv(
 
     Download: curl -b admin_session=... "/admin/export/backtest-csv?days=90" > backtest.csv
     """
-    import csv as _csv
-    import io as _io
-    from fastapi.responses import StreamingResponse
+    from app.utils.csv_stream import stream_csv, stream_rows
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     q = (
@@ -1050,7 +1040,6 @@ async def admin_export_backtest_csv(
     )
     if estimator in ("alpha", "beta"):
         q = q.where(Opportunity.estimator == estimator)
-    rows = (await db.execute(q)).all()
 
     base_cols = [
         "detected_at", "estimator", "city", "bucket_label", "side", "days_ahead",
@@ -1063,11 +1052,14 @@ async def admin_export_backtest_csv(
         key = s.split(" ")[0].lower().replace(".", "")
         model_cols += [f"{key}_fc", f"{key}_p", f"{key}_wt"]
 
-    buf = _io.StringIO()
-    writer = _csv.DictWriter(buf, fieldnames=base_cols + model_cols)
-    writer.writeheader()
+    async def rows_for(session):
+        # Streamed in batches: an Opportunity carries its full `signals` audit
+        # trail (~4.4 KB/row), so materialising 90 days of them at once was the
+        # single largest allocation this process made.
+        async for opp, outcome, market, city_name in stream_rows(session, q):
+            yield _backtest_row(opp, outcome, market, city_name)
 
-    for opp, outcome, market, city_name in rows:
+    def _backtest_row(opp, outcome, market, city_name) -> dict:
         sig = opp.signals or {}
         blend = sig.get("_blend") or sig.get("_beta_breakdown") or {}
         ens = blend.get("ensemble") or {}
@@ -1101,14 +1093,9 @@ async def admin_export_backtest_csv(
             row[f"{key}_fc"] = d.get("value_f", "")
             row[f"{key}_p"] = d.get("p_in_bucket", "")
             row[f"{key}_wt"] = d.get("weight", "")
-        writer.writerow(row)
+        return row
 
-    buf.seek(0)
-    return StreamingResponse(
-        iter([buf.read()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=backtest.csv"},
-    )
+    return await stream_csv("backtest.csv", base_cols + model_cols, rows_for)
 
 
 @router.get("/collector-miss/csv")
@@ -1125,9 +1112,7 @@ async def admin_collector_miss_csv(
     Tokyo, or Tomorrow.io unconfigured. Grouped by (city, source, reason) with
     a miss_count so repeated failures on different dates are collapsed.
     """
-    import csv
-    import io
-    from fastapi.responses import StreamingResponse
+    from app.utils.csv_stream import stream_csv, stream_rows
     from app.models.collector_miss import CollectorMiss
 
     from_dt = _parse_iso_date(from_date, "from_date")
@@ -1154,30 +1139,22 @@ async def admin_collector_miss_csv(
     if to_dt_inc is not None:
         q = q.where(CollectorMiss.event_date <= to_dt_inc.date())
 
-    rows = (await db.execute(q)).all()
+    fields = ["city_id", "city", "source", "miss_reason",
+              "miss_count", "first_seen", "last_seen"]
 
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=[
-        "city_id", "city", "source", "miss_reason", "miss_count", "first_seen", "last_seen",
-    ])
-    writer.writeheader()
-    for r in rows:
-        writer.writerow({
-            "city_id": r.city_id,
-            "city": r.city,
-            "source": r.source,
-            "miss_reason": r.miss_reason,
-            "miss_count": r.miss_count,
-            "first_seen": r.first_seen.isoformat() if r.first_seen else "",
-            "last_seen": r.last_seen.isoformat() if r.last_seen else "",
-        })
-    buf.seek(0)
+    async def rows_for(session):
+        async for r in stream_rows(session, q):
+            yield {
+                "city_id": r.city_id,
+                "city": r.city,
+                "source": r.source,
+                "miss_reason": r.miss_reason,
+                "miss_count": r.miss_count,
+                "first_seen": r.first_seen.isoformat() if r.first_seen else "",
+                "last_seen": r.last_seen.isoformat() if r.last_seen else "",
+            }
 
-    return StreamingResponse(
-        iter([buf.read()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=collector_miss.csv"},
-    )
+    return await stream_csv("collector_miss.csv", fields, rows_for)
 
 
 @router.post("/model-skill/refresh")
