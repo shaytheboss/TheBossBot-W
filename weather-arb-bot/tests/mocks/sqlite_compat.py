@@ -62,7 +62,14 @@ def make_engine(url: str = SQLITE_MEMORY):
     `StaticPool` rejects them. That is why this module builds its own engine
     instead of reusing the application's.
     """
-    return create_async_engine(url, echo=False, future=True)
+    engine = create_async_engine(url, echo=False, future=True)
+    # The @compiles hooks above only rewrite DDL. Binding a Python list to a
+    # PG ARRAY column still fails ("type 'list' is not supported"), because
+    # the type's bind processor is unchanged. Registering JSON in the
+    # dialect's colspecs swaps the whole type implementation, so values
+    # round-trip as lists — which is what `TelegramUser.cities_watched` holds.
+    engine.dialect.colspecs[PG_ARRAY] = JSON
+    return engine
 
 
 def make_sessionmaker(engine) -> async_sessionmaker[AsyncSession]:

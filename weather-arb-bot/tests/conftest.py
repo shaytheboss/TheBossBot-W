@@ -100,6 +100,38 @@ def no_network(request, monkeypatch):
 # ── Guard 2 + 3: isolation is asserted, not assumed ───────────────────────
 
 @pytest.fixture(autouse=True)
+def reset_module_caches():
+    """Clear the analyzer's process-global state between tests.
+
+    Several modules memoise at import scope — the calibration table (30-min
+    TTL), per-city model skill and weights, and the side-alert dedup sets,
+    which only self-clear when the calendar date changes and therefore never
+    clear inside one test run. Left alone, whichever test ran first decides
+    what every later test sees.
+    """
+    import app.analyzers.calibrator as calibrator
+    import app.analyzers.model_skill as model_skill
+    import app.analyzers.model_weights as model_weights
+    import app.analyzers.opportunity_detector as detector
+    import app.analyzers.beta_opportunity_detector as beta_detector
+
+    def _clear():
+        calibrator._cache = {}
+        calibrator._cache_ts = None
+        model_skill._cache.clear()
+        model_weights._cache.clear()
+        detector._side_alert_date = None
+        detector._open_position_last_sent.clear()
+        detector._bucket_switch_alerts_sent.clear()
+        beta_detector._beta_dedup_date = None
+        beta_detector._beta_open_pos_last_sent.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def isolated_settings(request, monkeypatch):
     """Keep every test on a non-resolvable DB and a silent bot by default.
 

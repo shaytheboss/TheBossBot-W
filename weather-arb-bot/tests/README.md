@@ -3,9 +3,19 @@
 Run the suite:
 
 ```bash
-pytest tests -m "not integration"     # 461 tests, ~2s, no network, no database
+pytest tests -m "not integration"     # 517 tests, ~10s, no network, no database
 pytest tests -m integration           # hits the real APIs — costs quota
+ruff check app tests                  # must be clean before committing
 ```
+
+Two layers:
+
+- **`tests/unit/`** — fast and isolated. Most tests belong here.
+- **`tests/flow/`** — the whole pipeline end to end: mocked HTTP → real
+  collectors → temporary SQLite → real detector → real Telegram formatting →
+  `FakeBot`. Nothing between the edges is stubbed.
+
+Neither is marked `integration`; both run on every commit.
 
 ## What the harness guarantees
 
@@ -64,6 +74,57 @@ and passes. `fake_telegram` sets a dummy token for exactly this reason;
 `test_token_is_empty_by_default` pins the other half, so no test can
 accidentally inherit a real token from the environment.
 
+## The flow suite
+
+`tests/flow/` seeds one city and one market — Austin, resolving tomorrow, four
+2°F buckets from 91 to 98, every source reporting 95°F, a 62¢ two-sided book —
+and exposes the four real stages:
+
+```python
+async def test_something(pipeline):
+    await pipeline.collect_forecasts()   # 5 collectors → forecasts table
+    await pipeline.collect_ensemble()
+    await pipeline.collect_prices()      # Polymarket  → market_prices
+    result = await pipeline.detect()     # the real detector
+    await pipeline.alert(result)         # the real send functions → FakeBot
+
+    assert result.bucket_sides() == {"93-94°F": "NO"}
+    assert "Austin" in pipeline.telegram.only().text
+```
+
+`pipeline.run()` does all four. Shape the world with the indirect fixtures:
+
+| Fixture | Default | Example |
+|---|---|---|
+| `forecast_temp` | 95.0 | `@pytest.mark.parametrize("forecast_temp", [130.0], indirect=True)` |
+| `source_spread` | 0.0 | fan the sources apart in °F |
+| `days_ahead` | 1 | `[4]` puts the market past the 3-day horizon |
+| `market_buckets` | 91-98 | a different bucket ladder |
+
+Break things with `break_source(pipeline.http, endpoint, status=503)`, or
+`pipeline.http.prepend(...)` for a custom response. Use `no_backoff` whenever
+a test triggers a retry, or it spends 14 seconds sleeping.
+
+### Writing a flow test that is worth having
+
+Two failure modes to avoid, both of which produce a green test that checks
+nothing:
+
+**Asserting absence without a control.** "No opportunity was created" can mean
+the guard worked — or that the data never arrived. Pair it with a control that
+*does* fire. `test_one_day_past_the_horizon_is_skipped` sits next to
+`test_the_last_day_inside_the_horizon_still_trades` for this reason; without
+the control it passed even with the horizon check deleted.
+
+**Assuming a suppressed signal was computed.** Where a threshold blocks a
+trade, relax the threshold and show the signal appear — that is what proves
+the value reached the estimator instead of being swallowed by an exception.
+See `test_the_extreme_value_did_reach_the_estimator`.
+
+The suite was checked against nine deliberate mutations — write-on-change,
+horizon guard, normalisation, sparse-source shrink, blacklist, Markdown
+dialect, METAR °C→°F, retry, bias correction — and each one turned it red.
+
 ## Postgres-only SQL
 
 `sqlite_db` teaches SQLite three things — `JSONB`, `ARRAY(Integer)`, and
@@ -81,6 +142,10 @@ runs. Use `FakeSession` for those, or mark the test `integration`.
 tests/
   conftest.py                      fixtures + the three guards
   unit/test_harness_selfcheck.py   40 tests proving the harness works
+  flow/
+    conftest.py                    the `pipeline` fixture
+    test_full_pipeline.py          happy path, stage by stage
+    test_pipeline_edge_cases.py    provider failures, extremes, guards
   mocks/
     http_router.py                 routing, sequencing, call assertions
     weather_payloads.py            Open-Meteo · Tomorrow.io · Meteosource
