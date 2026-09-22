@@ -1417,6 +1417,24 @@ async function showDbSize(btn, exact) {
          + pad(bpr, 11) + `\n`;
     });
     if (!hasExact) s += `\n(row counts are pg_stat estimates and can be very stale — use "🔄 Refresh row counts" to update them)\n`;
+
+    // Index breakdown. The table view shows only a total for all of a table's
+    // indexes, which is not enough to act on — market_prices carries ~1,348 MB
+    // across two of them and the decision differs completely per index.
+    if (j.indexes && j.indexes.length) {
+      s += `\n${'index'.padEnd(38)}${'table'.padEnd(22)}${pad('MB',9)}${pad('scans',13)} kind\n`;
+      s += '-'.repeat(90) + '\n';
+      j.indexes.forEach(i => {
+        const kind = i.primary ? 'PRIMARY KEY' : (i.unique ? 'unique' : 'plain');
+        // A large index nobody has scanned is a candidate for removal — but a
+        // unique one also enforces a constraint, so flag it, never assume.
+        const flag = (i.size_mb >= 50 && i.scans === 0 && !i.unique) ? '⚠ ' : '  ';
+        s += flag + String(i.index).padEnd(36) + String(i.table).padEnd(22)
+           + pad(i.size_mb, 9) + pad((i.scans||0).toLocaleString(), 13) + kind + '\n';
+      });
+      s += `\n(⚠ = 50 MB+ and never scanned. A unique index also enforces a constraint,\n`
+         + ` so it is never flagged — check what depends on it before dropping anything.)\n`;
+    }
     out.textContent = s + '\n' + out.textContent;
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
