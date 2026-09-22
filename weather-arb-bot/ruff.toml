@@ -1,0 +1,44 @@
+# Lint configuration.
+#
+# The rule set is deliberately narrow: it catches things that are *wrong*
+# (undefined names, unreachable code, shadowed definitions, mutable default
+# arguments, dead assignments) and stays silent about style. It passes clean
+# on the whole repository today, which is what makes it useful as a gate —
+# any error you see is something your change introduced.
+#
+#   ruff check app tests
+#
+# Three families are excluded on purpose, because in this codebase they flag
+# correct code:
+#
+#   E711/E712  `Market.resolved == False` is the SQLAlchemy way to build a
+#              SQL predicate. `is False` produces a Python bool and silently
+#              breaks the query.
+#   B008       `Depends(...)` in a default argument is the FastAPI idiom.
+#   F401       56 unused imports exist today. Worth cleaning, but not worth
+#              a repo-wide diff inside an unrelated change. Enable once a
+#              dedicated cleanup lands.
+#
+# Widening the set is encouraged — just make it pass before committing.
+
+line-length = 110
+target-version = "py311"
+
+[lint]
+select = [
+    "E9",      # syntax / IO errors
+    "F63",     # comparison mistakes (e.g. `assert (a, b)`)
+    "F7",      # syntax-level pyflakes errors
+    "F82",     # undefined name — the single highest-value rule here
+    "F811",    # redefinition of an unused name
+    "F841",    # assigned-but-never-used local
+    "F502", "F506", "F522", "F524",   # broken % / .format() calls
+    "F601", "F602",                    # `x in (1, 2)` membership mistakes
+    "F632",    # `is` comparison against a literal
+    "B002", "B003", "B006", "B012", "B018", "B021", "B023", "B026",
+]
+
+[lint.per-file-ignores]
+# Fixtures intentionally import modules for their registration side effects.
+"tests/conftest.py" = ["F401"]
+"tests/flow/conftest.py" = ["F401"]

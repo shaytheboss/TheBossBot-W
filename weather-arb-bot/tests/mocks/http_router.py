@@ -100,6 +100,34 @@ class HttpRouter:
         self._routes.append(_Route(method, match, list(responses), once))
         return self
 
+    def prepend(
+        self,
+        match: str,
+        json: Any = None,
+        *,
+        status: int = 200,
+        text: Optional[str] = None,
+        method: str = "GET",
+        once: bool = False,
+    ) -> "HttpRouter":
+        """Register a route that WINS over anything already registered.
+
+        Routes are matched in registration order, so a fixture that has
+        already wired the happy path cannot be overridden with `add`. This is
+        how a test breaks one provider on an otherwise healthy world.
+        """
+        return self.prepend_sequence(
+            match, [self._build(status, json, text)], method=method, once=once
+        )
+
+    def prepend_sequence(
+        self, match: str, responses: list, *, method: str = "GET", once: bool = False,
+    ) -> "HttpRouter":
+        if not responses:
+            raise ValueError("prepend_sequence needs at least one response")
+        self._routes.insert(0, _Route(method, match, list(responses), once))
+        return self
+
     def add_handler(
         self, match: str, handler: Callable[[httpx.Request], httpx.Response],
         *, method: str = "GET",

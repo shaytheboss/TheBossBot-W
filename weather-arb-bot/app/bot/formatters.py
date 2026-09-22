@@ -620,7 +620,6 @@ def fmt_opportunity(
 
         current_side_prob = side_prob_pct
         prob_change = current_side_prob - prior_side_prob
-        edge_change = edge_pct - prior_edge_pp
 
         conf_arrow = f"↑{abs(prob_change)}pp" if prob_change >= 0 else f"↓{abs(prob_change)}pp"
 
