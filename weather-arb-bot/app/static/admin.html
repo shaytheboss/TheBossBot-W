@@ -166,6 +166,8 @@
       <h3 style="margin-top:24px;">🧠 Memory diagnostic
         <button class="btn small" onclick="showMemory(this,false)" title="Safe: reads RAM + allocator counters only. Sub-millisecond, cannot affect trading.">📸 Quick check (safe)</button>
         <button class="btn small" onclick="showMemory(this,true)" title="Full heap census. FREEZES the bot for ~1 second — do not use during an active market close.">🔬 Deep scan (~1s freeze)</button>
+        <button class="btn small" onclick="showJobStats(this,false)" title="CPU and wall time per scheduled job. Read-only, sub-millisecond.">⚙️ CPU by job</button>
+        <button class="btn small" onclick="showJobStats(this,true)" title="Zero the counters so the next window measures a change cleanly.">↺ CPU by job + reset</button>
       </h3>
       <p class="small">
         <strong>Quick check</strong> is safe to click any time — it reads process RAM and the allocator block count without touching the heap, so it cannot slow the bot or affect results.
@@ -554,7 +556,25 @@
 </div>
 
 <script>
-const api = (path, opts={}) => fetch('/api/admin' + path, { credentials: 'same-origin', ...opts });
+// A 401 means the session is gone, and every caller used to render that as a
+// bare "Failed: Unauthorized" — which says nothing about the actual fix. Show
+// the login screen instead, once, rather than letting each button invent its
+// own confusing message.
+let _authPrompted = false;
+const api = async (path, opts={}) => {
+  const r = await fetch('/api/admin' + path, { credentials: 'same-origin', ...opts });
+  if (r.status === 401 && !path.startsWith('/login')) {
+    if (!_authPrompted) {
+      _authPrompted = true;
+      document.getElementById('login').classList.remove('hidden');
+      document.getElementById('app').classList.add('hidden');
+      const err = document.getElementById('loginError');
+      if (err) err.textContent = 'Your session ended (the server restarted). Please sign in again.';
+      setTimeout(() => { _authPrompted = false; }, 3000);
+    }
+  }
+  return r;
+};
 let logsTimer = null;
 
 // --- Client-side table sorting -------------------------------------------------
@@ -2101,6 +2121,37 @@ async function saveSettings() {
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
   else { const j = await r.json().catch(()=>({})); alert('Save failed: ' + (j.detail || r.status)); }
+}
+
+async function showJobStats(btn, reset) {
+  const out = document.getElementById('memOut') || document.getElementById('dbOut');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await api('/job-stats' + (reset ? '?reset=true' : ''));
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) { out.textContent = 'Failed: ' + (j.detail || r.status); return; }
+    const pad = (v,n) => String(v).padStart(n) + ' ';
+    const hrs = (j.uptime_s/3600);
+    let s = `[${new Date().toLocaleTimeString()}]  uptime ${hrs.toFixed(1)}h  |  `
+          + `process CPU ${j.process_cpu_s}s  |  AVG ${j.avg_vcpu} vCPU (this is what Railway bills)\n`;
+    // Anything not inside a tracked job: the web server, the Telegram webhook,
+    // SQLAlchemy pool upkeep. A large share here means the cost is not in the
+    // scheduled jobs at all, which changes where to look.
+    s += `attributed to jobs: ${j.measured_cpu_s}s   |   elsewhere (web/webhook/idle): ${j.unattributed_cpu_s}s\n\n`;
+    s += `${'job'.padEnd(20)}${pad('runs',6)}${pad('CPU s',9)}${pad('% CPU',8)}`
+       + `${pad('avg ms',9)}${pad('wall s',9)}${pad('duty%',7)} err\n`;
+    s += '-'.repeat(78) + '\n';
+    (j.jobs||[]).forEach(x => {
+      s += String(x.job).padEnd(20) + pad(x.runs,6) + pad(x.cpu_s,9)
+         + pad((x.cpu_pct_of_process==null?'-':x.cpu_pct_of_process+'%'),8)
+         + pad(x.avg_cpu_ms==null?'-':x.avg_cpu_ms,9) + pad(x.wall_s,9)
+         + pad(x.duty_pct+'%',7) + (x.errors||0) + '\n';
+    });
+    s += `\n${j.note}\n`;
+    if (reset) s += `Counters reset — come back in an hour for a clean window.\n`;
+    out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
 async function showSuspensionReport(btn) {

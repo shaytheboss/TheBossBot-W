@@ -1,5 +1,8 @@
+import hashlib
+import hmac
 import logging
 import secrets
+import time
 from datetime import date as date_cls, datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -27,8 +30,53 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_ACTIVE_TOKENS: set[str] = set()
+# Admin sessions are SIGNED, not stored.
+#
+# They used to live in this set. The cookie lasts a week, the set lasts until
+# the process restarts — so every deploy silently invalidated every session
+# while the browser kept sending a cookie the server no longer recognised.
+# Each request then came back 401 "Unauthorized" with no hint that the fix was
+# simply to log in again. That is what broke "Shrink DB" right after a deploy.
+#
+# A token now carries its own expiry and an HMAC over it, so any process can
+# verify it without shared memory. The set remains only as a revocation list
+# for explicit logout; losing it on restart is harmless, because a revoked
+# token expires on its own anyway.
+_ACTIVE_TOKENS: set[str] = set()      # legacy accept-list, still honoured
+_REVOKED_TOKENS: set[str] = set()
 ADMIN_COOKIE_NAME = "admin_session"
+ADMIN_SESSION_SECONDS = 60 * 60 * 24 * 7
+
+
+def _signing_key() -> bytes:
+    """Derive the HMAC key from both secrets.
+
+    `secret_key` alone is not enough — it defaults to "changeme" and may never
+    have been set. Mixing in `admin_password`, which must be configured for the
+    admin UI to work at all, guarantees a real secret. Changing either one
+    invalidates outstanding sessions, which is the behaviour you want.
+    """
+    material = f"{settings.secret_key}|{settings.admin_password}".encode()
+    return hashlib.sha256(material).digest()
+
+
+def _issue_token(now: Optional[int] = None) -> str:
+    exp = int(now if now is not None else time.time()) + ADMIN_SESSION_SECONDS
+    sig = hmac.new(_signing_key(), str(exp).encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _token_is_valid(token: str, now: Optional[float] = None) -> bool:
+    """Constant-time signature check plus expiry. Never raises."""
+    try:
+        exp_str, sig = token.split(".", 1)
+        exp = int(exp_str)
+    except (ValueError, AttributeError):
+        return False
+    expected = hmac.new(_signing_key(), exp_str.encode(), hashlib.sha256).hexdigest()
+    if not secrets.compare_digest(sig, expected):
+        return False
+    return exp > (now if now is not None else time.time())
 
 
 async def get_db() -> AsyncSession:
@@ -39,8 +87,12 @@ async def get_db() -> AsyncSession:
 def _check_admin(session: Optional[str]) -> None:
     if not settings.admin_password:
         raise HTTPException(status_code=503, detail="Admin not configured (ADMIN_PASSWORD missing)")
-    if not session or session not in _ACTIVE_TOKENS:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not session or session in _REVOKED_TOKENS:
+        raise HTTPException(status_code=401, detail="Session expired — please log in again")
+    if session in _ACTIVE_TOKENS:
+        return
+    if not _token_is_valid(session):
+        raise HTTPException(status_code=401, detail="Session expired — please log in again")
 
 
 def require_admin(admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_COOKIE_NAME)):
@@ -89,14 +141,14 @@ async def admin_login(body: LoginIn, response: Response):
         raise HTTPException(status_code=503, detail="ADMIN_PASSWORD not configured")
     if not secrets.compare_digest(body.password, settings.admin_password):
         raise HTTPException(status_code=401, detail="Wrong password")
-    token = secrets.token_urlsafe(32)
-    _ACTIVE_TOKENS.add(token)
+    token = _issue_token()
+    _REVOKED_TOKENS.discard(token)
     response.set_cookie(
         key=ADMIN_COOKIE_NAME,
         value=token,
         httponly=True,
         samesite="lax",
-        max_age=60 * 60 * 24 * 7,
+        max_age=ADMIN_SESSION_SECONDS,
     )
     return {"ok": True}
 
@@ -108,6 +160,9 @@ async def admin_logout(
 ):
     if admin_session:
         _ACTIVE_TOKENS.discard(admin_session)
+        # A signed token cannot be un-signed, so logout records it as revoked.
+        # The list is lost on restart; the token expires on its own regardless.
+        _REVOKED_TOKENS.add(admin_session)
     response.delete_cookie(ADMIN_COOKIE_NAME)
     return {"ok": True}
 
@@ -1990,6 +2045,26 @@ async def admin_city_delete(
     await db.commit()
     logger.info(f"Admin deleted city #{city_id} {city_name}")
     return Response(status_code=204)
+
+
+@router.get("/job-stats")
+async def admin_job_stats(_: str = Depends(require_admin), reset: bool = Query(default=False)):
+    """Where the CPU goes, per scheduled job.
+
+    CPU is 38% of the bill at a steady ~0.39 vCPU. Wall time and CPU time are
+    both reported because they point at different fixes: a job that waits on
+    1,600 HTTP calls has large wall time and almost no CPU, while one doing
+    Student-t maths over every bucket is the reverse.
+
+    `reset=true` zeroes the counters so a change can be measured against a
+    clean window instead of against the whole uptime.
+    """
+    from app.utils.jobstats import reset as _reset, snapshot
+    out = snapshot()
+    if reset:
+        _reset()
+        out["reset"] = True
+    return out
 
 
 @router.get("/suspension-report")
