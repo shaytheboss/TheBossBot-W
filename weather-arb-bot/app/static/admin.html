@@ -1457,6 +1457,16 @@ async function runPrune(btn, full) {
       if (k === 'vacuum_errors') {
         s += `   ❌ FAILURES (${v.length}):\n`;
         v.forEach(e => { s += `        ${e}\n`; });
+      } else if (k === 'raw_data_eligible') {
+        // Only present when nothing was cleared. 0 eligible means the work was
+        // already done; a positive number means something stopped it.
+        s += v === 0
+          ? `   ℹ  raw_data: nothing eligible — already cleared on an earlier run\n`
+          : `   ⚠️  raw_data: ${v.toLocaleString()} rows WERE eligible but none were cleared\n`;
+      } else if (k === 'raw_data_error') {
+        s += `   ❌ raw_data strip failed: ${v}\n`;
+      } else if (k === 'raw_data_remaining') {
+        s += `   raw_data still to clear: ${v.toLocaleString()}\n`;
       } else if (k === 'vacuum_skipped_too_large') {
         // A deliberate skip, not a failure. Rewriting one of these needs free
         // disk equal to the whole table, which would fill the volume and take
