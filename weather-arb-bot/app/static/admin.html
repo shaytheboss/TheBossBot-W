@@ -2036,6 +2036,31 @@ async function loadSettings() {
       <tr><td>Beta alert threshold (post-blend)</td><td><input id="set-cba" type="number" step="0.01" min="0" max="1" value="${s.min_confidence_beta_alert}" /></td></tr>
       <tr><td>Beta virtual-buy threshold (post-blend)</td><td><input id="set-cbb" type="number" step="0.01" min="0" max="1" value="${s.min_confidence_beta_buy}" /></td></tr>
       <tr><td colspan="2" class="small">Applied after the 60/40 market-blend. At 72¢ NO market, 90% raw beta → 82.8% blended. Beta buys are virtual-only (free learning data) — keep the buy gate low enough that beta keeps trading; alpha's real thresholds are unaffected. Settings now persist across restarts.</td></tr>
+      <tr><td colspan="2" style="padding-top:14px;font-weight:600;">Auto-suspension of losing cities</td></tr>
+      <tr><td>Enabled</td><td>
+        <select id="set-susp-on">
+          <option value="1" ${s.suspension_enabled ? 'selected' : ''}>On — suspend automatically</option>
+          <option value="0" ${s.suspension_enabled ? '' : 'selected'}>Off — I decide manually</option>
+        </select></td></tr>
+      <tr><td>Consecutive losses to suspend <span class="small">(0 = off)</span></td>
+          <td><input id="set-susp-streak" type="number" min="0" max="50" value="${s.suspension_consecutive_losses}" /></td></tr>
+      <tr><td>Chronic window — trades looked at <span class="small">(0 = off, else 5–200)</span></td>
+          <td><input id="set-susp-window" type="number" min="0" max="200" value="${s.suspension_window_trades}" /></td></tr>
+      <tr><td>Chronic minimum win rate (0.0–1.0)</td>
+          <td><input id="set-susp-rate" type="number" step="0.01" min="0" max="1" value="${s.suspension_min_win_rate}" /></td></tr>
+      <tr><td>Suspension length (days)</td>
+          <td><input id="set-susp-days" type="number" min="1" max="90" value="${s.suspension_days}" /></td></tr>
+      <tr><td colspan="2" class="small">
+        A small window is the usual reason this fires too often. Over 10 trades the
+        standard error on a win rate is about 13 percentage points, so a 0.65 minimum
+        sits roughly ONE standard error below a city performing normally — and the rule
+        is re-checked every time a trade settles. Widening the window is almost always
+        better than loosening the rate. Turning this off does not strand anyone: existing
+        suspensions still expire, and you can still suspend or release a city by hand on
+        the Cities tab.
+      </td></tr>
+      <tr><td colspan="2"><button class="btn" onclick="showSuspensionReport(this)">📋 Why are cities being suspended?</button>
+        <pre id="suspOut" class="small" style="white-space:pre;overflow-x:auto;margin-top:8px;"></pre></td></tr>
       <tr><td>METAR interval (s)</td><td>${s.metar_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Polymarket interval (s)</td><td>${s.polymarket_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Analyzer interval (s)</td><td>${s.analyzer_run_interval} <span class="small">(restart)</span></td></tr>
@@ -2057,10 +2082,62 @@ async function saveSettings() {
     min_confidence_buy_far: parseFloat(document.getElementById('set-cbf').value),
     min_confidence_beta_alert: parseFloat(document.getElementById('set-cba').value),
     min_confidence_beta_buy: parseFloat(document.getElementById('set-cbb').value),
+    suspension_enabled: document.getElementById('set-susp-on').value === '1',
+    suspension_consecutive_losses: parseInt(document.getElementById('set-susp-streak').value),
+    suspension_window_trades: parseInt(document.getElementById('set-susp-window').value),
+    suspension_min_win_rate: parseFloat(document.getElementById('set-susp-rate').value),
+    suspension_days: parseInt(document.getElementById('set-susp-days').value),
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
   else { const j = await r.json().catch(()=>({})); alert('Save failed: ' + (j.detail || r.status)); }
+}
+
+async function showSuspensionReport(btn) {
+  const out = document.getElementById('suspOut');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Checking…';
+  try {
+    const r = await api('/suspension-report');
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok || j.error) { out.textContent = 'Failed: ' + (j.error || j.detail || r.status); return; }
+    const R = j.rules;
+    const pad = (v,n) => String(v).padStart(n) + ' ';
+    let s = `Rules: ${R.enabled ? 'ON' : 'OFF'}  |  streak ≥ ${R.consecutive_losses}`
+          + `  |  win rate < ${(R.min_win_rate*100).toFixed(0)}% over last ${R.window_trades}`
+          + `  |  suspend ${R.suspension_days}d\n`;
+    s += `Fleet: ${j.fleet_settled} settled high-conf trades, `
+       + `${j.fleet_win_rate == null ? 'n/a' : (j.fleet_win_rate*100).toFixed(1)+'% win rate'}\n`;
+    if (j.false_alarm_pct != null) {
+      // The number that explains the complaint: how often a city doing exactly
+      // as well as the fleet still trips the chronic rule, by luck alone.
+      const fa = j.false_alarm_pct;
+      const flag = fa >= 10 ? '⚠️  ' : '';
+      s += `\n${flag}FALSE ALARM RATE: a city performing exactly at the fleet average\n`
+         + `    still trips the chronic rule ${fa}% of the time — per check.\n`
+         + `    The rule re-runs every time a trade settles, so over a month\n`
+         + `    almost every city eventually trips it by luck.\n`;
+      if (fa >= 10) {
+        s += `    → Widen "trades looked at" (20 → ~5%, 30 → ~5%) before\n`
+           + `      touching the rate. That is the statistically sound fix.\n`;
+      }
+    }
+    s += `\n${'city'.padEnd(16)}${pad('settled',9)}${pad('streak',8)}${pad('window',14)}`
+       + `${pad('rate',7)}  status\n` + '-'.repeat(78) + '\n';
+    (j.cities || []).forEach(c => {
+      const win = c.window_size ? `${c.window_wins}/${c.window_size}` : '-';
+      const rate = c.window_win_rate == null ? '-' : (c.window_win_rate*100).toFixed(0) + '%';
+      let status = '';
+      if (c.suspended_until) status = `SUSPENDED until ${c.suspended_until.slice(0,10)}`;
+      else if (c.would_suspend_now) status = 'would suspend now';
+      else status = 'ok';
+      if (c.blacklisted) status += ' [blacklisted]';
+      s += `${String(c.city).padEnd(16)}${pad(c.settled_high_conf,9)}${pad(c.current_loss_streak,8)}`
+         + `${pad(win,14)}${pad(rate,7)}  ${status}\n`;
+      if (c.suspension_reason) s += `${' '.repeat(16)}↳ ${c.suspension_reason}\n`;
+    });
+    out.textContent = s;
+  } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
 async function loadLogs() {

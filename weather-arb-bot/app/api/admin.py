@@ -62,6 +62,11 @@ class SettingsIn(BaseModel):
     min_confidence_buy_far: Optional[float] = None
     min_confidence_beta_alert: Optional[float] = None
     min_confidence_beta_buy: Optional[float] = None
+    suspension_enabled: Optional[bool] = None
+    suspension_consecutive_losses: Optional[int] = None
+    suspension_window_trades: Optional[int] = None
+    suspension_min_win_rate: Optional[float] = None
+    suspension_days: Optional[int] = None
 
 
 class CityCreateIn(BaseModel):
@@ -1987,6 +1992,121 @@ async def admin_city_delete(
     return Response(status_code=204)
 
 
+@router.get("/suspension-report")
+async def admin_suspension_report(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=180, ge=7, le=400),
+):
+    """Per-city view of what the auto-suspension rules currently see.
+
+    Answers "why does this keep firing" with the actual numbers rather than a
+    guess: each city's recent high-confidence settled record, its current loss
+    streak, and whether it would trip either rule right now.
+
+    It also reports how often the chronic rule would fire on a city that is
+    performing normally. With a 10-trade window the standard error on a win
+    rate is about 13 percentage points, so a 65% minimum sits roughly one
+    standard error below a healthy city — and the rule is re-checked every
+    time a trade settles. `false_alarm_pct` makes that concrete.
+    """
+    from app.analyzers.opportunity_detector import _suspension_verdict
+
+    streak_threshold = int(getattr(settings, "suspension_consecutive_losses", 0))
+    window_trades = int(getattr(settings, "suspension_window_trades", 0))
+    min_win_rate = float(getattr(settings, "suspension_min_win_rate", 0.0))
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = (await db.execute(
+        select(Market.city_id, Opportunity.virtual_status, Opportunity.detected_at)
+        .join(MarketOutcome, MarketOutcome.id == Opportunity.outcome_id)
+        .join(Market, Market.id == MarketOutcome.market_id)
+        .where(
+            Opportunity.virtual_status.in_(["win", "loss"]),
+            Opportunity.confidence_score >= 90,
+            Opportunity.detected_at >= cutoff,
+        )
+        .order_by(Opportunity.detected_at.desc())
+    )).all()
+
+    by_city: dict[int, list[str]] = {}
+    for city_id, status, _ts in rows:
+        by_city.setdefault(city_id, []).append(status)
+
+    cities = (await db.execute(select(City).order_by(City.name))).scalars().all()
+    out = []
+    overall_wins = overall_n = 0
+    for c in cities:
+        statuses = by_city.get(c.id, [])
+        overall_wins += sum(1 for s in statuses if s == "win")
+        overall_n += len(statuses)
+
+        streak = 0
+        for s in statuses:
+            if s != "loss":
+                break
+            streak += 1
+
+        window = statuses[:window_trades] if window_trades > 0 else []
+        wins = sum(1 for s in window if s == "win")
+        rate = (wins / len(window)) if window else None
+
+        out.append({
+            "city": c.name,
+            "city_id": c.id,
+            "settled_high_conf": len(statuses),
+            "current_loss_streak": streak,
+            "window_wins": wins if window else None,
+            "window_size": len(window),
+            "window_win_rate": round(rate, 3) if rate is not None else None,
+            "would_suspend_now": _suspension_verdict(
+                statuses, streak_threshold, window_trades, min_win_rate
+            ),
+            "suspended_until": c.suspended_until.isoformat() if c.suspended_until else None,
+            "suspension_reason": c.suspension_reason,
+            "blacklisted": bool(getattr(c, "blacklisted", False)),
+        })
+
+    baseline = (overall_wins / overall_n) if overall_n else None
+    return {
+        "window_days": days,
+        "rules": {
+            "enabled": bool(getattr(settings, "suspension_enabled", True)),
+            "consecutive_losses": streak_threshold,
+            "window_trades": window_trades,
+            "min_win_rate": min_win_rate,
+            "suspension_days": int(getattr(settings, "suspension_days", 7)),
+        },
+        "fleet_win_rate": round(baseline, 3) if baseline is not None else None,
+        "fleet_settled": overall_n,
+        "false_alarm_pct": _chronic_false_alarm_pct(
+            baseline, window_trades, min_win_rate
+        ),
+        "cities": out,
+    }
+
+
+def _chronic_false_alarm_pct(
+    baseline: Optional[float], window: int, min_rate: float
+) -> Optional[float]:
+    """Chance a city performing AT the fleet average still trips the chronic
+    rule, from the binomial distribution. This is the false-alarm rate per
+    evaluation — and the rule is evaluated every time a trade settles, so the
+    chance of eventually tripping is far higher than this single number.
+    """
+    if not baseline or window <= 0 or not (0 < min_rate <= 1):
+        return None
+    from math import comb
+    needed = int(min_rate * window)          # wins strictly below this trips
+    if needed * 1.0 == min_rate * window:
+        needed -= 1                          # exact boundary is NOT below
+    p = sum(
+        comb(window, k) * baseline**k * (1 - baseline) ** (window - k)
+        for k in range(0, max(needed, -1) + 1)
+    )
+    return round(p * 100, 1)
+
+
 @router.get("/settings")
 async def admin_get_settings(_: str = Depends(require_admin)):
     return {
@@ -1999,6 +2119,11 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "min_confidence_buy_far": settings.min_confidence_buy_far,
         "min_confidence_beta_alert": settings.min_confidence_beta_alert,
         "min_confidence_beta_buy": getattr(settings, "min_confidence_beta_buy", 0.85),
+        "suspension_enabled": getattr(settings, "suspension_enabled", True),
+        "suspension_consecutive_losses": settings.suspension_consecutive_losses,
+        "suspension_window_trades": settings.suspension_window_trades,
+        "suspension_min_win_rate": settings.suspension_min_win_rate,
+        "suspension_days": settings.suspension_days,
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -2043,6 +2168,28 @@ async def admin_set_settings(
         if val is not None:
             _validate_unit(val, unit_key)
             changed[unit_key] = val
+
+    # ── Auto-suspension ───────────────────────────────────────────────────
+    if payload.suspension_enabled is not None:
+        changed["suspension_enabled"] = bool(payload.suspension_enabled)
+    if payload.suspension_consecutive_losses is not None:
+        if not (0 <= payload.suspension_consecutive_losses <= 50):
+            raise HTTPException(400, "suspension_consecutive_losses must be 0-50 (0 disables)")
+        changed["suspension_consecutive_losses"] = payload.suspension_consecutive_losses
+    if payload.suspension_window_trades is not None:
+        # 0 disables. Anything from 1-4 is noise dressed up as a rule, so the
+        # smallest real window is 5; the ceiling keeps the lookback query cheap.
+        w = payload.suspension_window_trades
+        if w != 0 and not (5 <= w <= 200):
+            raise HTTPException(400, "suspension_window_trades must be 0 (off) or 5-200")
+        changed["suspension_window_trades"] = w
+    if payload.suspension_min_win_rate is not None:
+        _validate_unit(payload.suspension_min_win_rate, "suspension_min_win_rate")
+        changed["suspension_min_win_rate"] = payload.suspension_min_win_rate
+    if payload.suspension_days is not None:
+        if not (1 <= payload.suspension_days <= 90):
+            raise HTTPException(400, "suspension_days must be 1-90")
+        changed["suspension_days"] = payload.suspension_days
 
     # Apply in-memory (immediate effect) AND persist (survives restart).
     for key, val in changed.items():

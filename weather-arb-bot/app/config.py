@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     # בשניות. בנוסף לכך העדכון רץ מיד אחרי כל settlement של פולימרקט.
     model_skill_update_interval: int = 3600
 
+    # ── Auto-suspension ─────────────────────────────────────────────────────
+    # Master switch. False stops the bot suspending cities on its own; existing
+    # suspensions still expire, and a city can still be suspended by hand from
+    # the admin screen. All four knobs below are runtime-tunable and persist.
+    #
+    # A note on the chronic rule, because it is easy to set badly. With a window
+    # of 10 the standard error on a win rate near 0.78 is about 13 percentage
+    # points, so a 0.65 minimum sits roughly ONE standard error below a city
+    # that is performing exactly as expected — and the rule is re-evaluated
+    # every time a trade settles. A healthy city trips it by chance alone
+    # fairly often. Widen the window before tightening the rate.
+    suspension_enabled: bool = True
     # Auto-suspend a city after this many consecutive high-conf (≥90%) losses.
     # Set to 0 to disable the streak rule.
     suspension_consecutive_losses: int = 3
