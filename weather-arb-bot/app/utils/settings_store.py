@@ -33,6 +33,14 @@ PERSISTABLE_KEYS: frozenset = frozenset({
     "min_confidence_buy_far",
     "min_confidence_beta_alert",
     "min_confidence_beta_buy",
+    # Auto-suspension. Tunable at runtime because the defaults fire far more
+    # often than intended: a 10-trade window carries ~13pp of standard error,
+    # so a 65% minimum sits about one standard error below a healthy city.
+    "suspension_enabled",
+    "suspension_consecutive_losses",
+    "suspension_window_trades",
+    "suspension_min_win_rate",
+    "suspension_days",
 })
 
 

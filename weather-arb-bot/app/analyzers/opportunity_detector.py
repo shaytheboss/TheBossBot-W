@@ -180,15 +180,21 @@ async def _auto_suspend_check(db: AsyncSession, city: City) -> None:
     streak_threshold = int(getattr(settings, "suspension_consecutive_losses", 0))
     window_trades = int(getattr(settings, "suspension_window_trades", 0))
     min_win_rate = float(getattr(settings, "suspension_min_win_rate", 0.0))
-    if streak_threshold <= 0 and (window_trades <= 0 or min_win_rate <= 0):
-        return
+    enabled = bool(getattr(settings, "suspension_enabled", True))
 
-    # Clear an expired suspension
+    # An expired suspension is cleared even when auto-suspension is switched
+    # off — otherwise turning the feature off would strand every city that
+    # happened to be suspended at that moment, with nothing left to release it.
     if getattr(city, "suspended_until", None) and not _city_is_suspended(city):
         city.suspended_until = None
         city.suspension_reason = None
         await db.commit()
         logger.info(f"City {city.name} suspension expired — resumed.")
+        return
+
+    if not enabled:
+        return
+    if streak_threshold <= 0 and (window_trades <= 0 or min_win_rate <= 0):
         return
 
     if _city_is_suspended(city):
