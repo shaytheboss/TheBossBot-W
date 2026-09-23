@@ -15,6 +15,7 @@ from telegram import Update
 from app.config import settings
 from app.api import cities, markets, opportunities, users, health, admin
 from app.utils.log_buffer import install_buffer_handler
+from app.utils.jobstats import track
 
 logger = logging.getLogger(__name__)
 
@@ -84,24 +85,35 @@ async def lifespan(app: FastAPI):
         now = datetime.now()
         _scheduler = AsyncIOScheduler()
 
-        _scheduler.add_job(job_discover_markets, IntervalTrigger(seconds=1800),
+        def _add_tracked_job(func, trigger, *, id, **kw):
+            """Register a scheduled job with CPU/wall-clock accounting attached.
+
+            CPU is 38% of the Railway bill at a steady ~0.39 vCPU, and nothing
+            measured which of these fifteen jobs spends it. `track` wraps the
+            coroutine, records both clocks per run, and re-raises unchanged so
+            APScheduler's own error handling is untouched. Read it at
+            /admin/job-stats.
+            """
+            return _scheduler.add_job(track(id, func), trigger, id=id, **kw)
+
+        _add_tracked_job(job_discover_markets, IntervalTrigger(seconds=1800),
                            id="discover", next_run_time=now, max_instances=1, misfire_grace_time=300)
-        _scheduler.add_job(job_fetch_metars, IntervalTrigger(seconds=settings.metar_fetch_interval),
+        _add_tracked_job(job_fetch_metars, IntervalTrigger(seconds=settings.metar_fetch_interval),
                            id="metar", next_run_time=now, max_instances=1, misfire_grace_time=60)
-        _scheduler.add_job(job_fetch_wunderground, IntervalTrigger(seconds=settings.wunderground_fetch_interval),
+        _add_tracked_job(job_fetch_wunderground, IntervalTrigger(seconds=settings.wunderground_fetch_interval),
                            id="wunderground", next_run_time=now, max_instances=1, misfire_grace_time=300)
-        _scheduler.add_job(job_fetch_nws, IntervalTrigger(seconds=3600),
+        _add_tracked_job(job_fetch_nws, IntervalTrigger(seconds=3600),
                            id="nws", next_run_time=now, max_instances=1, misfire_grace_time=300)
-        _scheduler.add_job(job_fetch_models, IntervalTrigger(seconds=3600),
+        _add_tracked_job(job_fetch_models, IntervalTrigger(seconds=3600),
                            id="models", next_run_time=now, max_instances=1, misfire_grace_time=600)
         # ICON (DWD via Open-Meteo). The job existed since day one but was never
         # scheduled — collector_miss showed 100% no_data for all cities. Wired in
         # with its own id so it can be tracked separately from GFS/ECMWF.
         if getattr(settings, "icon_enabled", True):
-            _scheduler.add_job(job_fetch_icon,
+            _add_tracked_job(job_fetch_icon,
                                IntervalTrigger(seconds=getattr(settings, "icon_fetch_interval", 3600)),
                                id="icon", next_run_time=now, max_instances=1, misfire_grace_time=600)
-        _scheduler.add_job(job_fetch_external_forecasts,
+        _add_tracked_job(job_fetch_external_forecasts,
                            IntervalTrigger(seconds=settings.external_forecast_fetch_interval),
                            id="external_forecasts", next_run_time=now,
                            max_instances=1, misfire_grace_time=600)
@@ -109,22 +121,22 @@ async def lifespan(app: FastAPI):
         # only 25 req/h, 500/day). The old shared external job burst 144 calls
         # at once and got rate-limited for every city except the first few.
         if settings.tomorrowio_api_key:
-            _scheduler.add_job(job_fetch_tomorrowio,
+            _add_tracked_job(job_fetch_tomorrowio,
                                IntervalTrigger(seconds=getattr(settings, "tomorrowio_fetch_interval", 3600)),
                                id="tomorrowio", next_run_time=now,
                                max_instances=1, misfire_grace_time=600)
-        _scheduler.add_job(job_fetch_pireps, IntervalTrigger(seconds=900),
+        _add_tracked_job(job_fetch_pireps, IntervalTrigger(seconds=900),
                            id="pireps", next_run_time=now, max_instances=1, misfire_grace_time=120)
-        _scheduler.add_job(job_fetch_polymarket, IntervalTrigger(seconds=settings.polymarket_fetch_interval),
+        _add_tracked_job(job_fetch_polymarket, IntervalTrigger(seconds=settings.polymarket_fetch_interval),
                            id="polymarket", next_run_time=now, max_instances=1, misfire_grace_time=60)
-        _scheduler.add_job(job_run_analyzer, IntervalTrigger(seconds=settings.analyzer_run_interval),
+        _add_tracked_job(job_run_analyzer, IntervalTrigger(seconds=settings.analyzer_run_interval),
                            id="analyzer", next_run_time=now, max_instances=1, misfire_grace_time=60)
-        _scheduler.add_job(job_check_resolutions, IntervalTrigger(seconds=86400),
+        _add_tracked_job(job_check_resolutions, IntervalTrigger(seconds=86400),
                            id="resolutions", next_run_time=now, max_instances=1, misfire_grace_time=3600)
         # Data retention / de-dup — the RAM-cost control job. First run cleans the
         # accumulated backlog; delay it 10 min so it doesn't fight startup.
         if getattr(settings, "retention_enabled", True):
-            _scheduler.add_job(
+            _add_tracked_job(
                 job_prune_old_data,
                 IntervalTrigger(seconds=getattr(settings, "retention_run_interval", 86400)),
                 id="retention", next_run_time=now + timedelta(minutes=10),
@@ -143,11 +155,11 @@ async def lifespan(app: FastAPI):
                 logger.info(f"[mem] RSS={s['rss_mb']} MB blocks={s['allocated_blocks']:,}")
             except Exception as e:
                 logger.debug(f"[mem] heartbeat failed: {e}")
-        _scheduler.add_job(_mem_heartbeat, IntervalTrigger(seconds=900),
+        _add_tracked_job(_mem_heartbeat, IntervalTrigger(seconds=900),
                            id="mem_heartbeat", next_run_time=now, max_instances=1,
                            misfire_grace_time=120)
         if getattr(settings, "intraday_enabled", True):
-            _scheduler.add_job(job_run_intraday,
+            _add_tracked_job(job_run_intraday,
                                IntervalTrigger(seconds=getattr(settings, "intraday_run_interval", 300)),
                                id="intraday", next_run_time=now, max_instances=1, misfire_grace_time=60)
 
