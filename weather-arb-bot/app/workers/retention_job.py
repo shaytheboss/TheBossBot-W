@@ -234,14 +234,38 @@ _RAW_DATA_MAX_BATCHES = 200       # ≤400k rows per run — a full pass, bounde
 
 
 async def _exec_count(db, sql: str, params: dict | None = None) -> int:
-    """Run a DELETE and return affected row count; never raises."""
+    """Run a statement and return affected row count; never raises."""
+    n, _err = await _exec_count_or_error(db, sql, params)
+    return n
+
+
+async def _exec_count_or_error(
+    db, sql: str, params: dict | None = None
+) -> tuple[int, Optional[str]]:
+    """As above, but hands the failure back instead of only logging it.
+
+    A step that reports 0 is ambiguous: it can mean "nothing needed doing" or
+    "the statement blew up and nobody noticed". Callers that show a number to a
+    human need to be able to tell those apart.
+    """
     try:
         result = await db.execute(text(sql), params or {})
-        return int(result.rowcount or 0)
+        return int(result.rowcount or 0), None
     except Exception as e:
-        logger.error(f"[retention] statement failed: {e}", exc_info=True)
+        msg = f"{type(e).__name__}: {e}"
+        logger.error(f"[retention] statement failed: {msg}", exc_info=True)
         await db.rollback()
-        return 0
+        return 0, msg
+
+
+async def _scalar(db, sql: str, params: dict | None = None) -> Optional[int]:
+    """Read one number; None if the query fails. Diagnostics must never break
+    the maintenance run they are describing."""
+    try:
+        return int((await db.execute(text(sql), params or {})).scalar() or 0)
+    except Exception as e:
+        logger.warning(f"[retention] diagnostic query failed: {e}")
+        return None
 
 
 def raw_data_cutoff(today: date, cfg=None) -> date:
@@ -256,16 +280,31 @@ async def strip_raw_data(
     *,
     batch: int = _RAW_DATA_BATCH,
     max_batches: int = _RAW_DATA_MAX_BATCHES,
-) -> int:
+) -> dict:
     """NULL out `forecasts.raw_data` for target dates older than `cutoff`.
 
-    Deletes nothing. Returns the number of rows cleared. Never raises — a
-    failure mid-way keeps the batches already committed, which is fine because
-    the operation is idempotent and resumes on the next run.
+    Deletes nothing. Never raises — a failure mid-way keeps the batches already
+    committed, which is fine because the operation is idempotent and resumes on
+    the next run.
+
+    Returns {"cleared", "eligible_before", "remaining", "error"}. The counts
+    exist because a bare "cleared: 0" is ambiguous: it reads identically
+    whether the work was already done or the statement failed and nobody
+    noticed. `eligible_before` settles it — 0 eligible means there was nothing
+    to do, and a non-zero `remaining` alongside `cleared: 0` means something
+    went wrong.
     """
+    eligible = await _scalar(
+        db,
+        "SELECT count(*) FROM forecasts "
+        "WHERE forecast_for_date < :cutoff AND raw_data IS NOT NULL",
+        {"cutoff": cutoff},
+    )
+    out: dict = {"cleared": 0, "eligible_before": eligible, "remaining": None,
+                 "error": None}
     cleared = 0
     for _ in range(max_batches):
-        n = await _exec_count(
+        n, err = await _exec_count_or_error(
             db,
             """
             UPDATE forecasts SET raw_data = NULL
@@ -277,16 +316,33 @@ async def strip_raw_data(
             """,
             {"cutoff": cutoff, "batch": batch},
         )
+        if err:
+            out["error"] = err
+            break
         if n == 0:
             break
         await db.commit()
         cleared += n
+
+    out["cleared"] = cleared
+    out["remaining"] = await _scalar(
+        db,
+        "SELECT count(*) FROM forecasts "
+        "WHERE forecast_for_date < :cutoff AND raw_data IS NOT NULL",
+        {"cutoff": cutoff},
+    )
     if cleared:
         logger.info(
             f"[retention] cleared raw_data on {cleared} forecast rows "
-            f"older than {cutoff} (no rows deleted)"
+            f"older than {cutoff} (no rows deleted); {out['remaining']} left"
         )
-    return cleared
+    elif eligible:
+        logger.warning(
+            f"[retention] {eligible} forecast rows were eligible for raw_data "
+            f"stripping but none were cleared"
+            + (f" — {out['error']}" if out["error"] else "")
+        )
+    return out
 
 
 async def job_prune_old_data(vacuum_full: bool = False) -> dict:
@@ -330,9 +386,16 @@ async def job_prune_old_data(vacuum_full: bool = False) -> dict:
 
         # ── 1.5 Strip raw_data from past target dates (lossless, no deletes) ────
         if strip_on:
-            summary["forecasts_raw_data_stripped"] = await strip_raw_data(
-                db, raw_data_cutoff(date.today(), settings)
-            )
+            strip = await strip_raw_data(db, raw_data_cutoff(date.today(), settings))
+            summary["forecasts_raw_data_stripped"] = strip["cleared"]
+            # Only surfaced when they say something the count does not: that
+            # there was nothing to do, or that something failed.
+            if not strip["cleared"]:
+                summary["raw_data_eligible"] = strip["eligible_before"]
+            if strip["remaining"]:
+                summary["raw_data_remaining"] = strip["remaining"]
+            if strip["error"]:
+                summary["raw_data_error"] = strip["error"]
 
         # ── 2. Retention deletes — OFF by default (destroys history) ────────────
         if prune_on:

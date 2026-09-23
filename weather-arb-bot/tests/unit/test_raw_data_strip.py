@@ -36,15 +36,20 @@ APP = Path(__file__).resolve().parents[2] / "app"
 class _DB:
     """Records UPDATEs and replays a script of rowcounts."""
 
-    def __init__(self, rowcounts):
+    def __init__(self, rowcounts, eligible=99):
         self.rowcounts = list(rowcounts)
+        self.eligible = eligible
         self.statements: list[str] = []
         self.params: list[dict] = []
         self.commits = 0
         self.rollbacks = 0
 
     async def execute(self, statement, params=None):
-        self.statements.append(str(statement))
+        sql = str(statement)
+        if "count(*)" in sql:                 # the eligible/remaining probes
+            eligible = self.eligible
+            return type("R", (), {"scalar": lambda _s: eligible})()
+        self.statements.append(sql)
         self.params.append(params or {})
 
         class _R:
@@ -132,13 +137,13 @@ class TestBatching:
         """One 267k-row UPDATE would spike WAL past the free space on a volume
         already at 85%. Small committed batches keep the peak flat."""
         db = _DB([2000, 2000, 450, 0])
-        assert await strip_raw_data(db, date(2026, 9, 15), batch=2000) == 4450
+        assert (await strip_raw_data(db, date(2026, 9, 15), batch=2000))["cleared"] == 4450
         assert db.commits == 3, "each non-empty batch commits before the next"
 
     @pytest.mark.asyncio
     async def test_it_stops_as_soon_as_nothing_is_left(self):
         db = _DB([0])
-        assert await strip_raw_data(db, date(2026, 9, 15)) == 0
+        assert (await strip_raw_data(db, date(2026, 9, 15)))["cleared"] == 0
         assert len(db.statements) == 1, "must not keep polling an empty table"
         assert db.commits == 0
 
@@ -154,16 +159,19 @@ class TestBatching:
         """A bug that made every batch report work would otherwise loop until
         the job is killed mid-transaction."""
         db = _DB([5] * 100)
-        assert await strip_raw_data(db, date(2026, 9, 15), batch=5, max_batches=3) == 15
+        assert (await strip_raw_data(db, date(2026, 9, 15), batch=5, max_batches=3))["cleared"] == 15
         assert len(db.statements) == 3
 
     @pytest.mark.asyncio
     async def test_a_failure_keeps_the_committed_batches(self):
-        """_exec_count swallows the error and returns 0, which ends the loop.
-        The rows already cleared stay cleared; the next run resumes."""
+        """The loop ends on error; rows already cleared stay cleared and the
+        next run resumes, because the operation is idempotent."""
         class _Boom(_DB):
             async def execute(self, statement, params=None):
-                self.statements.append(str(statement))
+                sql = str(statement)
+                if "count(*)" in sql:
+                    return type("R", (), {"scalar": lambda _s: 99})()
+                self.statements.append(sql)
                 if len(self.statements) == 2:
                     raise RuntimeError("connection lost")
                 class _R:
@@ -171,8 +179,81 @@ class TestBatching:
                 return _R()
 
         db = _Boom([])
-        assert await strip_raw_data(db, date(2026, 9, 15)) == 100
+        out = await strip_raw_data(db, date(2026, 9, 15))
+        assert out["cleared"] == 100
         assert db.commits == 1 and db.rollbacks == 1
+
+
+# ── "0" must never be ambiguous ───────────────────────────────────────────
+
+class TestZeroIsExplained:
+    """A bare "cleared: 0" reads identically whether the work was already done
+    or the statement failed and nobody noticed. Production reported exactly
+    that, and there was no way to tell which — so the counts now say.
+    """
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_do_reports_zero_eligible(self):
+        out = await strip_raw_data(_DB([0], eligible=0), date(2026, 9, 15))
+        assert out == {"cleared": 0, "eligible_before": 0,
+                       "remaining": 0, "error": None}
+
+    @pytest.mark.asyncio
+    async def test_a_silent_failure_is_no_longer_silent(self):
+        """Eligible rows, none cleared, and an error string — three signals
+        that together cannot be mistaken for "nothing needed doing"."""
+        class _Fails(_DB):
+            async def execute(self, statement, params=None):
+                sql = str(statement)
+                if "count(*)" in sql:
+                    return type("R", (), {"scalar": lambda _s: 4200})()
+                raise RuntimeError("could not extend file")
+
+        out = await strip_raw_data(_Fails([]), date(2026, 9, 15))
+        assert out["cleared"] == 0
+        assert out["eligible_before"] == 4200
+        assert out["remaining"] == 4200
+        assert "could not extend file" in out["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_job_surfaces_the_diagnosis(self, monkeypatch):
+        import app.workers.retention_job as rj
+
+        async def fake_strip(db, cutoff, **kw):
+            return {"cleared": 0, "eligible_before": 4200,
+                    "remaining": 4200, "error": "OperationalError: reset"}
+
+        monkeypatch.setattr(rj, "strip_raw_data", fake_strip)
+        monkeypatch.setattr(rj, "AsyncSessionLocal", lambda: _Session())
+        monkeypatch.setattr(rj.settings, "retention_dedup_enabled", False)
+        monkeypatch.setattr(rj.settings, "retention_prune_enabled", False)
+        monkeypatch.setattr(rj.settings, "retention_vacuum_enabled", False)
+
+        summary = await rj.job_prune_old_data()
+        assert summary["forecasts_raw_data_stripped"] == 0
+        assert summary["raw_data_eligible"] == 4200
+        assert summary["raw_data_remaining"] == 4200
+        assert "reset" in summary["raw_data_error"]
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_stays_quiet(self, monkeypatch):
+        """No noise keys when there is nothing to explain."""
+        import app.workers.retention_job as rj
+
+        async def fake_strip(db, cutoff, **kw):
+            return {"cleared": 500, "eligible_before": 500,
+                    "remaining": 0, "error": None}
+
+        monkeypatch.setattr(rj, "strip_raw_data", fake_strip)
+        monkeypatch.setattr(rj, "AsyncSessionLocal", lambda: _Session())
+        monkeypatch.setattr(rj.settings, "retention_dedup_enabled", False)
+        monkeypatch.setattr(rj.settings, "retention_prune_enabled", False)
+        monkeypatch.setattr(rj.settings, "retention_vacuum_enabled", False)
+
+        summary = await rj.job_prune_old_data()
+        assert summary["forecasts_raw_data_stripped"] == 500
+        for noise in ("raw_data_eligible", "raw_data_remaining", "raw_data_error"):
+            assert noise not in summary
 
 
 # ── Wiring ────────────────────────────────────────────────────────────────
@@ -204,7 +285,7 @@ class TestWiring:
 
         async def fake_strip(db, cutoff, **kw):
             calls["cutoff"] = cutoff
-            return 123
+            return {"cleared": 123, "eligible_before": 123, "remaining": 0, "error": None}
 
         monkeypatch.setattr(rj, "strip_raw_data", fake_strip)
         monkeypatch.setattr(rj, "AsyncSessionLocal", lambda: _Session())
