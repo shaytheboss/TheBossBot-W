@@ -97,6 +97,17 @@ class Settings(BaseSettings):
     # בשניות. בנוסף לכך העדכון רץ מיד אחרי כל settlement של פולימרקט.
     model_skill_update_interval: int = 3600
 
+    # ── Shadow study (app/shadow/) ──────────────────────────────────────────
+    # Hourly record of the model's estimate vs the market price for EVERY
+    # bucket of every open market, on each city's own clock. Research only:
+    # writes to its own tables, makes no HTTP calls, changes no trade.
+    shadow_enabled: bool = True
+    # Telegram: "off" | "summary" (one message per market after it resolves,
+    # showing the hour-by-hour story) | "summary_hourly" (also a single digest
+    # each hour of the largest model-vs-market gaps).
+    shadow_alert_mode: str = "summary"
+    shadow_retention_days: int = 45
+    shadow_max_days_ahead: int = 3
     # ── Auto-suspension ─────────────────────────────────────────────────────
     # Master switch. False stops the bot suspending cities on its own; existing
     # suspensions still expire, and a city can still be suspended by hand from

@@ -147,6 +147,8 @@
       <div id="statsModelSkill"></div>
       <h3 style="margin-top:24px;">🔬 Backtest export (for model tuning)
         <button class="btn primary small" onclick="downloadServerCsv('/export/backtest-csv?days=90', 'backtest', this)" title="Download every settled bet of the last 90 days WITH each model's forecast and the real outcome — the dataset used to rebuild and validate the confidence scoring">⬇ Download backtest CSV</button>
+        <button class="btn small" onclick="downloadServerCsv('/shadow/csv', 'shadow', this)" title="Every hourly shadow-study snapshot: model vs market per bucket, on each city's clock, with the outcome once resolved">⬇ Shadow study CSV</button>
+        <button class="btn small" onclick="showShadowStatus(this)" title="What the last hourly shadow run recorded, and how large the table is">🔬 Shadow status</button>
       </h3>
       <p class="small">One row per settled bet (last 90 days) with <strong>each model's forecast, its probability, the per-city weights, sigma, stated confidence, entry price — and the actual win/loss</strong>. This is the full decision-time record used to reconstruct exactly how the % is computed and to backtest scoring improvements against real results.</p>
       <h3 style="margin-top:24px;">💾 Database size &amp; maintenance
@@ -2091,6 +2093,25 @@ async function loadSettings() {
       </td></tr>
       <tr><td colspan="2"><button class="btn" onclick="showSuspensionReport(this)">📋 Why are cities being suspended?</button>
         <pre id="suspOut" class="small" style="white-space:pre;overflow-x:auto;margin-top:8px;"></pre></td></tr>
+      <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🔬 Shadow study (research only — never affects trading)</td></tr>
+      <tr><td>Recording</td><td>
+        <select id="set-shadow-on">
+          <option value="1" ${s.shadow_enabled ? 'selected' : ''}>On — record every bucket hourly</option>
+          <option value="0" ${s.shadow_enabled ? '' : 'selected'}>Off</option>
+        </select></td></tr>
+      <tr><td>Telegram</td><td>
+        <select id="set-shadow-mode">
+          <option value="summary" ${s.shadow_alert_mode === 'summary' ? 'selected' : ''}>Summary after each market resolves</option>
+          <option value="summary_hourly" ${s.shadow_alert_mode === 'summary_hourly' ? 'selected' : ''}>Summary + one hourly digest</option>
+          <option value="off" ${s.shadow_alert_mode === 'off' ? 'selected' : ''}>No messages</option>
+        </select></td></tr>
+      <tr><td colspan="2" class="small">
+        Every hour, the model's estimate and the market price are recorded for every bucket of
+        every open market, tagged with the city's own clock (hours until its day closes, local
+        hour, forecast freshness). The summary arrives once a market resolves and shows the
+        hour-by-hour story: which bucket each side favoured, and who settled on the winner first.
+        The hourly digest is ONE message per hour covering all markets, not one per market.
+      </td></tr>
       <tr><td>METAR interval (s)</td><td>${s.metar_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Polymarket interval (s)</td><td>${s.polymarket_fetch_interval} <span class="small">(restart)</span></td></tr>
       <tr><td>Analyzer interval (s)</td><td>${s.analyzer_run_interval} <span class="small">(restart)</span></td></tr>
@@ -2117,10 +2138,36 @@ async function saveSettings() {
     suspension_window_trades: parseInt(document.getElementById('set-susp-window').value),
     suspension_min_win_rate: parseFloat(document.getElementById('set-susp-rate').value),
     suspension_days: parseInt(document.getElementById('set-susp-days').value),
+    shadow_enabled: document.getElementById('set-shadow-on').value === '1',
+    shadow_alert_mode: document.getElementById('set-shadow-mode').value,
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
   else { const j = await r.json().catch(()=>({})); alert('Save failed: ' + (j.detail || r.status)); }
+}
+
+async function showShadowStatus(btn) {
+  const out = document.getElementById('dbOut') || document.getElementById('memOut');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await api('/shadow/status');
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) { out.textContent = 'Failed: ' + (j.detail || r.status) + '\n\n' + out.textContent; return; }
+    let s = `[${new Date().toLocaleTimeString()}] Shadow study: ${j.enabled ? 'ON' : 'OFF'}`
+          + `  |  Telegram: ${j.alert_mode}  |  keeps ${j.retention_days} days`
+          + `  |  table ${j.table_size_mb == null ? '?' : j.table_size_mb + ' MB'}\n`;
+    const L = j.last_run;
+    if (!L) s += '   no run yet since the last restart (runs at :05 every hour)\n';
+    else {
+      s += `   last run ${L.at}: ${L.markets} markets, ${L.rows} rows written, `
+         + `${L.skipped_dead} dead buckets skipped, ${L.already_done} already done this hour\n`
+         + `   summaries sent: ${L.summaries_sent}   hourly digest: ${L.digest_sent ? 'yes' : 'no'}`
+         + `   pruned: ${L.pruned}   took ${L.duration_s}s   errors: ${L.errors}\n`;
+      if (L.fatal) s += `   ❌ ${L.fatal}\n`;
+    }
+    out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
 async function showJobStats(btn, reset) {

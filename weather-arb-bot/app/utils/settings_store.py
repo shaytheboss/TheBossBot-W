@@ -41,6 +41,9 @@ PERSISTABLE_KEYS: frozenset = frozenset({
     "suspension_window_trades",
     "suspension_min_win_rate",
     "suspension_days",
+    # Shadow study — research switches, safe to flip at runtime.
+    "shadow_enabled",
+    "shadow_alert_mode",
 })
 
 

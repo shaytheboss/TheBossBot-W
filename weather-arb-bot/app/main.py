@@ -163,6 +163,16 @@ async def lifespan(app: FastAPI):
                                IntervalTrigger(seconds=getattr(settings, "intraday_run_interval", 300)),
                                id="intraday", next_run_time=now, max_instances=1, misfire_grace_time=60)
 
+        # Shadow study (app/shadow/) — research only, isolated from trading.
+        # Cron at :05 rather than an interval so snapshots land on the same
+        # minute every hour and line up across restarts. Always scheduled; the
+        # job checks shadow_enabled itself, so the settings screen can switch
+        # it on or off without a restart.
+        from apscheduler.triggers.cron import CronTrigger
+        from app.shadow.snapshot import job_shadow_snapshot
+        _add_tracked_job(job_shadow_snapshot, CronTrigger(minute=5),
+                         id="shadow", max_instances=1, misfire_grace_time=600)
+
         _scheduler.start()
         logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
     except Exception as e:
