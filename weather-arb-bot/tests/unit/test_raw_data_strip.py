@@ -365,6 +365,7 @@ class TestNothingElseReadsRawData:
             "collectors/tomorrowio_collector.py",
             "collectors/wunderground_collector.py",
             "collectors/metar_collector.py",
+            "workers/open_meteo_job.py",   # writes raw_data like the collectors; reads none
             "analyzers/model_skill.py",    # a comment explaining why it avoids it
         }
         found = set(self._sources_mentioning_raw_data())

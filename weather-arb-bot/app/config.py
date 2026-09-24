@@ -102,6 +102,25 @@ class Settings(BaseSettings):
     # בשניות. בנוסף לכך העדכון רץ מיד אחרי כל settlement של פולימרקט.
     model_skill_update_interval: int = 3600
 
+    # ── Open-Meteo fetching (app/workers/open_meteo_job.py) ─────────────────
+    # "batched": one request per (city, model) covering every day, on a
+    # cadence per model tier, under a daily budget. "legacy": the old jobs,
+    # one request per (city, model, day) — ~41k calls/day against a free
+    # tier of 10k. Runtime-switchable from the admin screen.
+    model_fetch_mode: str = "batched"
+    # Our own ceiling, below Open-Meteo's 10,000/day free limit.
+    open_meteo_daily_budget: int = 8000
+    # Hours between fetches, per tier. Core = GFS, ECMWF, ICON (the blend).
+    open_meteo_core_every_h: int = 1
+    open_meteo_ensemble_every_h: int = 6
+    open_meteo_extra_every_h: int = 6
+    # Record-only models: written to `forecasts` as source "om_<model>", never
+    # read by the estimators. Scored per city at /admin/models/compare.
+    open_meteo_extra_models: str = (
+        "ukmo_seamless,jma_seamless,gem_seamless,meteofrance_seamless,"
+        "ecmwf_aifs025_single,ncep_nbm_conus"
+    )
+
     # ── Shadow study (app/shadow/) ──────────────────────────────────────────
     # Hourly record of the model's estimate vs the market price for EVERY
     # bucket of every open market, on each city's own clock. Research only:

@@ -13,6 +13,59 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
 
+def ensemble_summary(hourly: dict, target_str: str) -> Optional[dict]:
+    """Daily high/low distribution for one date from Open-Meteo hourly members.
+
+    Shared by the per-date collector below and the all-days batch fetcher
+    (app/workers/open_meteo_job.py), so both write identical rows.
+    """
+    times = hourly.get("time", [])
+    target_indices = [i for i, t in enumerate(times) if t.startswith(target_str)]
+    if not target_indices:
+        return None
+
+    member_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
+    if not member_keys:
+        return None
+
+    daily_highs = []
+    daily_lows = []
+    for key in member_keys:
+        member_temps = [hourly[key][i] for i in target_indices if hourly[key][i] is not None]
+        if member_temps:
+            daily_highs.append(max(member_temps))
+            daily_lows.append(min(member_temps))
+
+    if not daily_highs:
+        return None
+
+    daily_highs.sort()
+    daily_lows.sort()
+    n = len(daily_highs)
+
+    def pct(lst, p):
+        return round(lst[int(n * p)])
+
+    return {
+        "ensemble_highs": daily_highs,
+        "ensemble_lows": daily_lows,
+        "ensemble_count": n,
+        "mean_high_f": round(sum(daily_highs) / n, 1),
+        "mean_low_f": round(sum(daily_lows) / n, 1),
+        "p10_high_f": pct(daily_highs, 0.10),
+        "p25_high_f": pct(daily_highs, 0.25),
+        "p50_high_f": pct(daily_highs, 0.50),
+        "p75_high_f": pct(daily_highs, 0.75),
+        "p90_high_f": pct(daily_highs, 0.90),
+        "p10_low_f": pct(daily_lows, 0.10),
+        "p25_low_f": pct(daily_lows, 0.25),
+        "p50_low_f": pct(daily_lows, 0.50),
+        "p75_low_f": pct(daily_lows, 0.75),
+        "p90_low_f": pct(daily_lows, 0.90),
+        "forecast_date": target_str,
+    }
+
+
 class GFSCollector(BaseCollector):
     name = "gfs"
 
@@ -125,53 +178,10 @@ class GFSCollector(BaseCollector):
             if not times:
                 return None
 
-            # Collect indices for the target date
-            target_indices = [i for i, t in enumerate(times) if t.startswith(target_str)]
-            if not target_indices:
-                logger.warning(f"Ensemble: date {target_str} not found for {lat},{lon}")
-                return None
-
-            # Find all member keys dynamically
-            member_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
-            if not member_keys:
-                return None
-
-            daily_highs = []
-            daily_lows = []
-            for key in member_keys:
-                member_temps = [hourly[key][i] for i in target_indices if hourly[key][i] is not None]
-                if member_temps:
-                    daily_highs.append(max(member_temps))
-                    daily_lows.append(min(member_temps))
-
-            if not daily_highs:
-                return None
-
-            daily_highs.sort()
-            daily_lows.sort()
-            n = len(daily_highs)
-
-            def pct(lst, p):
-                return round(lst[int(n * p)])
-
-            return {
-                "ensemble_highs": daily_highs,
-                "ensemble_lows": daily_lows,
-                "ensemble_count": n,
-                "mean_high_f": round(sum(daily_highs) / n, 1),
-                "mean_low_f": round(sum(daily_lows) / n, 1),
-                "p10_high_f": pct(daily_highs, 0.10),
-                "p25_high_f": pct(daily_highs, 0.25),
-                "p50_high_f": pct(daily_highs, 0.50),
-                "p75_high_f": pct(daily_highs, 0.75),
-                "p90_high_f": pct(daily_highs, 0.90),
-                "p10_low_f": pct(daily_lows, 0.10),
-                "p25_low_f": pct(daily_lows, 0.25),
-                "p50_low_f": pct(daily_lows, 0.50),
-                "p75_low_f": pct(daily_lows, 0.75),
-                "p90_low_f": pct(daily_lows, 0.90),
-                "forecast_date": target_str,
-            }
+            summary = ensemble_summary(hourly, target_str)
+            if summary is None:
+                logger.warning(f"Ensemble: no usable members for {target_str} at {lat},{lon}")
+            return summary
         except Exception as e:
             logger.error(f"Ensemble fetch failed for {target_str}: {e}")
             return None
