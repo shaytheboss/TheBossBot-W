@@ -124,7 +124,9 @@ def skill_weight(hits: int, samples: int) -> float:
 
 # ── חישוב ועדכון הטבלה ──────────────────────────────────────────────────────
 
-async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[tuple, dict]:
+async def compute_city_skill(
+    db: AsyncSession, city_id: int, sources: tuple[str, ...] = SKILL_SOURCES,
+) -> dict[tuple, dict]:
     """סטטיסטיקת דיוק לכל (מודל, days_ahead) בעיר אחת, על חלון הזמן המתגלגל.
 
     מחזיר {(source, days_ahead): {samples, hits, dist_sum, signed_sum, last_event}}.
@@ -133,6 +135,10 @@ async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[tuple, dict
     ימים לפני האירוע — כלומר מכסים גם אותו-יום וגם תחזיות מוקדמות.
     לכל (מודל, יום-אירוע, days_ahead) נלקחת התחזית עם retrieved_at המאוחר
     ביותר בתוך אותו יום-הקדמה.
+
+    `sources` defaults to the models in the blend. The comparison report
+    (app/analyzers/model_compare.py) passes the record-only models as well;
+    update_model_skill never does, so trading weights are unaffected.
     """
     since = date.today() - timedelta(days=WINDOW_DAYS)
 
@@ -185,7 +191,7 @@ async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[tuple, dict
             Forecast.predicted_high_f,
         ).where(
             Forecast.city_id == city_id,
-            Forecast.source.in_(SKILL_SOURCES),
+            Forecast.source.in_(sources),
             Forecast.forecast_for_date.in_(event_days),
             Forecast.predicted_high_f.isnot(None),
         )
@@ -212,7 +218,7 @@ async def compute_city_skill(db: AsyncSession, city_id: int) -> dict[tuple, dict
     stats: dict[tuple, dict] = {}
     for mid, winners in winners_by_market.items():
         ev = market_dates[mid]
-        for source in SKILL_SOURCES:
+        for source in sources:
             da_map = by_source_date.get((source, ev), {})
             for da, high_f in da_map.items():
                 scored = score_forecast(high_f, winners)

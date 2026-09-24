@@ -113,6 +113,13 @@ async def lifespan(app: FastAPI):
             _add_tracked_job(job_fetch_icon,
                                IntervalTrigger(seconds=getattr(settings, "icon_fetch_interval", 3600)),
                                id="icon", next_run_time=now, max_instances=1, misfire_grace_time=600)
+        # Open-Meteo, batched: one request per (city, model) for all days, on
+        # the clock (minute 20) so a redeploy cannot add a round of requests.
+        # The legacy jobs above return at once unless model_fetch_mode=legacy.
+        from apscheduler.triggers.cron import CronTrigger
+        from app.workers.open_meteo_job import job_fetch_open_meteo
+        _add_tracked_job(job_fetch_open_meteo, CronTrigger(minute=20),
+                           id="open_meteo", max_instances=1, misfire_grace_time=900)
         _add_tracked_job(job_fetch_external_forecasts,
                            IntervalTrigger(seconds=settings.external_forecast_fetch_interval),
                            id="external_forecasts", next_run_time=now,

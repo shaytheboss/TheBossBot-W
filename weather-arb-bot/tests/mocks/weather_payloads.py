@@ -266,3 +266,66 @@ def buoy_text(*, water_temp_c: float = 27.4, air_temp_c: float = 29.1) -> str:
         f"2026 07 28 18 00  160  5.0  6.0    MM    MM    MM  MM 1014.5  {air_temp_c:.1f}  {water_temp_c:.1f}  22.0   MM   MM    MM\n"
         f"2026 07 28 17 30  155  4.8  5.8    MM    MM    MM  MM 1014.7  {air_temp_c - 0.3:.1f}  {water_temp_c:.1f}  22.1   MM   MM    MM\n"
     )
+
+
+# ── Open-Meteo, whole-API simulator ───────────────────────────────────────
+
+def open_meteo_value(model: str, d: date) -> float:
+    """The forecast high a simulated model gives for a date. Fixed per
+    (model, date) and deliberately fractional, so rounding is exercised."""
+    return 60.0 + sum(map(ord, model)) % 17 + d.toordinal() % 11 + 0.4
+
+
+def open_meteo_simulator(
+    start: date,
+    *,
+    horizons: Optional[dict] = None,
+    rejected: Sequence[str] = (),
+    members: int = 5,
+):
+    """A handler answering `/v1/forecast` and `/v1/ensemble` the way the real
+    API does: `forecast_days` days from `start` (the city's local today), with
+    values that depend on the model and the date — never on how many days
+    were requested. That property is what lets a per-date fetch and an
+    all-days fetch be compared row for row.
+
+    `horizons` gives a model's last non-null day index (HRRR ends after ~2
+    days); `rejected` answers 400 the way Open-Meteo does for an unknown model.
+    """
+    import httpx
+
+    horizons = horizons or {}
+
+    def handler(request):
+        p = request.url.params
+        model = p.get("models", "")
+        n = int(p.get("forecast_days", "7"))
+        if model in rejected:
+            return httpx.Response(400, json={"error": True,
+                                             "reason": f"Invalid model '{model}'"})
+        days = [start + timedelta(days=i) for i in range(n)]
+        horizon = horizons.get(model, 15)
+        if "ensemble" in request.url.host:
+            hourly: dict = {"time": [f"{d}T{h:02d}:00" for d in days for h in range(24)]}
+            for m in range(members):
+                series = []
+                for i, d in enumerate(days):
+                    base = open_meteo_value("ens_" + model, d) + (m - members // 2)
+                    day = [None if i > horizon else base - 15] * 24
+                    if i <= horizon:
+                        day[15] = base
+                    series.extend(day)
+                hourly[f"temperature_2m_member{m:02d}"] = series
+            return httpx.Response(200, json={"latitude": 30.2, "longitude": -97.7,
+                                             "hourly": hourly})
+        highs = [None if i > horizon else open_meteo_value(model, d) for i, d in enumerate(days)]
+        daily = {
+            "time": [str(d) for d in days],
+            "temperature_2m_max": highs,
+            "temperature_2m_min": [None if h is None else h - 20 for h in highs],
+        }
+        if "windspeed_10m_max" in p.get("daily", ""):
+            daily["windspeed_10m_max"] = [7.0 for _ in days]
+        return httpx.Response(200, json={"latitude": 30.2, "longitude": -97.7, "daily": daily})
+
+    return handler

@@ -2103,6 +2103,25 @@ async function loadSettings() {
         (−6.35pp, then −5.27pp). A cheap ask on a "92% sure" bet means the market disagrees by
         20–30 points — and it was the market that was right. Alerts still fire; only the buy is gated.
       </td></tr>
+      <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🌐 Open-Meteo models</td></tr>
+      <tr><td>Fetch mode</td><td>
+        <select id="set-om-mode">
+          <option value="batched" ${s.model_fetch_mode === 'batched' ? 'selected' : ''}>Batched — one request per model per city, under a daily budget</option>
+          <option value="legacy" ${s.model_fetch_mode === 'legacy' ? 'selected' : ''}>Legacy — one request per day (≈41k/day, over the free limit)</option>
+        </select></td></tr>
+      <tr><td>Extra models (record-only)</td>
+          <td><input id="set-om-extra" type="text" style="width:100%" value="${s.open_meteo_extra_models}" /></td></tr>
+      <tr><td colspan="2" class="small">
+        GFS, ECMWF, ICON, HRRR and both ensembles come from Open-Meteo. NWS, Meteosource and
+        Tomorrow.io are separate providers and are not affected. Extra models are stored for
+        comparison only — the bot never trades on them. A model id Open-Meteo rejects is skipped
+        for the rest of the day and listed in the status.
+      </td></tr>
+      <tr><td colspan="2">
+        <button class="btn" onclick="showJson(this, '/open-meteo/status', 'omOut')">📶 Open-Meteo usage today</button>
+        <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=1', 'omOut')">🏁 Best model per city (1 day ahead)</button>
+        <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=0', 'omOut')">Same day</button>
+        <pre id="omOut" class="small" style="white-space:pre;overflow-x:auto;max-height:480px;margin-top:8px;"></pre></td></tr>
       <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🔬 Shadow study (research only — never affects trading)</td></tr>
       <tr><td>Recording</td><td>
         <select id="set-shadow-on">
@@ -2151,6 +2170,8 @@ async function saveSettings() {
     shadow_enabled: document.getElementById('set-shadow-on').value === '1',
     shadow_alert_mode: document.getElementById('set-shadow-mode').value,
     intraday_min_entry_cost: parseFloat(document.getElementById('set-intra-minentry').value),
+    model_fetch_mode: document.getElementById('set-om-mode').value,
+    open_meteo_extra_models: document.getElementById('set-om-extra').value,
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
@@ -2266,6 +2287,17 @@ async function showJobStats(btn, reset) {
     s += `\n${j.note}\n`;
     if (reset) s += `Counters reset — come back in an hour for a clean window.\n`;
     out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+async function showJson(btn, path, outId) {
+  const out = document.getElementById(outId);
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Loading…';
+  try {
+    const r = await api(path);
+    const j = await r.json().catch(()=>({}));
+    out.textContent = r.ok ? JSON.stringify(j, null, 2) : 'Failed: ' + (j.detail || r.status);
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
 

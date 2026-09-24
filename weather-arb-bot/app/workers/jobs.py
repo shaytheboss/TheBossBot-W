@@ -607,6 +607,9 @@ async def job_fetch_nws():
 
 
 async def job_fetch_models():
+    # Superseded by app/workers/open_meteo_job.py unless switched back to legacy.
+    if getattr(settings, "model_fetch_mode", "batched") == "batched":
+        return
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
         cities = result.scalars().all()

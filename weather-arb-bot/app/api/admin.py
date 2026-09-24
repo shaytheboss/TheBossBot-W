@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 import time
 from datetime import date as date_cls, datetime, timedelta, timezone
@@ -122,6 +123,8 @@ class SettingsIn(BaseModel):
     shadow_enabled: Optional[bool] = None
     shadow_alert_mode: Optional[str] = None
     intraday_min_entry_cost: Optional[float] = None
+    model_fetch_mode: Optional[str] = None
+    open_meteo_extra_models: Optional[str] = None
 
 
 class CityCreateIn(BaseModel):
@@ -2174,6 +2177,30 @@ async def admin_shadow_csv(
     return await stream_csv("shadow.csv", fields, rows_for)
 
 
+@router.get("/open-meteo/status")
+async def admin_open_meteo_status(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Open-Meteo requests today against our budget, the plan per tier, and
+    what the legacy jobs would have sent. From memory — no table scan."""
+    from app.workers.open_meteo_job import status
+    cities = (await db.execute(select(City).where(City.active == True))).scalars().all()
+    return status(cities)
+
+
+@router.get("/models/compare")
+async def admin_models_compare(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days_ahead: int = Query(default=1, ge=0, le=3),
+):
+    """Per city: which model lands in the winning bucket most often, including
+    the record-only Open-Meteo models. Read-only; changes no weight."""
+    from app.analyzers.model_compare import compare_models
+    return await compare_models(db, days_ahead=days_ahead)
+
+
 @router.get("/job-stats")
 async def admin_job_stats(_: str = Depends(require_admin), reset: bool = Query(default=False)):
     """Where the CPU goes, per scheduled job.
@@ -2329,6 +2356,8 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "shadow_enabled": getattr(settings, "shadow_enabled", True),
         "shadow_alert_mode": getattr(settings, "shadow_alert_mode", "summary"),
         "intraday_min_entry_cost": getattr(settings, "intraday_min_entry_cost", 0.70),
+        "model_fetch_mode": getattr(settings, "model_fetch_mode", "batched"),
+        "open_meteo_extra_models": getattr(settings, "open_meteo_extra_models", ""),
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -2407,6 +2436,18 @@ async def admin_set_settings(
     if payload.intraday_min_entry_cost is not None:
         _validate_unit(payload.intraday_min_entry_cost, "intraday_min_entry_cost")
         changed["intraday_min_entry_cost"] = payload.intraday_min_entry_cost
+
+    # ── Open-Meteo ────────────────────────────────────────────────────────
+    if payload.model_fetch_mode is not None:
+        from app.workers.open_meteo_job import MODES
+        if payload.model_fetch_mode not in MODES:
+            raise HTTPException(400, f"model_fetch_mode must be one of {MODES}")
+        changed["model_fetch_mode"] = payload.model_fetch_mode
+    if payload.open_meteo_extra_models is not None:
+        names = [m.strip() for m in payload.open_meteo_extra_models.split(",") if m.strip()]
+        if len(names) > 10 or any(not re.fullmatch(r"[a-z0-9_]{2,26}", m) for m in names):
+            raise HTTPException(400, "open_meteo_extra_models: up to 10 Open-Meteo model ids, comma-separated")
+        changed["open_meteo_extra_models"] = ",".join(names)
 
     # Apply in-memory (immediate effect) AND persist (survives restart).
     for key, val in changed.items():

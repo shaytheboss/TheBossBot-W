@@ -26,6 +26,9 @@ ICON_FORECAST_DAYS_AHEAD = 7
 async def job_fetch_icon() -> None:
     if not getattr(settings, "icon_enabled", True):
         return
+    # ICON is fetched by app/workers/open_meteo_job.py in batched mode.
+    if getattr(settings, "model_fetch_mode", "batched") == "batched":
+        return
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(City).where(City.active == True))
