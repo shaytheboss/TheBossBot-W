@@ -47,7 +47,16 @@ class ShadowSnapshot(Base):
     model_p = Column(REAL, nullable=False)
     raw_p = Column(REAL, nullable=False)
     normalized = Column(Boolean, nullable=False)
-    market_p = Column(REAL)            # latest stored YES price; NULL if never priced
+    # The market's view. market_p is the LIVE order-book mid when the book was
+    # readable (price_live true), otherwise the stored midpoint. bid/ask are
+    # what could actually have been traded; NULL when the book was not usable.
+    market_p = Column(REAL)
+    bid = Column(REAL)
+    ask = Column(REAL)
+    price_live = Column(Boolean)
+    # Minutes since the price job last ran — the freshness stamp that matters
+    # for rows that fell back to the stored price.
+    price_job_age_min = Column(Integer)
 
     n_sources = Column(SmallInteger)       # global deterministic sources reporting
     forecast_age_min = Column(Integer)     # minutes since the newest forecast landed

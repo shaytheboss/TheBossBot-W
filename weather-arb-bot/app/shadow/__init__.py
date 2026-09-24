@@ -19,8 +19,10 @@ Isolation is the design constraint. The package:
   - writes ONLY to its own tables (shadow_snapshots, shadow_market_state),
     which carry no foreign keys, so they can never constrain or block a
     production write or delete
-  - never makes an HTTP call — prices come from the market_prices table the
-    price job already fills, not from the CLOB
+  - makes exactly one kind of HTTP call: a read-only order-book GET to
+    Polymarket for each LIVE bucket at snapshot time (see live_price.py), so
+    the comparison is against the market's price at that moment, with the bid
+    and ask that could actually have been traded. It never writes a price.
   - never calls _collect_outcome_data or _persist_collector_misses, the two
     production paths with side effects
   - never changes a trading decision; the detector does not know it exists

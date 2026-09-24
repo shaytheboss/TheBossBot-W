@@ -33,6 +33,7 @@ from app.models.city import City
 from app.models.market import Market, MarketOutcome
 from app.shadow.clock import hour_floor, hours_to_close, local_hour
 from app.shadow.estimate import estimate_market
+from app.shadow.live_price import fetch_books, new_collector, price_job_age_min
 from app.shadow.models import ShadowMarketState, ShadowSnapshot
 from app.shadow.notify import send_shadow_text
 from app.shadow.report import Row, build_hourly_digest, build_summary
@@ -71,7 +72,7 @@ _MARKET_FIELDS = ("id", "city_id", "event_date", "question")
 _CITY_FIELDS = ("id", "name", "primary_icao", "reference_icao", "nws_lat",
                 "nws_lon", "timezone", "onshore_wind_dir")
 _OUTCOME_FIELDS = ("id", "market_id", "bucket_label", "bucket_min", "bucket_max",
-                   "bucket_unit")
+                   "bucket_unit", "token_id")
 
 
 def _plain(obj, fields) -> SimpleNamespace:
@@ -97,13 +98,16 @@ async def job_shadow_snapshot(
     hour = hour_floor(now)
     started = time.monotonic()
     stats = {"at": hour.isoformat(), "markets": 0, "rows": 0, "skipped_dead": 0,
+             "book_calls": 0, "live_prices": 0, "stored_fallbacks": 0,
+             "price_job_age_min": price_job_age_min(),
              "already_done": 0, "no_forecast": 0, "errors": 0,
              "summaries_sent": 0, "digest_sent": False, "pruned": 0}
     gaps: list[tuple] = []
 
+    collector = new_collector()
     try:
         async with factory() as db:
-            await _record(db, now, today, hour, stats, gaps)
+            await _record(db, now, today, hour, stats, gaps, collector)
             stats["pruned"] = await _prune(db, now)
 
             mode = str(getattr(settings, "shadow_alert_mode", "summary") or "summary")
@@ -118,6 +122,8 @@ async def job_shadow_snapshot(
         stats["errors"] += 1
         stats["fatal"] = f"{type(e).__name__}: {e}"
         logger.error(f"[shadow] run failed: {e}", exc_info=True)
+    finally:
+        await collector.close()
 
     stats["duration_s"] = round(time.monotonic() - started, 2)
     LAST_RUN.clear()
@@ -130,7 +136,7 @@ async def job_shadow_snapshot(
     return stats
 
 
-async def _record(db, now, today, hour, stats, gaps) -> None:
+async def _record(db, now, today, hour, stats, gaps, collector) -> None:
     horizon = int(getattr(settings, "shadow_max_days_ahead",
                           getattr(settings, "max_days_ahead_for_alert", 3)))
     markets = (await db.execute(
@@ -181,9 +187,27 @@ async def _record(db, now, today, hour, stats, gaps) -> None:
             htc = hours_to_close(now, market.event_date, city.timezone)
             lh = local_hour(now, city.timezone)
             labels = {o.id: o.bucket_label for o in outcomes}
+            tokens = {o.id: o.token_id for o in outcomes}
+
+            # Live order book, only for buckets not already dead on both sides
+            # by the stored price — dead buckets are never worth a request.
+            candidates = [e for e in ests if not is_dead(e.model_p, e.market_p)]
+            stats["skipped_dead"] += len(ests) - len(candidates)
+            wanted = [tokens[e.outcome_id] for e in candidates if tokens.get(e.outcome_id)]
+            books = await fetch_books(wanted, collector)
+            stats["book_calls"] += len(wanted)
+
             best_gap = None
-            for e in ests:
-                if is_dead(e.model_p, e.market_p):
+            for e in candidates:
+                book = books.get(tokens.get(e.outcome_id) or "")
+                if book:
+                    market_p, bid, ask, live = book["mid"], book["bid"], book["ask"], True
+                    stats["live_prices"] += 1
+                else:
+                    market_p, bid, ask, live = e.market_p, None, None, False
+                    stats["stored_fallbacks"] += 1
+                if is_dead(e.model_p, market_p):
+                    # The live price moved it into the dead zone after all.
                     stats["skipped_dead"] += 1
                     continue
                 db.add(ShadowSnapshot(
@@ -191,13 +215,15 @@ async def _record(db, now, today, hour, stats, gaps) -> None:
                     city_id=city.id, event_date=market.event_date,
                     hours_to_close=htc, local_hour=lh,
                     model_p=e.model_p, raw_p=e.raw_p, normalized=e.normalized,
-                    market_p=e.market_p, n_sources=e.n_sources,
+                    market_p=market_p, bid=bid, ask=ask, price_live=live,
+                    price_job_age_min=stats["price_job_age_min"],
+                    n_sources=e.n_sources,
                     forecast_age_min=e.forecast_age_min,
                     forecast_high_f=e.forecast_high_f, sigma=e.sigma,
                 ))
                 stats["rows"] += 1
-                if e.market_p is not None:
-                    g = (city.name, labels.get(e.outcome_id, "?"), htc, e.model_p, e.market_p)
+                if market_p is not None:
+                    g = (city.name, labels.get(e.outcome_id, "?"), htc, e.model_p, market_p)
                     if best_gap is None or abs(g[3] - g[4]) > abs(best_gap[3] - best_gap[4]):
                         best_gap = g
             if best_gap:

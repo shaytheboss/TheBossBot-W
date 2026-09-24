@@ -2099,8 +2099,8 @@ async def admin_shadow_csv(
     )
     fields = ["taken_at", "city", "event_date", "market_id", "outcome_id", "bucket",
               "hours_to_close", "local_hour", "model_p", "raw_p", "normalized",
-              "market_p", "n_sources", "forecast_age_min", "forecast_high_f",
-              "sigma", "won"]
+              "market_p", "bid", "ask", "price_live", "price_job_age_min",
+              "n_sources", "forecast_age_min", "forecast_high_f", "sigma", "won"]
 
     async def rows_for(session):
         async for snap, label, won, city in stream_rows(session, q):
@@ -2113,6 +2113,10 @@ async def admin_shadow_csv(
                 "model_p": round(snap.model_p, 4), "raw_p": round(snap.raw_p, 4),
                 "normalized": snap.normalized,
                 "market_p": "" if snap.market_p is None else round(snap.market_p, 4),
+                "bid": "" if snap.bid is None else round(snap.bid, 4),
+                "ask": "" if snap.ask is None else round(snap.ask, 4),
+                "price_live": "" if snap.price_live is None else int(snap.price_live),
+                "price_job_age_min": snap.price_job_age_min,
                 "n_sources": snap.n_sources, "forecast_age_min": snap.forecast_age_min,
                 "forecast_high_f": snap.forecast_high_f, "sigma": snap.sigma,
                 "won": "" if won is None else int(won),
