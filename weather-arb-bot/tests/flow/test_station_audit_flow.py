@@ -103,3 +103,21 @@ class TestEndpoints:
         async with pipeline.session() as db:
             out = await admin_stations_apply(pipeline.city.id, "tok", db)
         assert out["changes"]["primary_icao"] == {"from": "KAUS", "to": "KATT"}
+
+
+class TestEvidence:
+    @pytest.mark.asyncio
+    async def test_the_verdict_carries_the_text_it_was_based_on(self, pipeline):
+        """So a wrong verdict can be seen for what it is on the screen,
+        instead of being trusted — the first report could not be checked."""
+        await _set_rules(pipeline, RULES)
+        a = await _audit(pipeline)
+        assert "wunderground.com/history/daily/us/tx/austin/KATT" in a.evidence
+        assert a.read_from == "stored"
+
+    @pytest.mark.asyncio
+    async def test_a_gamma_failure_is_reported_as_such(self, pipeline, no_backoff):
+        await _set_rules(pipeline, "rules text without any link")
+        pipeline.http.prepend(pm.GAMMA_EVENTS, {"error": "down"}, status=503)
+        a = await _audit(pipeline)
+        assert a.read_from == "stored (gamma failed)"

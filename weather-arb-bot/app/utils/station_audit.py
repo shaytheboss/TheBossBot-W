@@ -29,13 +29,17 @@ from sqlalchemy import desc, select
 
 logger = logging.getLogger(__name__)
 
-# A Wunderground URL, with the station as the last path segment. The optional
-# /date/YYYY-M-D tail is dropped: the Wunderground collector appends its own.
-_WU_URL = re.compile(
-    r"https?://(?:www\.)?wunderground\.com/(?:history/daily|history/airport|weather|dashboard/pws)"
-    r"/[^\s\"'<>)]*?/([A-Za-z][A-Za-z0-9]{3})(?:/date/[0-9-]+)?(?=[/\s\"'<>).,]|$)",
-    re.IGNORECASE,
+# Any Wunderground link, with or without a scheme. The station is read from
+# the path afterwards rather than inside the regex: the first version demanded
+# a region segment before the code, so ".../history/daily/EHAM" and scheme-less
+# links went unread — and the audit then reported the city as "not
+# Wunderground", 45 times over.
+_WU_LINK = re.compile(
+    r"(?:https?://)?(?:www\.)?wunderground\.com/[^\s\"'<>)\]]*", re.IGNORECASE,
 )
+# An ICAO code in a Wunderground path is upper-case; city slugs are lower-case.
+# Case-sensitive on purpose, so "/weather/it/rome" never yields a station "ROME".
+_ICAO_SEGMENT = re.compile(r"^[A-Z][A-Z0-9]{3}$")
 _ANY_URL = re.compile(r"https?://([^/\s\"'<>)]+)", re.IGNORECASE)
 _STATION_NAME = re.compile(
     r"recorded (?:at|by) (?:the )?(.{3,80}?)(?: [Ss]tation| in degrees|,|\.)"
@@ -65,23 +69,48 @@ class StationAudit:
     checked_market: Optional[str]
     verdict: str
     advice: str
+    evidence: Optional[str] = None
+    read_from: Optional[str] = None     # "stored", "gamma", "gamma failed", "no market"
+    notes: Optional[list] = None        # problems in the city's own fields
 
     def as_dict(self) -> dict:
         return asdict(self)
 
 
 def _clean_wu_url(url: str) -> str:
-    return re.sub(r"/date/[0-9-]+/?$", "", url.rstrip("/.,)"))
+    url = re.sub(r"/date/[0-9-]+/?$", "", url.rstrip("/.,)]"))
+    if not url.lower().startswith("http"):
+        url = "https://" + url.lstrip("/")
+    return url
 
 
 def extract_wu_station(text: Optional[str]) -> Optional[tuple[str, str]]:
-    """(ICAO, clean URL) of the first Wunderground station link, or None."""
-    if not text:
-        return None
-    m = _WU_URL.search(text)
-    if not m:
-        return None
-    return m.group(1).upper(), _clean_wu_url(m.group(0))
+    """(ICAO, clean URL) of the first Wunderground link that names a station."""
+    for m in _WU_LINK.finditer(text or ""):
+        url = _clean_wu_url(m.group(0))
+        last = url.rstrip("/").rsplit("/", 1)[-1]
+        if _ICAO_SEGMENT.match(last):
+            return last, url
+    return None
+
+
+def mentions_wunderground(text: Optional[str]) -> bool:
+    return "wunderground" in (text or "").lower()
+
+
+def evidence_snippet(texts: list[str], width: int = 360) -> Optional[str]:
+    """The part of the rules the verdict rests on — shown on the screen so a
+    wrong verdict can be seen for what it is instead of trusted."""
+    for t in texts:
+        low = t.lower()
+        at = low.find("wunderground")
+        if at < 0:
+            at = low.find("http")
+        if at >= 0:
+            start = max(0, at - width // 3)
+            return ("…" if start else "") + t[start:start + width].strip() + "…"
+    joined = " ".join(t for t in texts if t).strip()
+    return (joined[:width] + "…") if joined else None
 
 
 def extract_station_name(text: Optional[str]) -> Optional[str]:
@@ -107,9 +136,40 @@ def _icao_in_url(url: Optional[str]) -> Optional[str]:
     return hit[0] if hit else None
 
 
+#: Values that have been typed into primary_icao as placeholders. Lucknow was
+#: found with the literal "ICAO": four upper-case letters, so it passes any
+#: shape check, and METAR for the city had never once been fetched.
+_PLACEHOLDER_ICAO = frozenset({"ICAO", "XXXX", "NONE", "NULL", "TODO", "TBD"})
+
+
+def field_notes(city) -> list[str]:
+    """Problems visible in the city's own fields, whatever Polymarket says."""
+    notes = []
+    primary = (city.primary_icao or "").upper()
+    wu_icao = _icao_in_url(city.wunderground_url)
+    if not primary or primary in _PLACEHOLDER_ICAO or not _ICAO_SEGMENT.match(primary):
+        notes.append(f"primary_icao {primary or '(empty)'!r} is not a real station — "
+                     f"METAR for this city is never fetched")
+    if not wu_icao:
+        notes.append("the Wunderground URL names no station, so the scraper reads "
+                     "whatever location page Wunderground serves")
+    elif primary and wu_icao != primary:
+        notes.append(f"METAR reads {primary} but Wunderground reads {wu_icao} — the "
+                     f"'official max' mixes two different stations")
+    return notes
+
+
 def judge(city, resolution: Optional[tuple[str, str]], name: Optional[str],
-          other: Optional[str], checked: Optional[str]) -> StationAudit:
-    """Compare one city with the station its market resolves on. Pure."""
+          other: Optional[str], checked: Optional[str],
+          saw_wunderground: bool = False, evidence: Optional[str] = None,
+          read_from: Optional[str] = None) -> StationAudit:
+    """Compare one city with the station its market resolves on. Pure.
+
+    "not_wunderground" is reserved for rules that never mention Wunderground
+    and name another source. Rules that DO mention it, where no station could
+    be read, are "unknown" — a parsing gap must never be reported as a fact
+    about the market.
+    """
     primary = (city.primary_icao or "").upper() or None
     reference = (city.reference_icao or "").upper() or None
     wu_icao = _icao_in_url(city.wunderground_url)
@@ -131,6 +191,10 @@ def judge(city, resolution: Optional[tuple[str, str]], name: Optional[str],
             verdict = VERDICT_WU
             advice = (f"Polymarket resolves on {res_icao}; the Wunderground URL points "
                       f"at {wu_icao or 'no station'}.")
+    elif saw_wunderground:
+        verdict = VERDICT_UNKNOWN
+        advice = ("The rules mention Wunderground but no station code could be read "
+                  "from them — see the evidence. Nothing to apply.")
     elif other:
         verdict = VERDICT_NOT_WU
         advice = (f"Resolves on {other}, which no METAR mirrors — intraday locks for "
@@ -143,7 +207,8 @@ def judge(city, resolution: Optional[tuple[str, str]], name: Optional[str],
         city_id=city.id, city=city.name, primary_icao=primary, reference_icao=reference,
         wu_url_icao=wu_icao, resolution_icao=res_icao, resolution_url=res_url,
         resolution_name=name, other_source=other, checked_market=checked,
-        verdict=verdict, advice=advice,
+        verdict=verdict, advice=advice, evidence=evidence, read_from=read_from,
+        notes=field_notes(city),
     )
 
 
@@ -156,12 +221,12 @@ def _texts_from_event(event: Optional[dict]) -> list[str]:
     return [t for t in out if t]
 
 
-async def resolution_for_city(db, city, client, markets_to_check: int = 3):
-    """(resolution, name, other, checked_slug) for one city.
+async def resolution_for_city(db, city, client, markets_to_check: int = 3) -> dict:
+    """What the markets' rules say about the station, and what was read.
 
     The stored description is tried first — it costs nothing. It is capped at
-    500 characters when stored, which can cut the URL off, so Gamma is only
-    asked when the stored text has no station in it.
+    500 characters when stored, which can cut the link off, so Gamma is asked
+    only when the stored text names no station.
     """
     from app.models.market import Market
     from app.utils.polymarket_discovery import fetch_event_by_slug
@@ -170,27 +235,38 @@ async def resolution_for_city(db, city, client, markets_to_check: int = 3):
         select(Market).where(Market.city_id == city.id)
         .order_by(desc(Market.event_date)).limit(markets_to_check)
     )).scalars().all()
+    out = {"resolution": None, "name": None, "other": None, "checked": None,
+           "saw_wunderground": False, "evidence": None,
+           "read_from": "no market" if not markets else None}
 
-    name = other = None
+    all_texts: list[str] = []
     for market in markets:
-        stored = market.resolution_source or ""
-        hit = extract_wu_station(stored)
-        name = name or extract_station_name(stored)
-        if hit:
-            return hit, name, None, market.external_id
-        texts = [stored]
-        if client is not None and market.external_id:
+        out["checked"] = out["checked"] or market.external_id
+        texts = [market.resolution_source or ""]
+        read_from = "stored"
+        if not extract_wu_station(texts[0]) and client is not None and market.external_id:
             try:
-                texts += _texts_from_event(await fetch_event_by_slug(client, market.external_id))
+                event = await fetch_event_by_slug(client, market.external_id)
             except Exception as e:
                 logger.warning(f"[stations] Gamma lookup failed for {market.external_id}: {e}")
+                event = None
+            read_from = "stored + gamma" if event else "stored (gamma failed)"
+            texts += _texts_from_event(event)
+        texts = [t for t in texts if t]
+        all_texts += texts
+        out["read_from"] = read_from
         for t in texts:
+            out["name"] = out["name"] or extract_station_name(t)
+            out["saw_wunderground"] = out["saw_wunderground"] or mentions_wunderground(t)
             hit = extract_wu_station(t)
-            name = name or extract_station_name(t)
             if hit:
-                return hit, name, None, market.external_id
-        other = other or next((d for d in map(other_source_domain, texts) if d), None)
-    return None, name, other, (markets[0].external_id if markets else None)
+                out.update(resolution=hit, checked=market.external_id,
+                           evidence=evidence_snippet([t]))
+                return out
+        out["other"] = out["other"] or next(
+            (d for d in map(other_source_domain, texts) if d), None)
+    out["evidence"] = evidence_snippet(all_texts)
+    return out
 
 
 async def audit_cities(db, client, cities: Optional[Iterable] = None) -> list[StationAudit]:
@@ -199,8 +275,10 @@ async def audit_cities(db, client, cities: Optional[Iterable] = None) -> list[St
         cities = (await db.execute(select(City).order_by(City.name))).scalars().all()
     out = []
     for city in cities:
-        res, name, other, checked = await resolution_for_city(db, city, client)
-        out.append(judge(city, res, name, other, checked))
+        r = await resolution_for_city(db, city, client)
+        out.append(judge(city, r["resolution"], r["name"], r["other"], r["checked"],
+                         saw_wunderground=r["saw_wunderground"],
+                         evidence=r["evidence"], read_from=r["read_from"]))
     return out
 
 
