@@ -114,6 +114,7 @@ def reset_module_caches():
     import app.analyzers.model_weights as model_weights
     import app.analyzers.opportunity_detector as detector
     import app.analyzers.beta_opportunity_detector as beta_detector
+    import app.shadow.snapshot as shadow_snapshot
 
     def _clear():
         calibrator._cache = {}
@@ -125,6 +126,7 @@ def reset_module_caches():
         detector._bucket_switch_alerts_sent.clear()
         beta_detector._beta_dedup_date = None
         beta_detector._beta_open_pos_last_sent.clear()
+        shadow_snapshot.LAST_RUN.clear()
 
     _clear()
     yield

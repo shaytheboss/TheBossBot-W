@@ -119,6 +119,8 @@ class SettingsIn(BaseModel):
     suspension_window_trades: Optional[int] = None
     suspension_min_win_rate: Optional[float] = None
     suspension_days: Optional[int] = None
+    shadow_enabled: Optional[bool] = None
+    shadow_alert_mode: Optional[str] = None
 
 
 class CityCreateIn(BaseModel):
@@ -2047,6 +2049,78 @@ async def admin_city_delete(
     return Response(status_code=204)
 
 
+@router.get("/shadow/status")
+async def admin_shadow_status(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """What the shadow study did on its last run, and how big it has grown.
+
+    The run figures come from memory and the size from the catalog — this view
+    must not scan the table it is describing.
+    """
+    from sqlalchemy import text as _text
+    from app.shadow.snapshot import LAST_RUN
+    size_mb = None
+    try:
+        b = (await db.execute(_text(
+            "SELECT pg_total_relation_size('shadow_snapshots')"
+        ))).scalar()
+        size_mb = round((b or 0) / 1024 / 1024, 1)
+    except Exception:
+        await db.rollback()          # not Postgres, or table not migrated yet
+    return {
+        "enabled": getattr(settings, "shadow_enabled", True),
+        "alert_mode": getattr(settings, "shadow_alert_mode", "summary"),
+        "retention_days": getattr(settings, "shadow_retention_days", 45),
+        "table_size_mb": size_mb,
+        "last_run": dict(LAST_RUN) or None,
+    }
+
+
+@router.get("/shadow/csv")
+async def admin_shadow_csv(
+    _: str = Depends(require_admin),
+    days: int = Query(default=45, ge=1, le=400),
+):
+    """Every shadow snapshot with its bucket, city and — once resolved —
+    whether that bucket won. The raw material for the per-time-window
+    analysis. Streams, so it never holds the export in memory."""
+    from app.shadow.models import ShadowSnapshot
+    from app.utils.csv_stream import stream_csv, stream_rows
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    q = (
+        select(ShadowSnapshot, MarketOutcome.bucket_label, MarketOutcome.won, City.name)
+        .join(MarketOutcome, MarketOutcome.id == ShadowSnapshot.outcome_id)
+        .join(City, City.id == ShadowSnapshot.city_id)
+        .where(ShadowSnapshot.taken_at >= cutoff)
+        .order_by(ShadowSnapshot.taken_at)
+    )
+    fields = ["taken_at", "city", "event_date", "market_id", "outcome_id", "bucket",
+              "hours_to_close", "local_hour", "model_p", "raw_p", "normalized",
+              "market_p", "n_sources", "forecast_age_min", "forecast_high_f",
+              "sigma", "won"]
+
+    async def rows_for(session):
+        async for snap, label, won, city in stream_rows(session, q):
+            yield {
+                "taken_at": snap.taken_at.isoformat(), "city": city,
+                "event_date": snap.event_date.isoformat(), "market_id": snap.market_id,
+                "outcome_id": snap.outcome_id, "bucket": label,
+                "hours_to_close": round(snap.hours_to_close, 2),
+                "local_hour": snap.local_hour,
+                "model_p": round(snap.model_p, 4), "raw_p": round(snap.raw_p, 4),
+                "normalized": snap.normalized,
+                "market_p": "" if snap.market_p is None else round(snap.market_p, 4),
+                "n_sources": snap.n_sources, "forecast_age_min": snap.forecast_age_min,
+                "forecast_high_f": snap.forecast_high_f, "sigma": snap.sigma,
+                "won": "" if won is None else int(won),
+            }
+
+    return await stream_csv("shadow.csv", fields, rows_for)
+
+
 @router.get("/job-stats")
 async def admin_job_stats(_: str = Depends(require_admin), reset: bool = Query(default=False)):
     """Where the CPU goes, per scheduled job.
@@ -2199,6 +2273,8 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "suspension_window_trades": settings.suspension_window_trades,
         "suspension_min_win_rate": settings.suspension_min_win_rate,
         "suspension_days": settings.suspension_days,
+        "shadow_enabled": getattr(settings, "shadow_enabled", True),
+        "shadow_alert_mode": getattr(settings, "shadow_alert_mode", "summary"),
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -2265,6 +2341,15 @@ async def admin_set_settings(
         if not (1 <= payload.suspension_days <= 90):
             raise HTTPException(400, "suspension_days must be 1-90")
         changed["suspension_days"] = payload.suspension_days
+
+    # ── Shadow study ──────────────────────────────────────────────────────
+    if payload.shadow_enabled is not None:
+        changed["shadow_enabled"] = bool(payload.shadow_enabled)
+    if payload.shadow_alert_mode is not None:
+        from app.shadow.snapshot import ALERT_MODES
+        if payload.shadow_alert_mode not in ALERT_MODES:
+            raise HTTPException(400, f"shadow_alert_mode must be one of {ALERT_MODES}")
+        changed["shadow_alert_mode"] = payload.shadow_alert_mode
 
     # Apply in-memory (immediate effect) AND persist (survives restart).
     for key, val in changed.items():
