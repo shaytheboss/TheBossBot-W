@@ -120,6 +120,9 @@ async def lifespan(app: FastAPI):
         from app.workers.open_meteo_job import job_fetch_open_meteo
         _add_tracked_job(job_fetch_open_meteo, CronTrigger(minute=20),
                            id="open_meteo", max_instances=1, misfire_grace_time=900)
+        from app.workers.open_meteo_job import job_fetch_open_meteo_half_hour
+        _add_tracked_job(job_fetch_open_meteo_half_hour, CronTrigger(minute=50),
+                           id="open_meteo_half_hour", max_instances=1, misfire_grace_time=900)
         _add_tracked_job(job_fetch_external_forecasts,
                            IntervalTrigger(seconds=settings.external_forecast_fetch_interval),
                            id="external_forecasts", next_run_time=now,

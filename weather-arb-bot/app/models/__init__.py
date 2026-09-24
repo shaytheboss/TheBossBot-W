@@ -11,6 +11,7 @@ from app.models.model_skill import ModelSkill
 from app.models.collector_miss import CollectorMiss
 from app.models.virtual_exit import VirtualExit
 from app.models.app_setting import AppSetting
+from app.models.model_update_event import ModelUpdateEvent
 
 __all__ = [
     "City",
@@ -29,4 +30,5 @@ __all__ = [
     "CollectorMiss",
     "VirtualExit",
     "AppSetting",
+    "ModelUpdateEvent",
 ]

@@ -140,6 +140,14 @@ class HttpRouter:
         self._routes.append(_Route(method, match, [handler], once=False))
         return self
 
+    def prepend_handler(
+        self, match: str, handler: Callable[[httpx.Request], httpx.Response],
+        *, method: str = "GET",
+    ) -> "HttpRouter":
+        """`add_handler`, but winning over routes already registered."""
+        self._routes.insert(0, _Route(method, match, [handler], once=False))
+        return self
+
     @staticmethod
     def _build(status: int, json: Any, text: Optional[str]) -> httpx.Response:
         if text is not None:

@@ -317,8 +317,8 @@ class TestAdmin:
 class TestPlan:
     @staticmethod
     def _fleet(n_us: int = 11, n_other: int = 37):
-        us = [SimpleNamespace(nws_lat=30.2, nws_lon=-97.7) for _ in range(n_us)]
-        other = [SimpleNamespace(nws_lat=51.5, nws_lon=-0.1) for _ in range(n_other)]
+        us = [SimpleNamespace(id=i, nws_lat=30.2, nws_lon=-97.7) for i in range(n_us)]
+        other = [SimpleNamespace(id=100 + i, nws_lat=51.5, nws_lon=-0.1) for i in range(n_other)]
         return us + other
 
     def test_48_cities_fit_under_our_budget_at_the_defaults(self):

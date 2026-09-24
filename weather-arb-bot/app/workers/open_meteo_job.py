@@ -27,6 +27,12 @@ Extra models are record-only: written as source "om_<model>", which no
 estimator reads (they read a fixed list of sources). They exist to be scored
 per city — /admin/models/compare.
 
+Update times. Every fetch is compared with the same city's previous one; when
+the numbers moved, a row goes to `model_update_events`. The slow tiers are
+also probed for one city in the hours they are not due, so the hour a new run
+appears is known to the hour. /admin/open-meteo/updates shows it; the slow
+tiers' fetch hours are tuned against it.
+
 Rollback: set `model_fetch_mode` to "legacy" on the admin screen. The old
 jobs resume on their next run; this one stops.
 """
@@ -35,12 +41,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.collectors.base import BaseCollector
 from app.collectors.gfs_collector import (
@@ -51,6 +57,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.city import City
 from app.models.forecast import Forecast
+from app.models.model_update_event import ModelUpdateEvent
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +66,9 @@ FORECAST_DAYS = 7
 # Pause between requests: caps a run at ~400/minute, under the 600/minute limit.
 PACE_SECONDS = 0.15
 EXTRA_PREFIX = "om_"
-TIER_ORDER = ("core", "hrrr", "ensemble", "extra")
+TIER_ORDER = ("core", "hrrr", "probe", "ensemble", "extra")
+# Change events older than this are pruned by the job itself.
+UPDATE_EVENT_RETENTION_DAYS = 30
 MODES = ("batched", "legacy")
 
 # Models that only cover part of the globe. Asking outside the domain spends
@@ -113,7 +122,22 @@ def specs_for(tier: str) -> list[Spec]:
                      kind="ensemble", weight=6.0)]      # 51 members
     if tier == "extra":
         return [Spec("extra", extra_source(m), m, m) for m in extra_models()]
+    if tier == "probe":
+        # The slow tiers, fetched for one city in the hours they are not due,
+        # so the hour a new run appears is seen to the hour rather than to
+        # the six. Model runs are global: one city is enough to see them.
+        return [replace(s, tier="probe") for t in ("ensemble", "extra") for s in specs_for(t)]
     raise ValueError(tier)
+
+
+def probe_city(cities, spec: Spec):
+    """The lowest-id city the model covers — stable across runs, so each
+    fetch is compared with the same place's previous one."""
+    for c in sorted(cities, key=lambda c: c.id):
+        if c.nws_lat is not None and c.nws_lon is not None \
+                and applies_to(spec, float(c.nws_lat), float(c.nws_lon)):
+            return c
+    return None
 
 
 def applies_to(spec: Spec, lat: float, lon: float) -> bool:
@@ -124,6 +148,8 @@ def applies_to(spec: Spec, lat: float, lon: float) -> bool:
 
 
 def every_h(tier: str) -> int:
+    if tier == "probe":
+        return 1
     key = {"core": "open_meteo_core_every_h", "hrrr": "open_meteo_core_every_h",
            "ensemble": "open_meteo_ensemble_every_h",
            "extra": "open_meteo_extra_every_h"}[tier]
@@ -131,13 +157,22 @@ def every_h(tier: str) -> int:
 
 
 # Offsets spread the slower tiers over different hours of the day.
-_OFFSET = {"core": 0, "hrrr": 0, "ensemble": 2, "extra": 3}
+_OFFSET = {"core": 0, "hrrr": 0, "probe": 0, "ensemble": 2, "extra": 3}
 
 
 def due_tiers(hour_utc: int) -> list[str]:
     """Tiers due at this UTC hour. Keyed on the clock, not on "time since the
     last run", so a redeploy cannot trigger an extra round of requests."""
-    return [t for t in TIER_ORDER if (hour_utc - _OFFSET[t]) % every_h(t) == 0]
+    due = [t for t in TIER_ORDER if (hour_utc - _OFFSET[t]) % every_h(t) == 0]
+    if not getattr(settings, "open_meteo_probe_enabled", True):
+        due.remove("probe")
+    return due
+
+
+def half_hour_tiers() -> list[str]:
+    """What the :50 run fetches. HRRR is the one model that publishes hourly,
+    and the one intraday weighs most."""
+    return ["hrrr"] if getattr(settings, "open_meteo_hrrr_half_hourly", True) else []
 
 
 def runs_left_today(tier: str, hour_utc: int) -> int:
@@ -177,6 +212,7 @@ BUDGET = Budget()
 def reset_budget() -> None:
     """For tests: the budget is module state, like the other caches."""
     global BUDGET
+    _LAST_FETCH.clear()
     BUDGET = Budget()
 
 
@@ -346,14 +382,22 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
     reserve = _tier_cost("core", cities) * runs_left_today("core", now.hour)
     start_requests = BUDGET.requests
 
+    changes: dict[str, list] = {}   # source → [changed, compared, latest prev fetch]
+
     for tier in TIER_ORDER:
         if tier not in due:
             continue
         for spec in specs_for(tier):
-            if spec.model in BUDGET.rejected and spec.tier == "extra":
+            if spec.model in BUDGET.rejected:
                 continue
+            targets = cities
+            if tier == "probe":
+                if _base_tier(spec) in due_tiers(now.hour):
+                    continue          # the full tier is scheduled this hour anyway
+                one = probe_city(cities, spec)
+                targets = [one] if one is not None else []
             dates = [today + timedelta(days=i) for i in range(spec.max_days_ahead + 1)]
-            for city in cities:
+            for city in targets:
                 if city.nws_lat is None or city.nws_lon is None:
                     continue
                 lat, lon = float(city.nws_lat), float(city.nws_lon)
@@ -374,9 +418,10 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
                                  BUDGET.paused_until, e)
                     summary["requests"] = BUDGET.requests - start_requests
                     BUDGET.last_run = summary
+                    await _record_changes(db, changes, now)
                     return summary
                 except ModelRejected as e:
-                    if tier == "extra":
+                    if spec.source.startswith(EXTRA_PREFIX):
                         BUDGET.rejected[spec.model] = str(e)
                         logger.warning("Open-Meteo rejected model %s: %s", spec.model, e)
                         break
@@ -392,6 +437,7 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
                         await asyncio.sleep(PACE_SECONDS)
 
                 rows = parse(spec, data, dates)
+                _note_change(changes, spec, city.id, rows, data, now)
                 for d, parsed in rows.items():
                     db.add(to_forecast(spec, city.id, d, parsed))
                 if rows:
@@ -399,9 +445,102 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
                     summary["stored"] += len(rows)
 
     summary["requests"] = BUDGET.requests - start_requests
+    summary["changed"] = {k: v[0] for k, v in changes.items() if v[0]}
     BUDGET.last_run = summary
+    await _record_changes(db, changes, now)
     logger.info("Open-Meteo run: %s", summary)
     return summary
+
+
+def _base_tier(spec: Spec) -> str:
+    return "extra" if spec.source.startswith(EXTRA_PREFIX) else "ensemble"
+
+
+# ── When did a model's numbers change? ─────────────────────────────────────
+
+# (source, city_id) → (fetched_at, {date: hash of the unrounded values}).
+# Memory only: after a restart the first fetch has nothing to compare with.
+_LAST_FETCH: dict[tuple, tuple] = {}
+
+
+def _fingerprint(spec: Spec, rows: dict, data: dict) -> dict:
+    """Per date, a hash of the values BEFORE rounding — a new run that moves
+    a high by 0.3°F must count as a change even when the stored integer
+    does not move."""
+    if spec.kind == "ensemble":
+        return {d: hash(tuple(r["ensemble_highs"]) + tuple(r["ensemble_lows"]))
+                for d, r in rows.items()}
+    daily = data.get("daily") or {}
+    index = {t: i for i, t in enumerate(daily.get("time") or [])}
+    return {d: hash((_at(daily.get("temperature_2m_max"), index[str(d)]),
+                     _at(daily.get("temperature_2m_min"), index[str(d)])))
+            for d in rows}
+
+
+def _note_change(changes: dict, spec: Spec, city_id: int, rows: dict, data: dict,
+                 now: datetime) -> None:
+    if not rows:
+        return
+    fp = _fingerprint(spec, rows, data)
+    key = (spec.source, city_id)
+    prev = _LAST_FETCH.get(key)
+    _LAST_FETCH[key] = (now, fp)
+    if prev is None:
+        return
+    prev_at, prev_fp = prev
+    overlap = set(prev_fp) & set(fp)
+    if not overlap or prev_at >= now:
+        return
+    entry = changes.setdefault(spec.source, [0, 0, None])
+    entry[1] += 1
+    if any(prev_fp[d] != fp[d] for d in overlap):
+        entry[0] += 1
+        entry[2] = prev_at if entry[2] is None else max(entry[2], prev_at)
+
+
+async def _record_changes(db, changes: dict, now: datetime) -> None:
+    try:
+        wrote = False
+        for source, (changed, compared, prev_at) in changes.items():
+            if changed:
+                db.add(ModelUpdateEvent(source=source, detected_at=now, prev_fetch_at=prev_at,
+                                        cities_changed=changed, cities_compared=compared))
+                wrote = True
+        if now.hour == 0 and now.minute < 30:
+            await db.execute(delete(ModelUpdateEvent).where(
+                ModelUpdateEvent.detected_at
+                < now - timedelta(days=UPDATE_EVENT_RETENTION_DAYS)))
+            wrote = True
+        if wrote:
+            await db.commit()
+    except Exception as e:   # a measurement must never cost a forecast run
+        logger.warning("model_update_events write failed: %s", e)
+        await db.rollback()
+
+
+async def update_report(db, days: int = 3, now: Optional[datetime] = None) -> dict:
+    """Per source: when its numbers changed over the last `days`, and the UTC
+    hours those changes landed in. The slow tiers' fetch hours are tuned
+    against this."""
+    now = now or datetime.now(timezone.utc)
+    rows = (await db.execute(
+        select(ModelUpdateEvent.source, ModelUpdateEvent.detected_at,
+               ModelUpdateEvent.prev_fetch_at, ModelUpdateEvent.cities_changed,
+               ModelUpdateEvent.cities_compared)
+        .where(ModelUpdateEvent.detected_at >= now - timedelta(days=days))
+        .order_by(ModelUpdateEvent.detected_at)
+    )).all()
+    out: dict = {}
+    for source, at, prev, changed, compared in rows:
+        s = out.setdefault(source, {"changes": [], "hours_utc": {}})
+        s["changes"].append({"between": f"{prev:%m-%d %H:%M}", "and": f"{at:%m-%d %H:%M}",
+                             "cities": f"{changed}/{compared}"})
+        s["hours_utc"][at.hour] = s["hours_utc"].get(at.hour, 0) + 1
+    for s in out.values():
+        s["hours_utc"] = dict(sorted(s["hours_utc"].items()))
+    return {"days": days, "sources": dict(sorted(out.items())),
+            "note": ("A change seen at a fetch means the new run appeared between "
+                     "'between' and 'and'. Probing is hourly, HRRR every 30 min.")}
 
 
 _collector = OpenMeteoBatchCollector()
@@ -415,20 +554,42 @@ async def job_fetch_open_meteo() -> None:
         await run_open_meteo(db, cities)
 
 
+async def job_fetch_open_meteo_half_hour() -> None:
+    """The :50 run — HRRR only, when open_meteo_hrrr_half_hourly is on."""
+    tiers = half_hour_tiers()
+    if getattr(settings, "model_fetch_mode", "batched") != "batched" or not tiers:
+        return
+    async with AsyncSessionLocal() as db:
+        cities = (await db.execute(select(City).where(City.active == True))).scalars().all()
+        await run_open_meteo(db, cities, tiers=tiers)
+
+
 # ── Status for the admin screen ─────────────────────────────────────────────
 
 def plan(cities) -> dict:
     """Projected weighted requests per day at the current settings."""
     tiers = {}
     for tier in TIER_ORDER:
-        per_run = _tier_cost(tier, cities)
-        runs = sum(1 for h in range(24) if tier in due_tiers(h))
+        hours = [h for h in range(24) if tier in due_tiers(h)]
+        runs = len(hours) + (24 if tier in half_hour_tiers() else 0)
+        if tier == "probe":
+            per_day = sum(_probe_cost(cities, h) for h in hours)
+            per_run = max((_probe_cost(cities, h) for h in hours), default=0.0)
+        else:
+            per_run = _tier_cost(tier, cities)
+            per_day = per_run * runs
         tiers[tier] = {"per_run": per_run, "runs_per_day": runs,
-                       "per_day": per_run * runs, "every_h": every_h(tier)}
+                       "per_day": per_day, "every_h": every_h(tier)}
     total = sum(t["per_day"] for t in tiers.values())
     legacy = _legacy_per_day(cities)
     return {"tiers": tiers, "projected_per_day": math.ceil(total),
             "budget": _cap(), "legacy_per_day": legacy}
+
+
+def _probe_cost(cities, hour: int) -> float:
+    due = due_tiers(hour)
+    return sum(s.weight for s in specs_for("probe")
+               if _base_tier(s) not in due and probe_city(cities, s) is not None)
 
 
 def _legacy_per_day(cities) -> int:
