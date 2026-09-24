@@ -2059,8 +2059,17 @@ async def admin_stations_audit(_: str = Depends(require_admin), db: AsyncSession
     from app.utils.station_audit import audit_cities
     async with httpx.AsyncClient(headers={"User-Agent": "weather-arb-bot/1.0"}) as client:
         rows = await audit_cities(db, client)
-    return {"cities": [r.as_dict() for r in rows],
-            "mismatches": sum(1 for r in rows if r.verdict not in ("ok", "unknown"))}
+    from app.utils.station_audit import ACTIONABLE, VERDICT_NOT_WU, VERDICT_OK
+    return {
+        "cities": [r.as_dict() for r in rows],
+        # Counted separately on purpose. The first version lumped "could not
+        # read the rules" in with real mismatches and reported 47 of 48.
+        "ok": sum(1 for r in rows if r.verdict == VERDICT_OK),
+        "mismatches": sum(1 for r in rows if r.verdict in ACTIONABLE),
+        "not_wunderground": sum(1 for r in rows if r.verdict == VERDICT_NOT_WU),
+        "unread": sum(1 for r in rows if r.verdict == "unknown"),
+        "with_field_problems": sum(1 for r in rows if r.notes),
+    }
 
 
 @router.post("/stations/apply/{city_id}")

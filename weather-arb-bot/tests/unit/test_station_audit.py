@@ -46,9 +46,27 @@ class TestParsing:
             "see https://www.wunderground.com/history/daily/kr/incheon/RKSI/date/2026-6-14")
         assert icao == "RKSI" and url.endswith("/RKSI")
 
-    def test_lowercase_and_trailing_punctuation(self):
+    def test_trailing_punctuation(self):
         assert extract_wu_station(
-            "(https://wunderground.com/history/daily/us/tx/houston/khou).")[0] == "KHOU"
+            "(https://wunderground.com/history/daily/us/tx/houston/KHOU).")[0] == "KHOU"
+
+    def test_a_lowercase_city_slug_is_not_a_station(self):
+        """Station codes in Wunderground paths are upper-case; city slugs are
+        not. Reading "rome" as station ROME would invent a fix."""
+        assert extract_wu_station("https://www.wunderground.com/weather/it/rome") is None
+
+    def test_the_code_directly_after_history_daily(self):
+        """The first parser demanded a region segment before the code."""
+        assert extract_wu_station("https://www.wunderground.com/history/daily/EHAM")[0] == "EHAM"
+
+    def test_a_link_without_a_scheme(self):
+        icao, url = extract_wu_station("see wunderground.com/history/daily/nl/schiphol/EHAM for data")
+        assert icao == "EHAM" and url.startswith("https://")
+
+    def test_a_link_cut_off_by_truncation_names_no_station(self):
+        """Stored descriptions are capped at 500 characters. A half link must
+        read as "no station" so the Gamma fallback runs — never as a guess."""
+        assert extract_wu_station("https://www.wunderground.com/history/daily/nl/sch") is None
 
     def test_no_link_is_none(self):
         assert extract_wu_station("Resolves per the official observatory.") is None
@@ -101,6 +119,18 @@ class TestJudge:
         assert a.verdict == VERDICT_NOT_WU and a.verdict not in ACTIONABLE
         assert "intraday" in a.advice
 
+    def test_rules_that_mention_wunderground_are_never_called_not_wunderground(self):
+        """The regression behind "47 of 48 do not match". Rules that name
+        Wunderground but whose link could not be read were reported as
+        resolving on www.weather.gov. A parsing gap is not a fact about the
+        market: it must read as unknown, with nothing to apply."""
+        text = ("Resolves on Wunderground data for the station (link unavailable). "
+                "Background: https://www.weather.gov")
+        a = judge(_city(), extract_wu_station(text), None, other_source_domain(text),
+                  "slug", saw_wunderground=True)
+        assert a.verdict == VERDICT_UNKNOWN
+        assert a.verdict not in ACTIONABLE
+
     def test_nothing_readable_is_unknown(self):
         a = judge(_city(), None, None, None, None)
         assert a.verdict == VERDICT_UNKNOWN and a.verdict not in ACTIONABLE
@@ -142,3 +172,37 @@ class TestApply:
         with pytest.raises(ValueError):
             apply_fix(city, audit)
         assert city.primary_icao == "EGLL", "a refused apply must change nothing"
+
+
+# ── Problems in the city's own fields ─────────────────────────────────────
+
+class TestFieldNotes:
+    def test_a_placeholder_primary_icao_is_flagged(self):
+        """Lucknow was found with primary_icao = "ICAO". Four upper-case
+        letters, so no shape check catches it — and METAR was never fetched."""
+        from app.utils.station_audit import field_notes
+        notes = field_notes(_city(name="Lucknow", primary_icao="ICAO",
+                                  wunderground_url="https://www.wunderground.com/history/daily/in/lucknow/VILK"))
+        assert any("not a real station" in n for n in notes)
+
+    def test_metar_and_wunderground_on_different_stations_is_flagged(self):
+        """Seoul: METAR RKSS (Gimpo), Wunderground RKSI (Incheon). The
+        'official max' then mixes two thermometers."""
+        from app.utils.station_audit import field_notes
+        notes = field_notes(_city(name="Seoul", primary_icao="RKSS",
+                                  wunderground_url="https://www.wunderground.com/history/daily/kr/incheon/RKSI"))
+        assert any("RKSS" in n and "RKSI" in n for n in notes)
+
+    def test_a_wunderground_url_without_a_station_is_flagged(self):
+        from app.utils.station_audit import field_notes
+        notes = field_notes(_city(wunderground_url="https://www.wunderground.com/weather/tr/istanbul"))
+        assert any("names no station" in n for n in notes)
+
+    def test_a_consistent_city_has_no_notes(self):
+        from app.utils.station_audit import field_notes
+        assert field_notes(_city(primary_icao="EGLC",
+                                 wunderground_url="https://www.wunderground.com/history/daily/gb/london/EGLC")) == []
+
+    def test_notes_are_part_of_every_verdict(self):
+        a = judge(_city(primary_icao="ICAO"), None, None, None, None)
+        assert a.notes

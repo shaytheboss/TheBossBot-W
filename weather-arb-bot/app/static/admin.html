@@ -2169,20 +2169,32 @@ async function auditStations(btn) {
     const label = {ok:'✅ ok', primary_icao_mismatch:'⚠️ METAR station', wunderground_url_mismatch:'⚠️ WU station',
                    both_mismatch:'❌ both', not_wunderground:'🚫 not Wunderground', unknown:'? unknown'};
     const actionable = new Set(['primary_icao_mismatch','wunderground_url_mismatch','both_mismatch']);
-    let h = `<p><b>${j.mismatches}</b> of ${j.cities.length} cities do not match their Polymarket resolution station.
-      Applying moves the old METAR station to "reference", so it stays collected and can be switched back here.
-      The station bias re-learns for the new station over ~2 weeks.</p>
-      <table><tr><th>City</th><th>METAR</th><th>WU URL</th><th>Polymarket resolves on</th><th>Verdict</th><th></th></tr>`;
+    let h = `<p>${j.cities.length} cities: <b>${j.ok}</b> match · <b>${j.mismatches}</b> point at a different
+      station than Polymarket · ${j.not_wunderground} resolve on a non-Wunderground source ·
+      ${j.unread} whose rules could not be read (see evidence) · <b>${j.with_field_problems}</b> with problems
+      in their own fields.</p>
+      <p class="small">Applying moves the old METAR station to "reference", so it stays collected and can be
+      switched back here. The station bias re-learns for the new station over ~2 weeks.
+      Click a row to see the exact text of the market rules the verdict is based on.</p>
+      <table><tr><th>City</th><th>METAR</th><th>WU URL</th><th>Polymarket resolves on</th><th>Verdict</th><th>Own fields</th><th></th></tr>`;
     j.cities.forEach(c => {
       const res = c.resolution_icao
         ? `<b>${escapeHtml(c.resolution_icao)}</b>${c.resolution_name ? ' · ' + escapeHtml(c.resolution_name) : ''}`
         : (c.other_source ? escapeHtml(c.other_source) : '—');
       const act = actionable.has(c.verdict)
         ? `<button class="btn small primary" onclick="applyStation(${c.city_id}, this)">Apply ${escapeHtml(c.resolution_icao)}</button>` : '';
-      h += `<tr title="${escapeHtml(c.advice)}"><td>${escapeHtml(c.city)}</td><td>${escapeHtml(c.primary_icao||'—')}</td>
-            <td>${escapeHtml(c.wu_url_icao||'—')}</td><td>${res}</td><td>${label[c.verdict]||c.verdict}</td><td>${act}</td></tr>`;
+      const notes = (c.notes||[]).length ? '⚠️ ' + (c.notes||[]).length : '';
+      const detail = `<b>${escapeHtml(c.advice)}</b>`
+        + ((c.notes||[]).length ? '<br>' + c.notes.map(n => '• ' + escapeHtml(n)).join('<br>') : '')
+        + `<br><span class="small">market: ${escapeHtml(c.checked_market||'—')} · read from: ${escapeHtml(c.read_from||'—')}</span>`
+        + (c.evidence ? `<br><code style="white-space:pre-wrap">${escapeHtml(c.evidence)}</code>` : '');
+      h += `<tr style="cursor:pointer" onclick="this.nextElementSibling.classList.toggle('hidden')">
+            <td>${escapeHtml(c.city)}</td><td>${escapeHtml(c.primary_icao||'—')}</td>
+            <td>${escapeHtml(c.wu_url_icao||'—')}</td><td>${res}</td><td>${label[c.verdict]||c.verdict}</td>
+            <td>${notes}</td><td>${act}</td></tr>
+            <tr class="hidden"><td colspan="7" class="small">${detail}</td></tr>`;
     });
-    box.innerHTML = h + '</table><p class="small">Hover a row for the explanation.</p>';
+    box.innerHTML = h + '</table>';
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
