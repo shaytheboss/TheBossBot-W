@@ -125,6 +125,8 @@ class SettingsIn(BaseModel):
     intraday_min_entry_cost: Optional[float] = None
     model_fetch_mode: Optional[str] = None
     open_meteo_extra_models: Optional[str] = None
+    open_meteo_hrrr_half_hourly: Optional[bool] = None
+    open_meteo_probe_enabled: Optional[bool] = None
 
 
 class CityCreateIn(BaseModel):
@@ -2189,6 +2191,17 @@ async def admin_open_meteo_status(
     return status(cities)
 
 
+@router.get("/open-meteo/updates")
+async def admin_open_meteo_updates(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=3, ge=1, le=30),
+):
+    """When each model's numbers actually changed — the hours new runs land."""
+    from app.workers.open_meteo_job import update_report
+    return await update_report(db, days=days)
+
+
 @router.get("/models/compare")
 async def admin_models_compare(
     _: str = Depends(require_admin),
@@ -2358,6 +2371,8 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "intraday_min_entry_cost": getattr(settings, "intraday_min_entry_cost", 0.70),
         "model_fetch_mode": getattr(settings, "model_fetch_mode", "batched"),
         "open_meteo_extra_models": getattr(settings, "open_meteo_extra_models", ""),
+        "open_meteo_hrrr_half_hourly": getattr(settings, "open_meteo_hrrr_half_hourly", True),
+        "open_meteo_probe_enabled": getattr(settings, "open_meteo_probe_enabled", True),
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -2448,6 +2463,10 @@ async def admin_set_settings(
         if len(names) > 10 or any(not re.fullmatch(r"[a-z0-9_]{2,26}", m) for m in names):
             raise HTTPException(400, "open_meteo_extra_models: up to 10 Open-Meteo model ids, comma-separated")
         changed["open_meteo_extra_models"] = ",".join(names)
+    for flag in ("open_meteo_hrrr_half_hourly", "open_meteo_probe_enabled"):
+        val = getattr(payload, flag)
+        if val is not None:
+            changed[flag] = bool(val)
 
     # Apply in-memory (immediate effect) AND persist (survives restart).
     for key, val in changed.items():

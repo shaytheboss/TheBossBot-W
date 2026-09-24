@@ -2111,6 +2111,16 @@ async function loadSettings() {
         </select></td></tr>
       <tr><td>Extra models (record-only)</td>
           <td><input id="set-om-extra" type="text" style="width:100%" value="${s.open_meteo_extra_models}" /></td></tr>
+      <tr><td>HRRR every 30 min</td><td>
+        <select id="set-om-hrrr30">
+          <option value="1" ${s.open_meteo_hrrr_half_hourly ? 'selected' : ''}>On (:20 and :50)</option>
+          <option value="0" ${s.open_meteo_hrrr_half_hourly ? '' : 'selected'}>Off (:20 only)</option>
+        </select></td></tr>
+      <tr><td>Measure model update times</td><td>
+        <select id="set-om-probe">
+          <option value="1" ${s.open_meteo_probe_enabled ? 'selected' : ''}>On — probe one city hourly (~320 req/day)</option>
+          <option value="0" ${s.open_meteo_probe_enabled ? '' : 'selected'}>Off</option>
+        </select></td></tr>
       <tr><td colspan="2" class="small">
         GFS, ECMWF, ICON, HRRR and both ensembles come from Open-Meteo. NWS, Meteosource and
         Tomorrow.io are separate providers and are not affected. Extra models are stored for
@@ -2119,6 +2129,7 @@ async function loadSettings() {
       </td></tr>
       <tr><td colspan="2">
         <button class="btn" onclick="showJson(this, '/open-meteo/status', 'omOut')">📶 Open-Meteo usage today</button>
+        <button class="btn" onclick="showJson(this, '/open-meteo/updates?days=3', 'omOut')">🕐 When models update</button>
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=1', 'omOut')">🏁 Best model per city (1 day ahead)</button>
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=0', 'omOut')">Same day</button>
         <pre id="omOut" class="small" style="white-space:pre;overflow-x:auto;max-height:480px;margin-top:8px;"></pre></td></tr>
@@ -2172,6 +2183,8 @@ async function saveSettings() {
     intraday_min_entry_cost: parseFloat(document.getElementById('set-intra-minentry').value),
     model_fetch_mode: document.getElementById('set-om-mode').value,
     open_meteo_extra_models: document.getElementById('set-om-extra').value,
+    open_meteo_hrrr_half_hourly: document.getElementById('set-om-hrrr30').value === '1',
+    open_meteo_probe_enabled: document.getElementById('set-om-probe').value === '1',
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }

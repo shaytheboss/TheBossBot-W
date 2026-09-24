@@ -49,6 +49,8 @@ PERSISTABLE_KEYS: frozenset = frozenset({
     # Open-Meteo fetch mode — the rollback switch for the batched fetcher.
     "model_fetch_mode",
     "open_meteo_extra_models",
+    "open_meteo_hrrr_half_hourly",
+    "open_meteo_probe_enabled",
 })
 
 

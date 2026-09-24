@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     open_meteo_core_every_h: int = 1
     open_meteo_ensemble_every_h: int = 6
     open_meteo_extra_every_h: int = 6
+    # HRRR again at :50 (it publishes hourly; intraday weighs it most).
+    open_meteo_hrrr_half_hourly: bool = True
+    # One city per slow-tier model, every hour the tier is not due, to see
+    # when new runs appear (/admin/open-meteo/updates). ~320 requests/day.
+    open_meteo_probe_enabled: bool = True
     # Record-only models: written to `forecasts` as source "om_<model>", never
     # read by the estimators. Scored per city at /admin/models/compare.
     open_meteo_extra_models: str = (
