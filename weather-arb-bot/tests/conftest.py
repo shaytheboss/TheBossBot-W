@@ -115,6 +115,7 @@ def reset_module_caches():
     import app.analyzers.opportunity_detector as detector
     import app.analyzers.beta_opportunity_detector as beta_detector
     import app.shadow.snapshot as shadow_snapshot
+    import app.intraday.detector as intraday_detector
     from app.utils import jobstats
 
     def _clear():
@@ -128,6 +129,9 @@ def reset_module_caches():
         beta_detector._beta_dedup_date = None
         beta_detector._beta_open_pos_last_sent.clear()
         shadow_snapshot.LAST_RUN.clear()
+        intraday_detector._realert_date = None
+        intraday_detector._last_alerted.clear()
+        intraday_detector._cluster_warmth_today.clear()
         jobstats.reset()
 
     _clear()

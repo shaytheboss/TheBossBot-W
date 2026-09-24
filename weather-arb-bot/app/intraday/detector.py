@@ -660,6 +660,16 @@ async def _evaluate_intraday_outcome(
     max_entry_cost = float(getattr(settings, "intraday_max_entry_cost", 0.88))
     entry_too_expensive = entry_cost > max_entry_cost
 
+    # Entry-price floor. Across 5,418 settled intraday bets, buying at an ask
+    # below 70c lost in BOTH halves of a time split — Jun-Jul -6.35pp
+    # (t=-3.48), Aug-Sep -5.27pp (t=-2.77) — and dropping them was at the 99th
+    # percentile against random subsets of the same size. A cheap ask on a
+    # "92% sure" bet is the market disagreeing by 20-30 points, and it was the
+    # market that was right (these won ~50-58%). Alerts still fire; only the
+    # virtual buy is gated. 0 disables.
+    min_entry_cost = float(getattr(settings, "intraday_min_entry_cost", 0.70))
+    entry_too_cheap = min_entry_cost > 0 and entry_cost < min_entry_cost
+
     # Coherence guard: never open a virtual buy on a bucket where we already
     # hold an OPEN position on the opposite side — that's a locked-in loss
     # (London 15/6 cross-bet). The contradictory signal can still alert/realert;
@@ -677,6 +687,7 @@ async def _evaluate_intraday_outcome(
         certainty >= buy_thresh
         and not bool(getattr(city, "blacklisted", False))
         and not entry_too_expensive
+        and not entry_too_cheap
         and not has_open_opposite
     )
 
@@ -708,6 +719,8 @@ async def _evaluate_intraday_outcome(
         "_entry_too_expensive": bool(entry_too_expensive),
         "_has_open_opposite": bool(has_open_opposite),
         "_max_entry_cost": max_entry_cost,
+        "_entry_too_cheap": bool(entry_too_cheap),
+        "_min_entry_cost": min_entry_cost,
         "_wu_confirmed_for_lock": bool(wu_confirmed_for_lock),
         "_bucket_unit": bucket_unit,
         "_forecast_sources": forecast_sources,

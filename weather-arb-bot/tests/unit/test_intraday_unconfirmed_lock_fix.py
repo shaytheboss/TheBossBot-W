@@ -144,8 +144,11 @@ def test_hard_lock_not_capped_by_stat_cap():
     assert p_no == PROB_LO
     assert bd_no["stat_cap_applied"] is False
 
+    # Max moved 86.4 -> 87.0: 86.4 is only 0.9F past the 85.5 floor, inside
+    # METAR's measurement resolution, and is no longer a lock (see
+    # IntradayParams.lock_margin_f). 87.0 clears the margin.
     p_yes, bd_yes = estimate_intraday(
-        running_max_f=86.4, current_temp_f=86.0, minutes_since_max=20.0,
+        running_max_f=87.0, current_temp_f=86.0, minutes_since_max=20.0,
         forecast_high_f=87.0, local_hour=12.0,
         bucket_min=86, bucket_max=None, bucket_unit="F",
     )

@@ -44,6 +44,8 @@ PERSISTABLE_KEYS: frozenset = frozenset({
     # Shadow study — research switches, safe to flip at runtime.
     "shadow_enabled",
     "shadow_alert_mode",
+    # Intraday buy guard — measured, and switchable off from the screen.
+    "intraday_min_entry_cost",
 })
 
 

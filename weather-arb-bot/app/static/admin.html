@@ -408,7 +408,9 @@
         <button class="btn primary" onclick="toggleAddCity()" id="addCityToggle">+ Add City</button>
         <button class="btn primary" onclick="runDiscovery(this)">Run Discovery</button>
         <span id="discoveryStatus" class="small"></span>
+        <button class="btn" onclick="auditStations(this)" title="Compare each city's METAR and Wunderground stations with the station its Polymarket markets resolve on. Read-only.">🛰 Check stations vs Polymarket</button>
       </div>
+      <div id="stationAudit" class="panel hidden"></div>
       <p class="small">Edit any field, then click Save. Coordinates are used for all weather model queries (GFS, ECMWF, NWS, HRRR, Tomorrow.io, Meteosource). For airports, use city-centre coords rather than the airport itself if the market resolves on a city-wide reading.</p>
       <div id="addCityPanel" class="panel hidden">
         <h4>Add new city</h4>
@@ -2093,6 +2095,14 @@ async function loadSettings() {
       </td></tr>
       <tr><td colspan="2"><button class="btn" onclick="showSuspensionReport(this)">📋 Why are cities being suspended?</button>
         <pre id="suspOut" class="small" style="white-space:pre;overflow-x:auto;margin-top:8px;"></pre></td></tr>
+      <tr><td colspan="2" style="padding-top:14px;font-weight:600;">⚡ Intraday buy guard</td></tr>
+      <tr><td>Minimum entry price for a virtual buy (0 = off)</td>
+          <td><input id="set-intra-minentry" type="number" step="0.01" min="0" max="1" value="${s.intraday_min_entry_cost}" /></td></tr>
+      <tr><td colspan="2" class="small">
+        Across 5,418 settled intraday bets, buying below 70¢ lost in both halves of a time split
+        (−6.35pp, then −5.27pp). A cheap ask on a "92% sure" bet means the market disagrees by
+        20–30 points — and it was the market that was right. Alerts still fire; only the buy is gated.
+      </td></tr>
       <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🔬 Shadow study (research only — never affects trading)</td></tr>
       <tr><td>Recording</td><td>
         <select id="set-shadow-on">
@@ -2140,10 +2150,54 @@ async function saveSettings() {
     suspension_days: parseInt(document.getElementById('set-susp-days').value),
     shadow_enabled: document.getElementById('set-shadow-on').value === '1',
     shadow_alert_mode: document.getElementById('set-shadow-mode').value,
+    intraday_min_entry_cost: parseFloat(document.getElementById('set-intra-minentry').value),
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
   else { const j = await r.json().catch(()=>({})); alert('Save failed: ' + (j.detail || r.status)); }
+}
+
+async function auditStations(btn) {
+  const box = document.getElementById('stationAudit');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Checking…';
+  try {
+    const r = await api('/stations/audit');
+    const j = await r.json().catch(()=>({}));
+    box.classList.remove('hidden');
+    if (!r.ok) { box.textContent = 'Failed: ' + (j.detail || r.status); return; }
+    const label = {ok:'✅ ok', primary_icao_mismatch:'⚠️ METAR station', wunderground_url_mismatch:'⚠️ WU station',
+                   both_mismatch:'❌ both', not_wunderground:'🚫 not Wunderground', unknown:'? unknown'};
+    const actionable = new Set(['primary_icao_mismatch','wunderground_url_mismatch','both_mismatch']);
+    let h = `<p><b>${j.mismatches}</b> of ${j.cities.length} cities do not match their Polymarket resolution station.
+      Applying moves the old METAR station to "reference", so it stays collected and can be switched back here.
+      The station bias re-learns for the new station over ~2 weeks.</p>
+      <table><tr><th>City</th><th>METAR</th><th>WU URL</th><th>Polymarket resolves on</th><th>Verdict</th><th></th></tr>`;
+    j.cities.forEach(c => {
+      const res = c.resolution_icao
+        ? `<b>${escapeHtml(c.resolution_icao)}</b>${c.resolution_name ? ' · ' + escapeHtml(c.resolution_name) : ''}`
+        : (c.other_source ? escapeHtml(c.other_source) : '—');
+      const act = actionable.has(c.verdict)
+        ? `<button class="btn small primary" onclick="applyStation(${c.city_id}, this)">Apply ${escapeHtml(c.resolution_icao)}</button>` : '';
+      h += `<tr title="${escapeHtml(c.advice)}"><td>${escapeHtml(c.city)}</td><td>${escapeHtml(c.primary_icao||'—')}</td>
+            <td>${escapeHtml(c.wu_url_icao||'—')}</td><td>${res}</td><td>${label[c.verdict]||c.verdict}</td><td>${act}</td></tr>`;
+    });
+    box.innerHTML = h + '</table><p class="small">Hover a row for the explanation.</p>';
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+async function applyStation(cityId, btn) {
+  if (!confirm('Point this city at its Polymarket resolution station?\n\n'
+      + 'The current METAR station becomes the reference station, so nothing is lost '
+      + 'and you can switch it back in the Cities table.')) return;
+  btn.disabled = true;
+  const r = await api('/stations/apply/' + cityId, { method: 'POST' });
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) { alert('Not applied: ' + (j.detail || r.status)); btn.disabled = false; return; }
+  const lines = Object.entries(j.changes).map(([k,v]) => `${k}: ${v.from} → ${v.to}`).join('\n');
+  alert(`${j.city} updated:\n${lines}`);
+  btn.textContent = '✓ applied';
+  loadCities();
 }
 
 async function showShadowStatus(btn) {
