@@ -133,8 +133,11 @@ def test_estimate_post_peak_lock_scenario():
 
 
 def test_estimate_open_ended_locked():
+    # Max moved 86.4 -> 87.0: 86.4 is only 0.9F past the 85.5 floor, inside
+    # METAR's measurement resolution, and is no longer a lock (see
+    # IntradayParams.lock_margin_f). 87.0 clears the margin.
     p, bd = estimate_intraday(
-        running_max_f=86.4, current_temp_f=86.0, minutes_since_max=20.0,
+        running_max_f=87.0, current_temp_f=86.0, minutes_since_max=20.0,
         forecast_high_f=87.0, local_hour=14.0,
         bucket_min=86, bucket_max=None, bucket_unit="F",
     )
@@ -155,9 +158,12 @@ def test_estimate_midday_uncertainty_is_genuine():
 
 
 def test_estimate_celsius_bucket():
-    # Seoul "27°C" bucket = [27, 28)°C = [80.6, 82.4)°F; max 83.2°F → dead.
+    # Seoul "27°C" bucket = [27, 28)°C = [80.6, 82.4)°F. A lock now needs a
+    # whole degree Celsius (1.8°F) past the top: 84.5°F is dead for certain.
+    # (83.2°F — the old value here — is only 0.8°F past, which is exactly the
+    # at-the-edge case that lost in the data; see test_intraday_lock_margin.)
     p, bd = estimate_intraday(
-        running_max_f=83.2, current_temp_f=81.0, minutes_since_max=100.0,
+        running_max_f=84.5, current_temp_f=81.0, minutes_since_max=100.0,
         forecast_high_f=83.0, local_hour=15.5,
         bucket_min=27, bucket_max=27, bucket_unit="C",
     )

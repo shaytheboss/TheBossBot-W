@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # we're risking $4.40 to win ~40¢ — even at 99% win rate the EV is only
     # 3¢ but one lock-failure loss destroys 10 wins. Alerts still fire.
     intraday_max_entry_cost: float = 0.88
+    # Minimum entry price for a virtual intraday buy. Below 70c the market is
+    # disagreeing with a "92%" signal by 20-30 points — and across 5,418 bets
+    # the market was right: these lost in both halves of a time split (see
+    # detector.py). Alerts still fire. 0 disables.
+    intraday_min_entry_cost: float = 0.70
 
     # מאגר דיוק-המודלים הפר-עירוני (model_skill): מרווח העדכון התקופתי
     # בשניות. בנוסף לכך העדכון רץ מיד אחרי כל settlement של פולימרקט.

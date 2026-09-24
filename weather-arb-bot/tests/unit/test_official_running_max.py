@@ -98,9 +98,12 @@ def test_wu_override_can_kill_a_bucket():
     )
     assert bd_metar["lock_state"] is None
 
-    # With the WU official max: 74.0 >= 73.5 → yes_impossible.
+    # With the WU official max: 75.0 is 1.5°F past the 73.5 top → yes_impossible.
+    # (74.0 would be only 0.5°F past — within measurement resolution, so
+    # "yes_impossible_marginal" now; the point of this test is that the WU
+    # value, not METAR's 73.0, is the one the lock is judged on.)
     p_wu, bd_wu = estimate_intraday(
-        running_max_f=74.0, current_temp_f=73.0, minutes_since_max=10.0,
+        running_max_f=75.0, current_temp_f=73.0, minutes_since_max=10.0,
         forecast_high_f=74.0, local_hour=13.0,
         bucket_min=72, bucket_max=73, bucket_unit="F",
         metar_max_f=73.0,

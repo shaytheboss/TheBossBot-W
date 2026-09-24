@@ -86,6 +86,22 @@ class IntradayParams:
     # הוא 2.0°F — מה שמבטיח שפער של 2°F ייתן ביטחון NO של ~84% בלבד (מתחת
     # לסף הקנייה של 94%), ולא 99% כפי שהיה קודם.
     unconfirmed_lock_sigma_f: float = 2.0
+    # ── נעילה על הגבול (ניתוח 5,418 הימורים, ספטמבר) ─────────────────────
+    # נעילות "yes_impossible" שאושרו ב-WU זכו רק ב-77.5% (89 הימורים), והשוק
+    # תמחר אותן ב-~80¢ — השוק צדק. 58 מתוך 67 הוכרזו כשהמקסימום רק *נגע*
+    # בגבול הדלי (≤0.25 יחידה ממנו). METAR מדווח במעלות צלזיוס שלמות, כך
+    # ש-"90.0°F" יכול להיות כל דבר בין 88.7 ל-90.5 — הוא לא מבחין בין 89 ל-90
+    # בנתון הרשמי. לכן נעילה דורשת מרווח של יחידת-מדידה שלמה מעבר לגבול;
+    # מתחתיו המצב הוא "yes_impossible_marginal" ומטופל סטטיסטית בדיוק כמו
+    # נעילה לא-מאושרת (σ ≥ unconfirmed_lock_sigma_f, בלי PROB_LO מתמטי).
+    lock_margin_f: float = 1.0      # שווקי פרנהייט: מעלה שלמה
+    lock_margin_c_f: float = 1.8    # שווקי צלזיוס: 1°C שלמה, בפרנהייט
+
+
+#: Lock states that look like a lock but must be priced statistically. Kept in
+#: one place so every branch that special-cases "unconfirmed" treats
+#: "marginal" identically — a missed branch would quietly reinstate the 99%.
+SOFT_LOCK_STATES = frozenset({"yes_impossible_unconfirmed", "yes_impossible_marginal"})
 
 
 DEFAULT_PARAMS = IntradayParams()
@@ -175,6 +191,7 @@ def lock_state(
     f_lo: Optional[float],
     f_hi: Optional[float],
     wu_confirmed: bool = True,
+    margin_f: float = 0.0,
 ) -> Optional[str]:
     """Deterministic outcomes already decided by the monotonic running max.
 
@@ -189,14 +206,22 @@ def lock_state(
     yes_impossible is suppressed in that case to prevent locking a bucket the WU
     station has not yet confirmed.  yes_locked is unaffected (it only fires for
     open-ended >= buckets where METAR above the floor is safe).
+
+    margin_f: how far past the edge the max must be before it counts as a
+    lock. A max that merely touches the edge is within measurement resolution
+    of it (METAR reports whole °C), so it returns "yes_impossible_marginal"
+    — priced statistically — and a floor that is merely touched is no lock at
+    all. The default of 0 preserves the old behaviour for direct callers.
     """
     if f_hi is not None and running_max_f >= f_hi:
-        if wu_confirmed:
-            return "yes_impossible"
-        # METAR exceeded the ceiling but WU hasn't confirmed — treat as a
-        # high-confidence statistical signal, not a mathematical lock.
-        return "yes_impossible_unconfirmed"
-    if f_hi is None and f_lo is not None and running_max_f >= f_lo:
+        if not wu_confirmed:
+            # METAR exceeded the ceiling but WU hasn't confirmed — treat as a
+            # high-confidence statistical signal, not a mathematical lock.
+            return "yes_impossible_unconfirmed"
+        if running_max_f < f_hi + margin_f:
+            return "yes_impossible_marginal"
+        return "yes_impossible"
+    if f_hi is None and f_lo is not None and running_max_f >= f_lo + margin_f:
         return "yes_locked"
     return None
 
@@ -208,6 +233,7 @@ def bucket_probability(
     f_lo: Optional[float],
     f_hi: Optional[float],
     wu_confirmed: bool = True,
+    margin_f: float = 0.0,
 ) -> float:
     """P(final max lands in [f_lo, f_hi)) under final = max(M, X), X~N(mu, sigma).
 
@@ -225,7 +251,8 @@ def bucket_probability(
     """
     sigma = max(sigma, 1e-6)
 
-    state = lock_state(running_max_f, f_lo, f_hi, wu_confirmed=wu_confirmed)
+    state = lock_state(running_max_f, f_lo, f_hi, wu_confirmed=wu_confirmed,
+                       margin_f=margin_f)
     if state == "yes_impossible":
         return PROB_LO
     if state == "yes_locked":
@@ -283,7 +310,9 @@ def estimate_intraday(
     # Pass wu_confirmed to lock_state so METAR-only readings don't trigger a
     # hard mathematical lock (yes_impossible). The lock fires only when the
     # Wunderground station — the Polymarket resolution source — confirms it.
-    state = lock_state(running_max_f, f_lo, f_hi, wu_confirmed=wu_confirmed)
+    margin_f = params.lock_margin_c_f if bucket_unit == "C" else params.lock_margin_f
+    state = lock_state(running_max_f, f_lo, f_hi, wu_confirmed=wu_confirmed,
+                       margin_f=margin_f)
 
     # ── הרכבת הסיגמה האפקטיבית (תיקון תקרית פריז) ────────────────────────
     # שני מקורות אי-ודאות בלתי-תלויים, ולכן מחוברים ריבועית (quadrature):
@@ -323,14 +352,15 @@ def estimate_intraday(
     # floor means a 2°F METAR excess yields ~84% NO certainty (below 94% buy
     # threshold) rather than the former 99%.
     unconfirmed_sigma_applied = False
-    if state == "yes_impossible_unconfirmed" and sigma < params.unconfirmed_lock_sigma_f:
+    if state in SOFT_LOCK_STATES and sigma < params.unconfirmed_lock_sigma_f:
         sigma = params.unconfirmed_lock_sigma_f
         unconfirmed_sigma_applied = True
 
     mu = expected_final_max(running_max_f, forecast_high_f, local_hour, params)
     # Pass wu_confirmed so bucket_probability uses the same lock logic we did
     # above — unconfirmed METAR-only readings must NOT pin p at PROB_LO.
-    p = bucket_probability(running_max_f, mu, sigma, f_lo, f_hi, wu_confirmed=wu_confirmed)
+    p = bucket_probability(running_max_f, mu, sigma, f_lo, f_hi,
+                           wu_confirmed=wu_confirmed, margin_f=margin_f)
     # state was already computed above. Do NOT recompute here.
 
     # ── תקרת YES לפני חלון השיא ──────────────────────────────────────────
@@ -356,7 +386,7 @@ def estimate_intraday(
     # the bucket with confirmed peak is genuinely high-confidence.
     stat_cap_applied = False
     _is_hard_lock = state in ("yes_impossible", "yes_locked")
-    _is_unconfirmed = state == "yes_impossible_unconfirmed"
+    _is_unconfirmed = state in SOFT_LOCK_STATES
     if not _is_hard_lock and (not peak_passed or _is_unconfirmed):
         if p > params.stat_prob_hi:
             p = params.stat_prob_hi
@@ -388,6 +418,7 @@ def estimate_intraday(
         "wu_confirmed": wu_confirmed,
         "peak_passed": peak_passed,
         "lock_state": state,
+        "lock_margin_f": margin_f,
         "f_lo": f_lo,
         "f_hi": f_hi,
         "probability": round(p, 4),

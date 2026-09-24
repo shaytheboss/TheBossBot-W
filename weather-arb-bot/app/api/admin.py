@@ -121,6 +121,7 @@ class SettingsIn(BaseModel):
     suspension_days: Optional[int] = None
     shadow_enabled: Optional[bool] = None
     shadow_alert_mode: Optional[str] = None
+    intraday_min_entry_cost: Optional[float] = None
 
 
 class CityCreateIn(BaseModel):
@@ -2049,6 +2050,45 @@ async def admin_city_delete(
     return Response(status_code=204)
 
 
+@router.get("/stations/audit")
+async def admin_stations_audit(_: str = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    """Each city's METAR and Wunderground stations against the station its
+    Polymarket markets actually resolve on. Read-only: nothing is changed
+    here. Uses the stored market descriptions first and asks Gamma only when
+    the stored text was truncated before the station link."""
+    from app.utils.station_audit import audit_cities
+    async with httpx.AsyncClient(headers={"User-Agent": "weather-arb-bot/1.0"}) as client:
+        rows = await audit_cities(db, client)
+    return {"cities": [r.as_dict() for r in rows],
+            "mismatches": sum(1 for r in rows if r.verdict not in ("ok", "unknown"))}
+
+
+@router.post("/stations/apply/{city_id}")
+async def admin_stations_apply(
+    city_id: int, _: str = Depends(require_admin), db: AsyncSession = Depends(get_db),
+):
+    """Point one city at its Polymarket resolution station.
+
+    The comparison is recomputed here rather than taken from the request, so
+    the screen can never push a station the server did not itself find in the
+    market rules. The old primary moves to reference_icao, so it keeps being
+    collected and the change is reversible from the Cities tab.
+    """
+    from app.utils.station_audit import ACTIONABLE, apply_fix, audit_cities
+    city = await db.get(City, city_id)
+    if city is None:
+        raise HTTPException(404, "city not found")
+    async with httpx.AsyncClient(headers={"User-Agent": "weather-arb-bot/1.0"}) as client:
+        audit = (await audit_cities(db, client, [city]))[0]
+    if audit.verdict not in ACTIONABLE:
+        raise HTTPException(409, f"nothing to apply: {audit.verdict} — {audit.advice}")
+    changes = apply_fix(city, audit)
+    await db.commit()
+    logger.warning(f"[stations] {city.name} re-pointed to {audit.resolution_icao}: {changes}")
+    return {"ok": True, "city": city.name,
+            "changes": {k: {"from": v[0], "to": v[1]} for k, v in changes.items()}}
+
+
 @router.get("/shadow/status")
 async def admin_shadow_status(
     _: str = Depends(require_admin),
@@ -2279,6 +2319,7 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "suspension_days": settings.suspension_days,
         "shadow_enabled": getattr(settings, "shadow_enabled", True),
         "shadow_alert_mode": getattr(settings, "shadow_alert_mode", "summary"),
+        "intraday_min_entry_cost": getattr(settings, "intraday_min_entry_cost", 0.70),
         "metar_fetch_interval": settings.metar_fetch_interval,
         "polymarket_fetch_interval": settings.polymarket_fetch_interval,
         "analyzer_run_interval": settings.analyzer_run_interval,
@@ -2354,6 +2395,9 @@ async def admin_set_settings(
         if payload.shadow_alert_mode not in ALERT_MODES:
             raise HTTPException(400, f"shadow_alert_mode must be one of {ALERT_MODES}")
         changed["shadow_alert_mode"] = payload.shadow_alert_mode
+    if payload.intraday_min_entry_cost is not None:
+        _validate_unit(payload.intraday_min_entry_cost, "intraday_min_entry_cost")
+        changed["intraday_min_entry_cost"] = payload.intraday_min_entry_cost
 
     # Apply in-memory (immediate effect) AND persist (survives restart).
     for key, val in changed.items():

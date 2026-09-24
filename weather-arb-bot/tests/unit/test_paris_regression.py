@@ -81,8 +81,11 @@ def test_stat_cap_blocks_extreme_claims_pre_peak():
 
 def test_stat_cap_does_not_touch_locks():
     """נעילות הן מתמטיות — שומרות על 98.5% המלא."""
+    # Max moved 86.4 -> 87.0: 86.4 is only 0.9F past the 85.5 floor, inside
+    # METAR's measurement resolution, and is no longer a lock (see
+    # IntradayParams.lock_margin_f). 87.0 clears the margin.
     p, bd = estimate_intraday(
-        running_max_f=86.4, current_temp_f=86.0, minutes_since_max=20.0,
+        running_max_f=87.0, current_temp_f=86.0, minutes_since_max=20.0,
         forecast_high_f=87.0, local_hour=12.0,
         bucket_min=86, bucket_max=None, bucket_unit="F",
     )

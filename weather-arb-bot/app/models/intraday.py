@@ -34,7 +34,11 @@ class IntradayOpportunity(Base):
     expected_final_max_f = Column(Float, nullable=True)  # model's μ
     sigma_used = Column(Float, nullable=True)
     # None | "yes_locked" (floor already touched) | "yes_impossible" (max above bucket)
-    lock_state = Column(String(20), nullable=True)
+    # 32, not 20: "yes_impossible_unconfirmed" is 26 characters. At 20 Postgres
+    # rejected the insert, and because the detector's per-outcome handler does
+    # not roll back, the failed flush poisoned the session for the rest of the
+    # run. SQLite ignores VARCHAR lengths, so no test could see it.
+    lock_state = Column(String(32), nullable=True)
 
     # ── Virtual position (same semantics as the daily table) ──
     virtual_shares = Column(Integer, nullable=True, default=None)
