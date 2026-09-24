@@ -182,13 +182,22 @@ class TestFailureContainment:
 
 class TestIsolation:
     @pytest.mark.asyncio
-    async def test_it_makes_no_http_call(self, pipeline):
-        """Prices come from the table, not the CLOB. One stray HTTP call per
-        bucket per hour would be ~40,000 requests a day."""
+    async def test_its_only_http_calls_are_order_book_reads_for_recorded_buckets(
+        self, pipeline
+    ):
+        """Exactly one book read per recorded bucket, and nothing else — no
+        midpoint polls, no Gamma, no weather APIs. Anything more would be
+        traffic the study does not need."""
+        from tests.mocks import polymarket_payloads as pm
         await _prepare(pipeline)
-        before = pipeline.http.count()
-        await _run(pipeline)
-        assert pipeline.http.count() == before
+        before = len(pipeline.http.requests)
+        stats = await _run(pipeline)
+        calls = pipeline.http.requests[before:]
+
+        assert calls, "live prices must be read from Polymarket"
+        assert all(pm.CLOB_BOOK in str(r.url) for r in calls), \
+            [str(r.url) for r in calls if pm.CLOB_BOOK not in str(r.url)]
+        assert len(calls) == stats["book_calls"] == stats["rows"]
 
     @pytest.mark.asyncio
     async def test_it_writes_to_no_production_table(self, pipeline):
@@ -266,6 +275,89 @@ class TestIsolation:
         frozen = copy.deepcopy(s)
         estimate_with_breakdown(s, 93, 94, days_ahead=1, bucket_unit="F")
         assert s == frozen
+
+
+# ── Live prices ───────────────────────────────────────────────────────────
+
+class TestLivePrices:
+    """The comparison has to be against the market's price at that moment.
+    The stored midpoint is Polymarket's too and normally minutes old, but it
+    cannot prove its own freshness and it is not the price you would pay."""
+
+    @pytest.mark.asyncio
+    async def test_the_live_book_wins_over_the_stored_price(self, pipeline):
+        """Stored mid is 0.62; the live book says 0.70/0.72. The row must carry
+        the live mid — proof the stored value was not used."""
+        from tests.mocks import polymarket_payloads as pm
+        await _prepare(pipeline)
+        pipeline.http.prepend(pm.CLOB_BOOK, pm.book(0.70, 0.72))
+        await _run(pipeline)
+
+        rows = await pipeline.rows(ShadowSnapshot)
+        assert rows and all(r.price_live for r in rows)
+        r = rows[0]
+        assert r.market_p == pytest.approx(0.71, abs=1e-4)
+        assert r.bid == pytest.approx(0.70, abs=1e-4)
+        assert r.ask == pytest.approx(0.72, abs=1e-4)
+
+    @pytest.mark.asyncio
+    async def test_an_unusable_book_falls_back_to_the_stored_price_and_says_so(
+        self, pipeline
+    ):
+        from tests.mocks import polymarket_payloads as pm
+        await _prepare(pipeline)
+        pipeline.http.prepend(pm.CLOB_BOOK, pm.book(bid=0.61, ask=None))
+        stats = await _run(pipeline)
+
+        rows = await pipeline.rows(ShadowSnapshot)
+        assert rows and not any(r.price_live for r in rows)
+        assert rows[0].market_p == pytest.approx(0.62, abs=1e-4)
+        assert rows[0].bid is None and rows[0].ask is None
+        assert stats["stored_fallbacks"] == len(rows) and stats["live_prices"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_polymarket_outage_does_not_fail_the_run(self, pipeline, no_backoff):
+        from tests.mocks import polymarket_payloads as pm
+        await _prepare(pipeline)
+        pipeline.http.prepend(pm.CLOB_BOOK, {"error": "down"}, status=503)
+        stats = await _run(pipeline)
+        assert stats["errors"] == 0 and stats["rows"] > 0
+        assert stats["stored_fallbacks"] == stats["rows"]
+
+    @pytest.mark.asyncio
+    async def test_dead_buckets_cost_no_request(self, pipeline):
+        """A bucket both sides dismiss is never fetched."""
+        from app.models.market import MarketPrice
+        from tests.mocks import polymarket_payloads as pm
+        await _prepare(pipeline)
+        async with pipeline.session() as db:          # make every stored price ~0
+            for mp in (await db.execute(select(MarketPrice))).scalars().all():
+                mp.yes_price = 0.01
+            await db.commit()
+        # 130°F-style: nudge the model to ~0 on everything by making it absurd
+        # is not needed — assert directly on the count instead.
+        before = len(pipeline.http.requests)
+        stats = await _run(pipeline)
+        fetched = [r for r in pipeline.http.requests[before:] if pm.CLOB_BOOK in str(r.url)]
+        assert len(fetched) == stats["book_calls"]
+        assert stats["book_calls"] <= stats["rows"] + stats["skipped_dead"]
+
+    @pytest.mark.asyncio
+    async def test_the_price_job_freshness_is_stamped_on_every_row(self, pipeline):
+        """For a row that fell back to the stored price, this is how to tell
+        whether that price was minutes old or hours old."""
+        from app.utils import jobstats
+        await _prepare(pipeline)
+        jobstats.record("polymarket", wall=1.0, cpu=0.1)
+        await _run(pipeline)
+        rows = await pipeline.rows(ShadowSnapshot)
+        assert rows and all(r.price_job_age_min == 0 for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_no_price_job_yet_is_recorded_as_unknown(self, pipeline):
+        await _prepare(pipeline)
+        await _run(pipeline)
+        assert all(r.price_job_age_min is None for r in await pipeline.rows(ShadowSnapshot))
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────
@@ -411,8 +503,10 @@ class TestBoundary:
 
     def test_it_never_calls_the_side_effecting_production_paths(self):
         src = self._shadow_code()
+        # Reading an order book is allowed (live_price.py). Writing a price is
+        # not: collect_and_store is what fills market_prices.
         for forbidden in ("_persist_collector_misses(", "_collect_outcome_data(",
-                          "get_book_summary(", "PolymarketCollector", "import httpx"):
+                          "collect_and_store(", "import httpx"):
             assert forbidden not in src, f"shadow code must not use {forbidden}"
 
     def test_it_only_adds_its_own_rows(self):

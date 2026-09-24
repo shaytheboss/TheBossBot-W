@@ -270,25 +270,55 @@ class TestMarketProblems:
         assert await pipeline.count(MarketPrice) == 0
 
     @pytest.mark.asyncio
-    async def test_a_one_sided_book_still_detects(self, pipeline):
-        """No ask means nothing executable, so `get_book_summary` returns
-        None. The outcome still takes part in normalisation — dropping it
-        would redistribute its probability onto the others and inflate them."""
+    async def test_a_bucket_without_a_two_sided_book_is_not_traded(self, pipeline):
+        """No ask means no executable price, so the detector skips the bucket.
+
+        This test used to assert the opposite — "detection continues" — and
+        passed only because a harness leak served it an earlier test's normal
+        book. With the leak closed it received the one-sided book it was
+        written for, and the real behaviour turned out to be the safe one.
+        """
         pipeline.http.prepend(pm.CLOB_BOOK, pm.book(bid=0.61, ask=None))
         result = await pipeline.run()
-        assert result.opportunities, "detection must survive an unquotable book"
+        assert pipeline.http.calls_to(pm.CLOB_BOOK), "the bad book must reach the detector"
+        assert result.opportunities == []
+        assert pipeline.telegram.sent == []
+
+    @pytest.mark.asyncio
+    async def test_one_unquotable_bucket_does_not_disturb_the_others(self, pipeline):
+        """The property that matters: an unquotable bucket still counts in
+        normalisation, so the OTHER buckets' probabilities are unchanged. Only
+        91-92 loses its book here; the 93-94 NO must come out exactly as in the
+        healthy run (83%)."""
+        import httpx
+
+        def books(request):
+            if request.url.params.get("token_id") == "tok0":        # 91-92°F
+                return httpx.Response(200, json=pm.book(bid=0.61, ask=None))
+            return httpx.Response(200, json=pm.book(0.61, 0.63))
+
+        pipeline.http._routes.insert(
+            0, type(pipeline.http._routes[0])("GET", pm.CLOB_BOOK, [books], False)
+        )
+        result = await pipeline.run()
+        # Guard against the failure mode that hid the original bug: prove the
+        # one-sided book was actually served to the detector.
+        assert any(r.url.params.get("token_id") == "tok0"
+                   for r in pipeline.http.calls_to(pm.CLOB_BOOK))
+        assert result.bucket_sides() == {"93-94°F": "NO"}
+        assert result.best.confidence_score == 83
 
     @pytest.mark.asyncio
     async def test_a_crossed_book_is_rejected(self, pipeline):
-        """Bid above ask is impossible on a real venue, so the book is
-        treated as absent rather than trusted — same handling as one-sided."""
+        """Bid above ask is impossible on a real venue, so the book is treated
+        as absent — and, like a one-sided book, the bucket is not traded."""
         pipeline.http.prepend(pm.CLOB_BOOK, pm.crossed_book(bid=0.70, ask=0.60))
 
         from app.collectors.polymarket_collector import PolymarketCollector
         assert await PolymarketCollector().get_book_summary("tok0") is None
 
         result = await pipeline.run()
-        assert result.opportunities, "detection continues without a usable book"
+        assert result.opportunities == []
 
     @pytest.mark.asyncio
     async def test_a_resolved_market_is_skipped(self, pipeline):

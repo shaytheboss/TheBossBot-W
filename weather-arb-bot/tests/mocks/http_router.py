@@ -196,6 +196,25 @@ def install(monkeypatch, router: HttpRouter) -> HttpRouter:
         real_init(self, *args, **kwargs)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+
+    # Collectors cache their client on the instance, and some instances live at
+    # module level for the whole test run (the detector's `_poly_col`, for
+    # one). Patching __init__ only affects clients built from now on — a
+    # client built during an EARLIER test kept that test's router, so every
+    # later test's order-book calls went to a router the test could not see.
+    # Confirmed: the second of two flow tests received zero of the detector's
+    # book calls. Rebinding here makes each collector drop a client that
+    # belongs to a different test's router.
+    from app.collectors.base import BaseCollector
+    real_get_client = BaseCollector._get_client
+
+    async def get_client(self):
+        if getattr(self, "_harness_router", None) is not router:
+            self._client = None
+            self._harness_router = router
+        return await real_get_client(self)
+
+    monkeypatch.setattr(BaseCollector, "_get_client", get_client)
     return router
 
 

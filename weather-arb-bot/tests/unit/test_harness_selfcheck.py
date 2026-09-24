@@ -110,6 +110,36 @@ class TestHttpInterception:
         assert http.count(wx.OPEN_METEO) == 1
 
 
+class TestNoLeakAcrossTests:
+    @pytest.mark.asyncio
+    async def test_a_long_lived_collector_follows_the_current_router(self):
+        """A collector held at module level builds its client once. Before the
+        fix, that client kept the FIRST test's router forever, so later tests'
+        mocks never reached it — two flow tests about order books passed
+        without ever receiving the book they were written for.
+
+        Two separate patch contexts, entered and undone in turn, reproduce
+        exactly what pytest does between one test and the next.
+        """
+        from app.collectors.polymarket_collector import PolymarketCollector
+        from tests.mocks.http_router import HttpRouter, install
+
+        col = PolymarketCollector()                      # lives across "tests"
+
+        with pytest.MonkeyPatch.context() as mp:         # test one
+            first = install(mp, HttpRouter())
+            first.add(pm.CLOB_MIDPOINT, pm.midpoint(0.10))
+            assert await col.get_midpoint("t") == pytest.approx(0.10)
+
+        with pytest.MonkeyPatch.context() as mp:         # test two
+            second = install(mp, HttpRouter())
+            second.add(pm.CLOB_MIDPOINT, pm.midpoint(0.90))
+            assert await col.get_midpoint("t") == pytest.approx(0.90)
+
+        assert first.count(pm.CLOB_MIDPOINT) == 1
+        assert second.count(pm.CLOB_MIDPOINT) == 1
+
+
 async def _no_sleep(_seconds):
     """Collapse the 2s/4s/8s backoff so retry tests run instantly."""
     return None
