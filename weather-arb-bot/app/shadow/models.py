@@ -62,6 +62,9 @@ class ShadowSnapshot(Base):
     forecast_age_min = Column(Integer)     # minutes since the newest forecast landed
     forecast_high_f = Column(REAL)
     sigma = Column(REAL)
+    # The intraday model's P(YES) — the one that sees the running max. Only
+    # for the city's local today inside the intraday hours; NULL otherwise.
+    intraday_p = Column(REAL)
 
     __table_args__ = (
         Index("ix_shadow_market_time", "market_id", "taken_at"),

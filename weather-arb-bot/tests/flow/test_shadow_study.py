@@ -530,8 +530,11 @@ class TestBoundary:
         src = self._shadow_code()
         # Reading an order book is allowed (live_price.py). Writing a price is
         # not: collect_and_store is what fills market_prices.
+        # The intraday detector's entry points write positions and register
+        # cluster warm-ups; the study uses only the pure helpers they share.
         for forbidden in ("_persist_collector_misses(", "_collect_outcome_data(",
-                          "collect_and_store(", "import httpx"):
+                          "collect_and_store(", "import httpx",
+                          "_evaluate_intraday_outcome(", "detect_intraday("):
             assert forbidden not in src, f"shadow code must not use {forbidden}"
 
     def test_it_only_adds_its_own_rows(self):

@@ -9,6 +9,11 @@ The summary answers, for one market, the question the study exists for:
                     (lower is better), and the average probability each gave
                     to the bucket that actually won
 
+The intraday model (the one that sees the running max) is shown next to the
+daily one for the hours it runs, and scored against the market over those
+same hours only — the daily model cannot see the thermometer, so late in the
+day it is no match for a market that can.
+
 About missing rows. The snapshot skips a bucket when BOTH sides call it dead
 (see snapshot.DEAD_MODEL_P / DEAD_MARKET_P), because those rows carry no
 information and were most of the volume. Here a missing row reads as zero on
@@ -38,6 +43,7 @@ class Row:
     outcome_id: int
     model_p: float
     market_p: Optional[float]
+    intraday_p: Optional[float] = None
 
 
 @dataclass
@@ -51,6 +57,9 @@ class Hour:
     market_pick: Optional[int]
     model_brier: float
     market_brier: Optional[float]
+    intraday_win: Optional[float] = None
+    intraday_pick: Optional[int] = None
+    intraday_brier: Optional[float] = None
 
 
 def _brier(rs: list[Row], winner_id: int, winner_missing: bool, get) -> float:
@@ -76,6 +85,8 @@ def by_hour(rows: Iterable[Row], winner_id: int) -> list[Hour]:
         market_complete = len(priced) == len(rs)
         market_win = (win.market_p if win and win.market_p is not None
                       else (0.0 if win is None and market_complete else None))
+        # The intraday model estimates every bucket of a market or none.
+        has_intra = all(r.intraday_p is not None for r in rs)
 
         hours.append(Hour(
             taken_at=t,
@@ -88,6 +99,11 @@ def by_hour(rows: Iterable[Row], winner_id: int) -> list[Hour]:
             model_brier=_brier(rs, winner_id, win is None, lambda r: r.model_p),
             market_brier=(_brier(rs, winner_id, win is None, lambda r: r.market_p)
                           if market_complete else None),
+            intraday_win=((win.intraday_p if win else 0.0) if has_intra else None),
+            intraday_pick=(max(rs, key=lambda r: r.intraday_p).outcome_id
+                           if has_intra else None),
+            intraday_brier=(_brier(rs, winner_id, win is None, lambda r: r.intraday_p)
+                            if has_intra else None),
         ))
     return hours
 
@@ -118,7 +134,7 @@ def _sample(hours: list[Hour], n: int = MAX_TABLE_ROWS) -> list[Hour]:
 
 
 def _pct(v: Optional[float]) -> str:
-    return "  —" if v is None else f"{v * 100:3.0f}%"
+    return "   —" if v is None else f"{v * 100:3.0f}%"
 
 
 def build_summary(
@@ -151,24 +167,29 @@ def build_summary(
         + (f" · {after_close} after close left out" if after_close else ""),
         "",
         "<pre>",
-        " h-left local  model  mkt   model  mkt",
-        "              →win   →win   pick   pick",
+        " h-left local model intra  mkt  model   mkt",
+        "              →win  →win →win   pick  pick",
     ]
     for h in _sample(hours):
         lines.append(
-            f"{h.hours_to_close:6.1f} {h.local_hour:02d}:00 {_pct(h.model_win)} {_pct(h.market_win)}"
-            f"  {short(h.model_pick):>6} {short(h.market_pick) if h.market_pick else '—':>6}"
+            f"{h.hours_to_close:6.1f} {h.local_hour:02d}:00 {_pct(h.model_win)}"
+            f"  {_pct(h.intraday_win)} {_pct(h.market_win)}"
+            f" {short(h.model_pick):>6} {short(h.market_pick) if h.market_pick else '—':>5}"
         )
     lines.append("</pre>")
 
     m_from = knew_from(hours, winner_id, "model_pick")
     k_from = knew_from(hours, winner_id, "market_pick")
+    intra_hours = [h for h in hours if h.intraday_pick is not None]
     fmt = lambda v: "never settled on it" if v is None else f"from {v:.0f}h before close"
     lines += [
         "<b>Who knew first</b>",
         f"  model:  {fmt(m_from)}",
         f"  market: {fmt(k_from)}",
     ]
+    if intra_hours:
+        i_from = knew_from(hours, winner_id, "intraday_pick")
+        lines.append(f"  intraday: {fmt(i_from)}")
     if m_from is not None and (k_from is None or m_from > k_from + 0.5):
         lead = m_from - (k_from or 0.0)
         lines.append(f"  → model led by {lead:.0f}h")
@@ -187,6 +208,17 @@ def build_summary(
         f"  avg prob. on winner:  model {mw * 100:.0f}% · market "
         + (f"{sum(kw_vals) / len(kw_vals) * 100:.0f}%" if kw_vals else "—"),
     ]
+    both = [h for h in intra_hours if h.market_brier is not None]
+    if both:
+        n = len(both)
+        lines += [
+            "",
+            f"<b>Intraday hours only</b> ({n}h, same hours for both)",
+            f"  Brier: intraday {sum(h.intraday_brier for h in both) / n:.3f}"
+            f" · market {sum(h.market_brier for h in both) / n:.3f}",
+            f"  avg prob. on winner: intraday {sum(h.intraday_win for h in both) / n * 100:.0f}%"
+            f" · market {sum(h.market_win for h in both) / n * 100:.0f}%",
+        ]
     return _cap("\n".join(lines))
 
 

@@ -204,6 +204,83 @@ def forecast_spread(signals: dict) -> Optional[float]:
     return max(vals) - min(vals)
 
 
+def observed_readings(signals: dict, now_utc: datetime) -> Optional[dict]:
+    """What the intraday estimate starts from: the official running max and
+    the METAR readings. None when there is no METAR max yet today.
+
+    Shared by the detector and the shadow study (app/shadow/estimate.py), so
+    the study records the number the detector computes, not a lookalike.
+    """
+    metar_max = signals.get("metar_today_max_f")
+    if metar_max is None:
+        return None
+    metar_max = float(metar_max)
+
+    # OFFICIAL running max: Polymarket resolves on the Wunderground station,
+    # whose observed-so-far high can run 1-2°F above METAR. Using METAR alone
+    # underestimated the floor (real incident: WU history showed 74°F while
+    # METAR said 73.0°F — the model called a bucket "expected final 73.0").
+    wu_fc = signals.get("wunderground_forecast") or {}
+    wu_high = wu_fc.get("predicted_high_f")
+    wu_age_min: Optional[float] = None
+    if wu_fc.get("retrieved_at"):
+        try:
+            wu_ts = datetime.fromisoformat(str(wu_fc["retrieved_at"]))
+            if wu_ts.tzinfo is None:
+                wu_ts = wu_ts.replace(tzinfo=timezone.utc)
+            wu_age_min = (now_utc - wu_ts).total_seconds() / 60.0
+        except (ValueError, TypeError):
+            pass
+    running_max, max_source, wu_suspect = official_running_max(
+        metar_max, wu_high, wu_age_min
+    )
+    current_temp = (signals.get("primary_metar") or {}).get("temperature_f")
+    return {
+        "metar_max": metar_max,
+        "wu_high": wu_high,
+        "running_max": running_max,
+        "max_source": max_source,
+        "wu_suspect": wu_suspect,
+        # A yes_impossible lock is trustworthy only when WU (the Polymarket
+        # resolution source) directly confirmed the running max. METAR can
+        # run 2-4°F above WU causing false locks (Seoul/HK/Dallas incidents).
+        "wu_confirmed": max_source == "wunderground",
+        "current_temp": float(current_temp) if current_temp is not None else None,
+    }
+
+
+def cluster_boost_for(city_name: str) -> tuple[float, str]:
+    """The bias boost from a sister city's warming surprise today (read-only;
+    the detector registers surprises, this only reads them). (0.0, "") when
+    none applies — a city never boosts itself."""
+    cluster = _city_cluster(city_name)
+    existing_warmth = _cluster_warmth_today.get(cluster) if cluster else None
+    if existing_warmth is None:
+        return 0.0, ""
+    warmth_date, warmth_excess, warmth_city = existing_warmth
+    if warmth_date != date.today() or warmth_city == city_name:
+        return 0.0, ""
+    boost = min(warmth_excess * CLUSTER_BOOST_FRACTION, CLUSTER_BOOST_MAX_F)
+    note = (
+        f"cluster {cluster!r}: {warmth_city} running +{warmth_excess:.1f}°F "
+        f"above forecast → bias +{boost:.1f}°F"
+    )
+    return boost, note
+
+
+def apply_cluster_boost(signals: dict, boost: float, note: str) -> None:
+    """Raise the station bias in `signals` by `boost`. Replaces the
+    station_bias dict rather than editing it, so a shallow copy of signals
+    leaves the original untouched."""
+    station_bias = signals.get("station_bias") or {}
+    existing_bias = float(station_bias.get("bias_f") or 1.5)
+    signals["station_bias"] = {
+        **station_bias,
+        "bias_f": round(existing_bias + boost, 2),
+        "notes": ((station_bias.get("notes") or "") + f"; ⚠️ {note}").lstrip("; "),
+    }
+
+
 async def _minutes_since_running_max(
     db: AsyncSession, icao: str, tz, now_utc: datetime
 ) -> Optional[float]:
@@ -503,37 +580,17 @@ async def _evaluate_intraday_outcome(
         onshore_wind_dir=getattr(city, "onshore_wind_dir", None),
     )
 
-    metar_max = signals.get("metar_today_max_f")
     price_info = signals.get("market_price")
-    if metar_max is None or not price_info:
+    readings = observed_readings(signals, datetime.now(timezone.utc))
+    if readings is None or not price_info:
         return None, None
-    metar_max = float(metar_max)
-
-    # OFFICIAL running max: Polymarket resolves on the Wunderground station,
-    # whose observed-so-far high can run 1-2°F above METAR. Using METAR alone
-    # underestimated the floor (real incident: WU history showed 74°F while
-    # METAR said 73.0°F — the model called a bucket "expected final 73.0").
-    wu_fc = signals.get("wunderground_forecast") or {}
-    wu_high = wu_fc.get("predicted_high_f")
-    wu_age_min: Optional[float] = None
-    if wu_fc.get("retrieved_at"):
-        try:
-            wu_ts = datetime.fromisoformat(str(wu_fc["retrieved_at"]))
-            if wu_ts.tzinfo is None:
-                wu_ts = wu_ts.replace(tzinfo=timezone.utc)
-            wu_age_min = (datetime.now(timezone.utc) - wu_ts).total_seconds() / 60.0
-        except (ValueError, TypeError):
-            pass
-    running_max, max_source, wu_suspect = official_running_max(
-        metar_max, wu_high, wu_age_min
-    )
-    # A yes_impossible lock is trustworthy only when WU (the Polymarket
-    # resolution source) directly confirmed the running max. METAR can
-    # run 2-4°F above WU causing false locks (Seoul/HK/Dallas incidents).
-    wu_confirmed_for_lock = (max_source == "wunderground")
-
-    current_temp = (signals.get("primary_metar") or {}).get("temperature_f")
-    current_temp = float(current_temp) if current_temp is not None else None
+    metar_max = readings["metar_max"]
+    wu_high = readings["wu_high"]
+    running_max = readings["running_max"]
+    max_source = readings["max_source"]
+    wu_suspect = readings["wu_suspect"]
+    wu_confirmed_for_lock = readings["wu_confirmed"]
+    current_temp = readings["current_temp"]
 
     book = None
     if outcome.token_id:
@@ -571,28 +628,10 @@ async def _evaluate_intraday_outcome(
                 )
 
     # Apply a bias boost from sister-city warming surprise (not self-triggered).
-    cluster_boost = 0.0
-    cluster_boost_note = ""
-    existing_warmth = _cluster_warmth_today.get(cluster) if cluster else None
-    if existing_warmth is not None:
-        warmth_date, warmth_excess, warmth_city = existing_warmth
-        if warmth_date == date.today() and warmth_city != city.name:
-            cluster_boost = min(warmth_excess * CLUSTER_BOOST_FRACTION, CLUSTER_BOOST_MAX_F)
-            cluster_boost_note = (
-                f"cluster {cluster!r}: {warmth_city} running +{warmth_excess:.1f}°F "
-                f"above forecast → bias +{cluster_boost:.1f}°F"
-            )
-            station_bias = signals.get("station_bias") or {}
-            existing_bias = float(station_bias.get("bias_f") or 1.5)
-            signals["station_bias"] = {
-                **station_bias,
-                "bias_f": round(existing_bias + cluster_boost, 2),
-                "notes": (
-                    (station_bias.get("notes") or "")
-                    + f"; ⚠️ {cluster_boost_note}"
-                ).lstrip("; "),
-            }
-            forecast_high = blended_forecast_high(signals)  # recompute with boosted bias
+    cluster_boost, cluster_boost_note = cluster_boost_for(city.name)
+    if cluster_boost > 0:
+        apply_cluster_boost(signals, cluster_boost, cluster_boost_note)
+        forecast_high = blended_forecast_high(signals)  # recompute with boosted bias
 
     prob, breakdown = estimate_intraday(
         running_max_f=running_max,
@@ -694,7 +733,6 @@ async def _evaluate_intraday_outcome(
     # Per-source forecast highs (bias-corrected — the same values the blend
     # actually used) for the alert display table. WU intentionally excluded —
     # it's the observation feed here, not a model.
-    station_bias = signals.get("station_bias") or {}
     _SRC_LABELS = {
         "hrrr_forecast": "HRRR", "nws_forecast": "NWS",
         "gfs_forecast": "GFS", "ecmwf_forecast": "ECMWF",

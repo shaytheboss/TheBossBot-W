@@ -19,12 +19,23 @@ What this module deliberately does NOT call:
 
   _collect_outcome_data     fetches the order book over HTTP
   _persist_collector_misses writes to a production table
+  _evaluate_intraday_outcome reads the book, writes positions, and registers
+                            cluster warm-ups — the study takes only the
+                            estimate from it, through the helpers it shares
+
+The intraday probability. For a market on the city's local today, inside the
+intraday hours, each bucket also gets the intraday model's P(YES): the one
+that knows the running max. The daily model cannot see the thermometer, so in
+the last hours of the day only this one is a fair match for the market.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
+
+import pytz
 
 from app.analyzers.opportunity_detector import normalization_scale
 from app.analyzers.probability_estimator import (
@@ -33,7 +44,19 @@ from app.analyzers.probability_estimator import (
     estimate_with_breakdown,
 )
 from app.analyzers.signal_aggregator import SignalAggregator, _c_bucket_to_f_int_range
+from app.intraday.detector import (
+    _minutes_since_running_max,
+    _params_from_settings,
+    apply_cluster_boost,
+    blended_forecast_high,
+    cluster_boost_for,
+    forecast_spread,
+    observed_readings,
+)
+from app.intraday.estimator import estimate_intraday, local_decimal_hour
 from app.utils.units import resolve_bucket_unit
+
+logger = logging.getLogger(__name__)
 
 #: Keys of aggregate()'s output that depend on the individual bucket. Every
 #: other key is shared by all of a market's buckets. Pinned by a flow test.
@@ -54,6 +77,66 @@ class BucketEstimate:
     forecast_high_f: Optional[float]
     sigma: Optional[float]
     forecast_age_min: Optional[int]
+    # The intraday model's P(YES); None outside its hours or without METAR.
+    intraday_p: Optional[float] = None
+
+
+def intraday_hour(city, market, now: datetime, params) -> Optional[float]:
+    """The city's local decimal hour if the intraday model would run on this
+    market now — the market is for the city's local today and the hour is past
+    the intraday start — else None. The same two gates detect_intraday applies."""
+    try:
+        tz = pytz.timezone(city.timezone) if city.timezone else pytz.utc
+    except Exception:
+        tz = pytz.utc
+    if market.event_date != now.astimezone(tz).date():
+        return None
+    loc_hour = local_decimal_hour(now, tz)
+    return loc_hour if loc_hour >= params.start_hour else None
+
+
+async def intraday_probabilities(db, city, market, outcomes: list, base: dict,
+                                 now: datetime) -> dict[int, float]:
+    """{outcome_id: intraday P(YES)} computed as the detector computes it, or
+    {} when the intraday model would not run. Reads only; writes nothing."""
+    params = _params_from_settings()
+    loc_hour = intraday_hour(city, market, now, params)
+    if loc_hour is None:
+        return {}
+    readings = observed_readings(base, now)
+    if readings is None:
+        return {}
+    try:
+        tz = pytz.timezone(city.timezone) if city.timezone else pytz.utc
+    except Exception:
+        tz = pytz.utc
+    minutes_since_max = await _minutes_since_running_max(db, city.primary_icao, tz, now)
+
+    signals = dict(base)      # the boost replaces station_bias; base is untouched
+    boost, note = cluster_boost_for(city.name)
+    if boost > 0:
+        apply_cluster_boost(signals, boost, note)
+    forecast_high = blended_forecast_high(signals)
+    spread_f = forecast_spread(signals)
+
+    out = {}
+    for outcome in outcomes:
+        p, _ = estimate_intraday(
+            running_max_f=readings["running_max"],
+            current_temp_f=readings["current_temp"],
+            minutes_since_max=minutes_since_max,
+            forecast_high_f=forecast_high,
+            local_hour=loc_hour,
+            bucket_min=outcome.bucket_min,
+            bucket_max=outcome.bucket_max,
+            bucket_unit=resolve_bucket_unit(outcome),
+            params=params,
+            metar_max_f=readings["metar_max"],
+            forecast_spread_f=spread_f,
+            wu_confirmed=readings["wu_confirmed"],
+        )
+        out[outcome.id] = float(p)
+    return out
 
 
 def signals_for_outcome(base: dict, outcome, market_price: Optional[dict]) -> dict:
@@ -151,6 +234,12 @@ async def estimate_market(
             return []
         rows.append((outcome, float(raw), bd, price))
 
+    try:
+        intraday = await intraday_probabilities(db, city, market, outcomes, base, now)
+    except Exception as e:     # the daily estimate is still worth recording
+        logger.warning(f"[shadow] intraday estimate failed for market {market.id}: {e}")
+        intraday = {}
+
     priced = [r for r in rows if r[3]]
     scale = normalization_scale([r[1] for r in priced], len(outcomes)) if priced else None
 
@@ -167,5 +256,6 @@ async def estimate_market(
             forecast_high_f=bd.get("forecast_high_f"),
             sigma=bd.get("sigma_used"),
             forecast_age_min=age,
+            intraday_p=intraday.get(outcome.id),
         ))
     return out
