@@ -5,7 +5,7 @@ The summary answers, for one market, the question the study exists for:
   who knew first?   the hour from which the model's favourite bucket was the
                     eventual winner and stayed so through close — and the same
                     for the market's favourite
-  who was closer?   Brier score over the whole window, model vs market
+  who was closer?   Brier score over the hours before the close, model vs market
                     (lower is better), and the average probability each gave
                     to the bucket that actually won
 
@@ -129,8 +129,16 @@ def build_summary(
     winner_id: int,
     rows: Iterable[Row],
 ) -> Optional[str]:
-    """HTML for Telegram, or None if there is nothing to report."""
-    hours = by_hour(rows, winner_id)
+    """HTML for Telegram, or None if there is nothing to report.
+
+    Only snapshots taken before the city's day closed count. Rows after the
+    close (recorded before the recorder stopped taking them) compare a
+    forecast already looking at the next day with a price pinned at 0 or 100:
+    they flipped "who knew first" and inflated the market's score.
+    """
+    all_hours = by_hour(rows, winner_id)
+    hours = [h for h in all_hours if h.hours_to_close > 0]
+    after_close = len(all_hours) - len(hours)
     if not hours:
         return None
 
@@ -139,7 +147,8 @@ def build_summary(
         f"🔬 <b>Shadow study</b> — {html.escape(city)} · {event_date.isoformat()}",
         f"Resolved: <b>{html.escape(labels.get(winner_id, '?'))}</b> · "
         f"tracked {hours[0].hours_to_close:.0f}h before close "
-        f"({len(hours)} snapshot{'' if len(hours) == 1 else 's'})",
+        f"({len(hours)} snapshot{'' if len(hours) == 1 else 's'})"
+        + (f" · {after_close} after close left out" if after_close else ""),
         "",
         "<pre>",
         " h-left local  model  mkt   model  mkt",
@@ -172,7 +181,7 @@ def build_summary(
     kw_vals = [h.market_win for h in hours if h.market_win is not None]
     lines += [
         "",
-        "<b>Across the whole window</b>",
+        "<b>Until the close</b>",
         f"  Brier (lower=better): model {mb:.3f} · market "
         + (f"{sum(kb_vals) / len(kb_vals):.3f}" if kb_vals else "—"),
         f"  avg prob. on winner:  model {mw * 100:.0f}% · market "
