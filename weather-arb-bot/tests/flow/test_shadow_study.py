@@ -152,6 +152,31 @@ async def _add_second_market(pipeline, days_out: int = 1) -> int:
     return 2
 
 
+class TestTheClose:
+    @pytest.mark.asyncio
+    async def test_nothing_is_recorded_once_the_citys_day_is_over(self, pipeline):
+        """The market stays open until Polymarket settles it, hours later.
+        Those hours say nothing about who knew first — and the estimate is
+        not even about the right day any more."""
+        from app.shadow.clock import hour_floor, local_close_utc
+        await _prepare(pipeline)
+        after = hour_floor(local_close_utc(pipeline.event_date, pipeline.city.tz)) \
+            + timedelta(hours=1, minutes=5)
+        stats = await _run(pipeline, now=after)
+        assert stats["rows"] == 0 and stats["past_close"] == 1
+        async with pipeline.session() as db:
+            assert (await db.execute(select(ShadowSnapshot))).first() is None
+
+    @pytest.mark.asyncio
+    async def test_the_last_hour_before_the_close_is_still_recorded(self, pipeline):
+        from app.shadow.clock import hour_floor, local_close_utc
+        await _prepare(pipeline)
+        last = hour_floor(local_close_utc(pipeline.event_date, pipeline.city.tz)) \
+            - timedelta(minutes=55)
+        stats = await _run(pipeline, now=last)
+        assert stats["rows"] > 0 and stats["past_close"] == 0
+
+
 class TestFailureContainment:
     @pytest.mark.asyncio
     async def test_one_failing_market_does_not_lose_the_others(self, pipeline, monkeypatch):

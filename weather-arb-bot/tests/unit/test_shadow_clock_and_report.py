@@ -163,15 +163,18 @@ class TestSummaryMessage:
                              labels=LABELS, winner_id=C, rows=[]) is None
 
     def test_long_histories_are_sampled_but_keep_the_final_hours(self):
+        # 72 hourly rows from 72h-to-close down to 1h — all before the close,
+        # since rows after it are left out of the summary.
+        rows = [Row(r.taken_at, r.hours_to_close + 48, r.local_hour, r.outcome_id,
+                    r.model_p, r.market_p) for r in self._rows(72)]
         text = build_summary(city="Austin", event_date=date(2026, 9, 24),
-                             labels=LABELS, winner_id=C, rows=self._rows(72))
+                             labels=LABELS, winner_id=C, rows=rows)
         table = text.split("<pre>")[1].split("</pre>")[0].strip().splitlines()[2:]
         assert len(table) <= MAX_TABLE_ROWS
-        # 72 hourly rows from 24h-to-close down to -47h. The sample must keep
-        # the very first hour and the very last — the decisive end is what
-        # the summary is for.
-        assert table[0].split()[0] == "24.0"
-        assert table[-1].split()[0] == "-47.0"
+        # The sample must keep the very first hour and the very last — the
+        # decisive end is what the summary is for.
+        assert table[0].split()[0] == "72.0"
+        assert table[-1].split()[0] == "1.0"
 
     def test_user_text_is_escaped(self):
         """Bucket labels come from Polymarket. A stray '<' would make Telegram
@@ -215,3 +218,50 @@ def test_a_single_snapshot_reads_naturally():
     text = build_summary(city="Austin", event_date=date(2026, 9, 24),
                          labels=LABELS, winner_id=C, rows=rows)
     assert "(1 snapshot)" in text and "1 snapshots" not in text
+
+
+class TestOnlyTheHoursBeforeTheClose:
+    """Guangzhou, 24 Sep: the model picked the winner (35C) from 11h before
+    the close, the market from 8h. Seven snapshots taken after the close —
+    the model already looking at the next day, the market pinned at 100% —
+    turned that into "model never settled, market led by 8h"."""
+
+    W, L = 1, 2                      # 35C (won), 34C
+    LABELS = {1: "35°C", 2: "34°C"}
+
+    def _rows(self):
+        rows = []
+        for i in range(11):                        # 10.9h … 0.9h before close
+            htc = 10.9 - i
+            market_on_winner = i >= 3              # market switches with 7.9h left
+            rows += [Row(T0 + timedelta(hours=i), htc, (13 + i) % 24, self.W, .19,
+                         .96 if market_on_winner else .30),
+                     Row(T0 + timedelta(hours=i), htc, (13 + i) % 24, self.L, .15,
+                         .04 if market_on_winner else .60)]
+        for j in range(7):                         # after the close
+            t = T0 + timedelta(hours=11 + j)
+            rows += [Row(t, -0.1 - j, j, self.W, .16, 1.0),
+                     Row(t, -0.1 - j, j, self.L, .30, 0.0)]
+        return rows
+
+    def _text(self, rows):
+        return build_summary(city="Guangzhou", event_date=date(2026, 9, 24),
+                             labels=self.LABELS, winner_id=self.W, rows=rows)
+
+    def test_who_knew_first_is_decided_before_the_close(self):
+        text = self._text(self._rows())
+        assert "model:  from 11h before close" in text
+        assert "market: from 8h before close" in text
+        assert "model led by 3h" in text
+        assert "never settled" not in text
+
+    def test_the_after_close_rows_are_left_out_of_the_table_and_the_scores(self):
+        with_after = self._text(self._rows())
+        before_only = self._text([r for r in self._rows() if r.hours_to_close > 0])
+        assert with_after.replace(" · 7 after close left out", "") == before_only
+        assert "7 after close left out" in with_after
+        assert "-0.1" not in with_after
+
+    def test_a_market_seen_only_after_its_close_has_nothing_to_report(self):
+        rows = [r for r in self._rows() if r.hours_to_close <= 0]
+        assert self._text(rows) is None

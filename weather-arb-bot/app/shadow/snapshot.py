@@ -101,7 +101,8 @@ async def job_shadow_snapshot(
              "book_calls": 0, "live_prices": 0, "stored_fallbacks": 0,
              "price_job_age_min": price_job_age_min(),
              "already_done": 0, "no_forecast": 0, "errors": 0,
-             "summaries_sent": 0, "digest_sent": False, "pruned": 0}
+             "summaries_sent": 0, "digest_sent": False, "pruned": 0,
+             "past_close": 0}
     gaps: list[tuple] = []
 
     collector = new_collector()
@@ -176,6 +177,14 @@ async def _record(db, now, today, hour, stats, gaps, collector) -> None:
         city = cities.get(market.city_id)
         outcomes = outcomes_by_market.get(market.id) or []
         if city is None or not outcomes:
+            continue
+        # The city's day is over: the answer is decided and the market only
+        # waits for Polymarket to settle it. A snapshot now compares a forecast
+        # for a day that has ended — after local midnight the aggregator is
+        # already looking at the next day — with a price that is 0 or 100.
+        # Checked before the estimate so it costs no queries either.
+        if hours_to_close(now, market.event_date, city.timezone) <= 0:
+            stats["past_close"] += 1
             continue
         try:
             ests = await estimate_market(db, city, market, outcomes, now,
