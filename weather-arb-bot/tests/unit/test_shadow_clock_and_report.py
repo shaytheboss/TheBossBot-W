@@ -265,3 +265,53 @@ class TestOnlyTheHoursBeforeTheClose:
     def test_a_market_seen_only_after_its_close_has_nothing_to_report(self):
         rows = [r for r in self._rows() if r.hours_to_close <= 0]
         assert self._text(rows) is None
+
+
+class TestIntradayInTheSummary:
+    """Guangzhou again, now with the intraday model from 13:00 local (7.9h
+    before close): it locks onto the winner as soon as the thermometer does."""
+
+    W, L = 1, 2
+    LABELS = {1: "35°C", 2: "34°C"}
+
+    def _rows(self, with_intraday=True):
+        rows = []
+        for i in range(11):                         # 10.9h … 0.9h before close
+            htc = 10.9 - i
+            t = T0 + timedelta(hours=i)
+            intra_on = with_intraday and i >= 3     # intraday hours begin
+            iw = (.97 if i >= 4 else .40) if intra_on else None
+            il = (.02 if i >= 4 else .55) if intra_on else None
+            mkt_w = .96 if i >= 5 else .30
+            rows += [Row(t, htc, (13 + i) % 24, self.W, .19, mkt_w, iw),
+                     Row(t, htc, (13 + i) % 24, self.L, .15, 1 - mkt_w, il)]
+        return rows
+
+    def _text(self, rows):
+        return build_summary(city="Guangzhou", event_date=date(2026, 9, 24),
+                             labels=self.LABELS, winner_id=self.W, rows=rows)
+
+    def test_the_table_has_an_intraday_column(self):
+        text = self._text(self._rows())
+        table = text.split("<pre>")[1].split("</pre>")[0].splitlines()
+        assert "intra" in table[1]
+        first, last = table[3], table[-1]
+        assert first.split()[3] == "—", "no intraday estimate before its hours"
+        assert last.split()[3] == "97%"
+
+    def test_who_knew_first_includes_the_intraday_model(self):
+        text = self._text(self._rows())
+        assert "intraday: from 7h before close" in text     # 6.9h, rounded
+        assert "market: from 6h before close" in text       # 5.9h
+
+    def test_the_intraday_model_is_scored_on_its_own_hours_only(self):
+        rows = self._rows()
+        text = self._text(rows)
+        assert "Intraday hours only</b> (8h, same hours for both)" in text
+        hours = [h for h in by_hour(rows, self.W) if h.intraday_pick is not None]
+        mkt = sum(h.market_brier for h in hours) / len(hours)
+        assert f"market {mkt:.3f}" in text.split("Intraday hours only")[1]
+
+    def test_without_intraday_rows_the_summary_reads_as_before(self):
+        text = self._text(self._rows(with_intraday=False))
+        assert "intraday:" not in text and "Intraday hours only" not in text

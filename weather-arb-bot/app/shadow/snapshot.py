@@ -79,8 +79,13 @@ def _plain(obj, fields) -> SimpleNamespace:
     return SimpleNamespace(**{f: getattr(obj, f, None) for f in fields})
 
 
-def is_dead(model_p: float, market_p: Optional[float]) -> bool:
-    return model_p < DEAD_MODEL_P and (market_p is None or market_p < DEAD_MARKET_P)
+def is_dead(model_p: float, market_p: Optional[float],
+            intraday_p: Optional[float] = None) -> bool:
+    """Every side that has a view calls the bucket dead. The intraday model
+    counts: late in the day it can revive a bucket the daily model dismissed."""
+    return (model_p < DEAD_MODEL_P
+            and (market_p is None or market_p < DEAD_MARKET_P)
+            and (intraday_p is None or intraday_p < DEAD_MODEL_P))
 
 
 async def job_shadow_snapshot(
@@ -200,7 +205,7 @@ async def _record(db, now, today, hour, stats, gaps, collector) -> None:
 
             # Live order book, only for buckets not already dead on both sides
             # by the stored price — dead buckets are never worth a request.
-            candidates = [e for e in ests if not is_dead(e.model_p, e.market_p)]
+            candidates = [e for e in ests if not is_dead(e.model_p, e.market_p, e.intraday_p)]
             stats["skipped_dead"] += len(ests) - len(candidates)
             wanted = [tokens[e.outcome_id] for e in candidates if tokens.get(e.outcome_id)]
             books = await fetch_books(wanted, collector)
@@ -215,7 +220,7 @@ async def _record(db, now, today, hour, stats, gaps, collector) -> None:
                 else:
                     market_p, bid, ask, live = e.market_p, None, None, False
                     stats["stored_fallbacks"] += 1
-                if is_dead(e.model_p, market_p):
+                if is_dead(e.model_p, market_p, e.intraday_p):
                     # The live price moved it into the dead zone after all.
                     stats["skipped_dead"] += 1
                     continue
@@ -229,6 +234,7 @@ async def _record(db, now, today, hour, stats, gaps, collector) -> None:
                     n_sources=e.n_sources,
                     forecast_age_min=e.forecast_age_min,
                     forecast_high_f=e.forecast_high_f, sigma=e.sigma,
+                    intraday_p=e.intraday_p,
                 ))
                 stats["rows"] += 1
                 if market_p is not None:
@@ -304,7 +310,7 @@ async def send_pending_summaries(db, now: datetime) -> int:
             labels={o.id: o.bucket_label for o in outcomes},
             winner_id=winner.id,
             rows=[Row(s.taken_at, s.hours_to_close, s.local_hour, s.outcome_id,
-                      s.model_p, s.market_p) for s in snaps],
+                      s.model_p, s.market_p, s.intraday_p) for s in snaps],
         )
         if text and await send_shadow_text(db, text):
             sent += 1
