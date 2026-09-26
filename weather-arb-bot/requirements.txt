@@ -1,12 +1,16 @@
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
-sqlalchemy>=2.0.25
+# [asyncio] brings greenlet: SQLAlchemy 2.1 stopped installing it by default,
+# and without it alembic and the app fail on import. <2.1 keeps the series the
+# test suite runs on; moving to 2.1 is a deliberate, tested upgrade.
+sqlalchemy[asyncio]>=2.0.25,<2.1
 alembic>=1.13.1
 asyncpg>=0.29.0
 psycopg2-binary>=2.9.9
 httpx>=0.26.0
 python-telegram-bot>=20.7
-apscheduler>=3.10.4
+# 4.x is a rewrite (AsyncIOScheduler is gone) — it would break the same way.
+apscheduler>=3.10.4,<4
 beautifulsoup4>=4.12.3
 python-dotenv>=1.0.0
 pydantic>=2.5.3
