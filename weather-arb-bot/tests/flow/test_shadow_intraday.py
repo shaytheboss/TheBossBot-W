@@ -110,6 +110,15 @@ class TestTheIntradayProbability:
             rows = (await db.execute(select(ShadowSnapshot))).scalars().all()
         assert stats["rows"] == len(rows) > 0
         assert all(r.intraday_p is not None for r in rows)
+        assert stats["intraday_rows"] == len(rows), "visible on /admin/shadow/status"
+
+    @pytest.mark.asyncio
+    async def test_outside_the_intraday_hours_the_counter_stays_at_zero(self, pipeline, monkeypatch):
+        monkeypatch.setattr(est, "intraday_hour", lambda city, market, now, params: None)
+        await _world(pipeline)
+        stats = await job_shadow_snapshot(session_factory=pipeline.session,
+                                          now=datetime.now(timezone.utc), today=date.today())
+        assert stats["rows"] > 0 and stats["intraday_rows"] == 0
 
     @pytest.mark.asyncio
     async def test_without_a_metar_reading_there_is_none_and_the_row_is_kept(

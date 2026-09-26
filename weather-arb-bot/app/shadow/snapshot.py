@@ -107,7 +107,7 @@ async def job_shadow_snapshot(
              "price_job_age_min": price_job_age_min(),
              "already_done": 0, "no_forecast": 0, "errors": 0,
              "summaries_sent": 0, "digest_sent": False, "pruned": 0,
-             "past_close": 0}
+             "past_close": 0, "intraday_rows": 0}
     gaps: list[tuple] = []
 
     collector = new_collector()
@@ -237,6 +237,8 @@ async def _record(db, now, today, hour, stats, gaps, collector) -> None:
                     intraday_p=e.intraday_p,
                 ))
                 stats["rows"] += 1
+                if e.intraday_p is not None:
+                    stats["intraday_rows"] += 1
                 if market_p is not None:
                     g = (city.name, labels.get(e.outcome_id, "?"), htc, e.model_p, market_p)
                     if best_gap is None or abs(g[3] - g[4]) > abs(best_gap[3] - best_gap[4]):
