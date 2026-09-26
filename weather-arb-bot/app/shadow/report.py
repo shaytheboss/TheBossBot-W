@@ -134,7 +134,35 @@ def _sample(hours: list[Hour], n: int = MAX_TABLE_ROWS) -> list[Hour]:
 
 
 def _pct(v: Optional[float]) -> str:
-    return "   —" if v is None else f"{v * 100:3.0f}%"
+    return "-" if v is None else f"{v * 100:.0f}%"
+
+
+#: (header line 1, header line 2) per column of the hour table.
+_COLUMNS = (("hrs", "left"), ("local", ""), ("model", "win"), ("intra", "win"),
+            ("mkt", "win"), ("model", "pick"), ("mkt", "pick"))
+
+
+def _table(hours: list[Hour], label) -> list[str]:
+    """The hour-by-hour table, every column right-aligned to one width taken
+    from its header and its values together.
+
+    ASCII only: an arrow or an em dash can be drawn wider than one cell in
+    Telegram's monospace font, which is what pushed the columns out of line.
+    Widths are measured on the raw text and HTML-escaped afterwards, since
+    escaping changes the length ("<" is four characters) but not the width.
+    """
+    body = [(f"{h.hours_to_close:.1f}", f"{h.local_hour:02d}:00",
+             _pct(h.model_win), _pct(h.intraday_win), _pct(h.market_win),
+             label(h.model_pick), label(h.market_pick) if h.market_pick else "-")
+            for h in hours]
+    grid = [tuple(c[0] for c in _COLUMNS), tuple(c[1] for c in _COLUMNS)] + body
+    widths = [max(len(row[i]) for row in grid) for i in range(len(_COLUMNS))]
+    return [html.escape(" ".join(cell.rjust(w) for cell, w in zip(row, widths)))
+            for row in grid]
+
+
+def _raw_label(labels: dict, oid) -> str:
+    return (labels.get(oid) or "?").replace("°F", "").replace("°C", "C")
 
 
 def build_summary(
@@ -158,7 +186,6 @@ def build_summary(
     if not hours:
         return None
 
-    short = lambda oid: html.escape((labels.get(oid) or "?").replace("°F", "").replace("°C", "C"))
     lines = [
         f"🔬 <b>Shadow study</b> — {html.escape(city)} · {event_date.isoformat()}",
         f"Resolved: <b>{html.escape(labels.get(winner_id, '?'))}</b> · "
@@ -167,16 +194,9 @@ def build_summary(
         + (f" · {after_close} after close left out" if after_close else ""),
         "",
         "<pre>",
-        " h-left local model intra  mkt  model   mkt",
-        "              →win  →win →win   pick  pick",
+        *_table(_sample(hours), lambda oid: _raw_label(labels, oid)),
+        "</pre>",
     ]
-    for h in _sample(hours):
-        lines.append(
-            f"{h.hours_to_close:6.1f} {h.local_hour:02d}:00 {_pct(h.model_win)}"
-            f"  {_pct(h.intraday_win)} {_pct(h.market_win)}"
-            f" {short(h.model_pick):>6} {short(h.market_pick) if h.market_pick else '—':>5}"
-        )
-    lines.append("</pre>")
 
     m_from = knew_from(hours, winner_id, "model_pick")
     k_from = knew_from(hours, winner_id, "market_pick")

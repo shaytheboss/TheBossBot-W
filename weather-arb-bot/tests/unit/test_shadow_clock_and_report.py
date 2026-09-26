@@ -296,7 +296,7 @@ class TestIntradayInTheSummary:
         table = text.split("<pre>")[1].split("</pre>")[0].splitlines()
         assert "intra" in table[1]
         first, last = table[3], table[-1]
-        assert first.split()[3] == "—", "no intraday estimate before its hours"
+        assert first.split()[3] == "-", "no intraday estimate before its hours"
         assert last.split()[3] == "97%"
 
     def test_who_knew_first_includes_the_intraday_model(self):
@@ -315,3 +315,53 @@ class TestIntradayInTheSummary:
     def test_without_intraday_rows_the_summary_reads_as_before(self):
         text = self._text(self._rows(with_intraday=False))
         assert "intraday:" not in text and "Intraday hours only" not in text
+
+
+class TestTableLayout:
+    """The columns drifted out of line in Telegram: the headers were typed
+    separately from the row format, and an arrow and an em dash can be drawn
+    wider than one monospace cell."""
+
+    def _table(self, rows, labels=LABELS):
+        text = build_summary(city="X", event_date=date(2026, 9, 24),
+                             labels=labels, winner_id=C, rows=rows)
+        return text.split("<pre>")[1].split("</pre>")[0].strip("\n").splitlines()
+
+    @staticmethod
+    def _ends(line):
+        import re
+        return [m.end() for m in re.finditer(r"\S+", line)]
+
+    def _rows(self):
+        rows = []
+        for i in range(5):
+            intra = (0.97, 0.02) if i >= 2 else (None, None)
+            rows += [Row(T0 + timedelta(hours=i), 40.9 - i * 10, (7 + i) % 24, C,
+                         .31, 1.0 if i == 4 else .63, intra[0]),
+                     Row(T0 + timedelta(hours=i), 40.9 - i * 10, (7 + i) % 24, A,
+                         .2, 0.0 if i == 4 else .3, intra[1])]
+        return rows
+
+    def test_every_column_ends_where_its_header_ends(self):
+        table = self._table(self._rows())
+        header = self._ends(table[0])
+        assert len(header) == 7
+        for line in table[2:]:
+            assert self._ends(line) == header, line
+        assert len({len(line) for line in table}) == 1, "every line the same width"
+
+    def test_only_ascii_in_the_table(self):
+        """Wide glyphs are what broke the alignment; nothing outside ASCII
+        may reach the table except what a bucket label itself carries."""
+        assert all(ch.isascii() for line in self._table(self._rows()) for ch in line)
+
+    def test_escaping_does_not_shift_a_column(self):
+        """A '<' in a label becomes '&lt;' in the HTML but is still one cell."""
+        import html
+        labels = {**LABELS, C: "<95"}
+        table = [html.unescape(line) for line in self._table(self._rows(), labels)]
+        header = self._ends(table[0])
+        assert all(self._ends(line) == header for line in table[2:])
+
+    def test_it_fits_a_phone(self):
+        assert max(len(line) for line in self._table(self._rows())) <= 40

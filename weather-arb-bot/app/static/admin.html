@@ -2262,6 +2262,9 @@ async function showShadowStatus(btn) {
     else {
       s += `   last run ${L.at}: ${L.markets} markets, ${L.rows} rows written, `
          + `${L.skipped_dead} dead buckets skipped, ${L.already_done} already done this hour\n`
+         + `   intraday: ${L.intraday_rows ?? '?'} rows with an intraday estimate`
+         + ` (markets on the city's own today, from 10:00 local)   `
+         + `${L.past_close ?? 0} markets past their close skipped\n`
          + `   prices: ${L.live_prices} live from Polymarket, ${L.stored_fallbacks} fell back to stored`
          + ` (${L.book_calls} book reads; price job last ran ${L.price_job_age_min ?? '?'} min before)\n`
          + `   summaries sent: ${L.summaries_sent}   hourly digest: ${L.digest_sent ? 'yes' : 'no'}`
