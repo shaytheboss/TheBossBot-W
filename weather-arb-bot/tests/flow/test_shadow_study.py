@@ -416,7 +416,7 @@ class TestTelegram:
         msg = pipeline.telegram.only()
         assert msg.parse_mode == "HTML"
         assert "Shadow study" in msg.text and "95-96°F" in msg.text
-        assert "Who knew first" in msg.text
+        assert "Settled on the winner" in msg.text and "Chance given to the winner" in msg.text
         state = (await pipeline.rows(ShadowMarketState))[0]
         assert state.summary_sent_at is not None
 
