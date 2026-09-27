@@ -183,6 +183,12 @@ async def lifespan(app: FastAPI):
         _add_tracked_job(job_shadow_snapshot, CronTrigger(minute=5),
                          id="shadow", max_instances=1, misfire_grace_time=600)
 
+        # Daily peak times (app/peaks/) — record-only. Every 3 hours, because
+        # each city's day closes at a different UTC hour.
+        from app.peaks.job import job_record_peaks
+        _add_tracked_job(job_record_peaks, CronTrigger(hour="*/3", minute=40),
+                         id="peaks", max_instances=1, misfire_grace_time=1800)
+
         _scheduler.start()
         logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
     except Exception as e:

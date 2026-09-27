@@ -126,6 +126,9 @@ class Settings(BaseSettings):
         "ecmwf_aifs025_single,ncep_nbm_conus"
     )
 
+    # ── Daily peak times (app/peaks/) — record-only, never read by trading ──
+    peaks_enabled: bool = True
+
     # ── Shadow study (app/shadow/) ──────────────────────────────────────────
     # Hourly record of the model's estimate vs the market price for EVERY
     # bucket of every open market, on each city's own clock. Research only:
