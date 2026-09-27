@@ -117,6 +117,7 @@ def reset_module_caches():
     import app.shadow.snapshot as shadow_snapshot
     import app.intraday.detector as intraday_detector
     import app.workers.open_meteo_job as open_meteo_job
+    import app.peaks.job as peaks_job
     from app.utils import jobstats
 
     def _clear():
@@ -135,6 +136,7 @@ def reset_module_caches():
         intraday_detector._cluster_warmth_today.clear()
         jobstats.reset()
         open_meteo_job.reset_budget()
+        peaks_job.LAST_RUN.clear()
 
     _clear()
     yield

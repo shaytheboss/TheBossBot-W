@@ -2130,6 +2130,7 @@ async function loadSettings() {
       <tr><td colspan="2">
         <button class="btn" onclick="showJson(this, '/open-meteo/status', 'omOut')">📶 Open-Meteo usage today</button>
         <button class="btn" onclick="showJson(this, '/open-meteo/updates?days=3', 'omOut')">🕐 When models update</button>
+        <button class="btn" onclick="showJson(this, '/peaks', 'omOut')">🌡️ Daily peak hour per city</button>
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=1', 'omOut')">🏁 Best model per city (1 day ahead)</button>
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=0', 'omOut')">Same day</button>
         <pre id="omOut" class="small" style="white-space:pre;overflow-x:auto;max-height:480px;margin-top:8px;"></pre></td></tr>

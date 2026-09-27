@@ -2204,6 +2204,21 @@ async def admin_open_meteo_updates(
     return await update_report(db, days=days)
 
 
+@router.get("/peaks")
+async def admin_peaks(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    city: Optional[str] = Query(default=None),
+):
+    """When each city's daily high usually arrives, per month, and how often
+    it has already passed by each hour. Record-only; trading does not read it."""
+    from app.peaks.job import LAST_RUN
+    from app.peaks.report import climatology
+    out = await climatology(db, city_name=city)
+    out["last_run"] = dict(LAST_RUN) or None
+    return out
+
+
 @router.get("/models/compare")
 async def admin_models_compare(
     _: str = Depends(require_admin),
