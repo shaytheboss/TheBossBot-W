@@ -30,9 +30,6 @@ from typing import Iterable, Optional
 
 #: Telegram rejects messages over 4,096 characters.
 TELEGRAM_LIMIT = 4096
-#: Rows in the hour-by-hour table. Longer histories are sampled evenly, always
-#: keeping the first hour and the final ones, where resolution is decided.
-MAX_TABLE_ROWS = 24
 
 
 @dataclass
@@ -123,46 +120,53 @@ def knew_from(hours: list[Hour], winner_id: int, attr: str) -> Optional[float]:
     return since
 
 
-def _sample(hours: list[Hour], n: int = MAX_TABLE_ROWS) -> list[Hour]:
-    if len(hours) <= n:
-        return hours
-    tail = 6                                   # the decisive final hours, always
-    head = hours[:-tail]
-    step = len(head) / (n - tail)
-    picked = [head[int(i * step)] for i in range(n - tail)]
-    return picked + hours[-tail:]
-
-
 def _pct(v: Optional[float]) -> str:
     return "-" if v is None else f"{v * 100:.0f}%"
 
 
-#: (header line 1, header line 2) per column of the hour table.
-_COLUMNS = (("hrs", "left"), ("local", ""), ("model", "win"), ("intra", "win"),
-            ("mkt", "win"), ("model", "pick"), ("mkt", "pick"))
+#: Hours before the close at which the winner's probability is shown. A fixed
+#: grid instead of one row per snapshot: the first version printed up to 24
+#: rows and nobody could read a story out of them.
+CHECKPOINTS = (48, 24, 12, 6, 3, 1)
+_ROW_LABEL_W = 10
+_CELL_W = 5
 
 
-def _table(hours: list[Hour], label) -> list[str]:
-    """The hour-by-hour table, every column right-aligned to one width taken
-    from its header and its values together.
-
-    ASCII only: an arrow or an em dash can be drawn wider than one cell in
-    Telegram's monospace font, which is what pushed the columns out of line.
-    Widths are measured on the raw text and HTML-escaped afterwards, since
-    escaping changes the length ("<" is four characters) but not the width.
-    """
-    body = [(f"{h.hours_to_close:.1f}", f"{h.local_hour:02d}:00",
-             _pct(h.model_win), _pct(h.intraday_win), _pct(h.market_win),
-             label(h.model_pick), label(h.market_pick) if h.market_pick else "-")
-            for h in hours]
-    grid = [tuple(c[0] for c in _COLUMNS), tuple(c[1] for c in _COLUMNS)] + body
-    widths = [max(len(row[i]) for row in grid) for i in range(len(_COLUMNS))]
-    return [html.escape(" ".join(cell.rjust(w) for cell, w in zip(row, widths)))
-            for row in grid]
+def _at_checkpoint(hours: list[Hour], c: float) -> Optional[Hour]:
+    """The snapshot closest to `c` hours before the close, within an hour."""
+    near = [h for h in hours if abs(h.hours_to_close - c) <= 1.0]
+    return min(near, key=lambda h: abs(h.hours_to_close - c)) if near else None
 
 
-def _raw_label(labels: dict, oid) -> str:
-    return (labels.get(oid) or "?").replace("°F", "").replace("°C", "C")
+def _grid(hours: list[Hour], with_intraday: bool) -> list[str]:
+    """Three short rows, one column per checkpoint, ASCII only, fixed width —
+    nothing variable-length (bucket labels) goes inside it."""
+    points = [_at_checkpoint(hours, c) for c in CHECKPOINTS]
+    row = lambda name, cells: name.ljust(_ROW_LABEL_W) + "".join(x.rjust(_CELL_W) for x in cells)
+    out = [row("hours left", [f"{c}h" for c in CHECKPOINTS]),
+           row("daily", [_pct(p.model_win) if p else "-" for p in points])]
+    if with_intraday:
+        out.append(row("intraday", [_pct(p.intraday_win) if p else "-" for p in points]))
+    out.append(row("market", [_pct(p.market_win) if p else "-" for p in points]))
+    return out
+
+
+def _favourites(hours: list[Hour], attr: str, labels: dict) -> Optional[str]:
+    """How a side's favourite bucket moved: "A → B (from 12h left)"."""
+    segs: list[tuple[int, float]] = []
+    for h in hours:
+        pick = getattr(h, attr)
+        if pick is None:
+            continue
+        if not segs or segs[-1][0] != pick:
+            segs.append((pick, h.hours_to_close))
+    if not segs:
+        return None
+    parts = [html.escape(labels.get(pick, "?")) + ("" if i == 0 else f" (from {htc:.0f}h left)")
+             for i, (pick, htc) in enumerate(segs)]
+    if len(parts) > 4:
+        parts = parts[:1] + ["…"] + parts[-2:]
+    return " → ".join(parts)
 
 
 def build_summary(
@@ -180,65 +184,70 @@ def build_summary(
     forecast already looking at the next day with a price pinned at 0 or 100:
     they flipped "who knew first" and inflated the market's score.
     """
+    rows = list(rows)
     all_hours = by_hour(rows, winner_id)
     hours = [h for h in all_hours if h.hours_to_close > 0]
     after_close = len(all_hours) - len(hours)
     if not hours:
         return None
 
+    winner = html.escape(labels.get(winner_id, "?"))
+    intra_hours = [h for h in hours if h.intraday_pick is not None]
     lines = [
         f"🔬 <b>Shadow study</b> — {html.escape(city)} · {event_date.isoformat()}",
-        f"Resolved: <b>{html.escape(labels.get(winner_id, '?'))}</b> · "
-        f"tracked {hours[0].hours_to_close:.0f}h before close "
+        f"Resolved: <b>{winner}</b> · tracked {hours[0].hours_to_close:.0f}h before close "
         f"({len(hours)} snapshot{'' if len(hours) == 1 else 's'})"
         + (f" · {after_close} after close left out" if after_close else ""),
-        "",
-        "<pre>",
-        *_table(_sample(hours), lambda oid: _raw_label(labels, oid)),
-        "</pre>",
     ]
 
-    m_from = knew_from(hours, winner_id, "model_pick")
-    k_from = knew_from(hours, winner_id, "market_pick")
-    intra_hours = [h for h in hours if h.intraday_pick is not None]
-    fmt = lambda v: "never settled on it" if v is None else f"from {v:.0f}h before close"
-    lines += [
-        "<b>Who knew first</b>",
-        f"  model:  {fmt(m_from)}",
-        f"  market: {fmt(k_from)}",
-    ]
+    # Data problems first: a summary built on a broken record must say so
+    # before it shows numbers that look like a result.
+    seen = {r.outcome_id for r in rows if r.hours_to_close > 0}
+    warnings = []
+    if all(h.market_win is None and h.market_pick is None for h in hours):
+        warnings.append("no market price was recorded for this market — the market side is empty")
+    if len(labels) <= 2:
+        warnings.append(f"only {len(labels)} bucket(s) of this market are in the database — "
+                        "the model's numbers are not a full distribution")
+    elif len(seen) < len(labels) // 2:
+        warnings.append(f"only {len(seen)} of {len(labels)} buckets were ever recorded")
+    lines += [f"⚠️ {w}" for w in warnings]
+
+    lines += ["", f"<b>Chance given to the winner</b> ({winner})",
+              "<pre>", *_grid(hours, bool(intra_hours)), "</pre>"]
+    if len(labels) <= 2:
+        # With one or two buckets every side "favours" the winner by default;
+        # favourites, who-settled-first and scores would only mislead.
+        return _cap("\n".join(lines))
+
+    fav = [("daily", _favourites(hours, "model_pick", labels))]
     if intra_hours:
-        i_from = knew_from(hours, winner_id, "intraday_pick")
-        lines.append(f"  intraday: {fmt(i_from)}")
-    if m_from is not None and (k_from is None or m_from > k_from + 0.5):
-        lead = m_from - (k_from or 0.0)
-        lines.append(f"  → model led by {lead:.0f}h")
-    elif k_from is not None and (m_from is None or k_from > m_from + 0.5):
-        lines.append(f"  → market led by {k_from - (m_from or 0.0):.0f}h")
+        fav.append(("intraday", _favourites(hours, "intraday_pick", labels)))
+    fav.append(("market", _favourites(hours, "market_pick", labels)))
+    lines.append("<b>Favourite bucket</b>")
+    lines += [f"  {name}: {text or '—'}" for name, text in fav]
+
+    sides = [("daily", knew_from(hours, winner_id, "model_pick")),
+             ("market", knew_from(hours, winner_id, "market_pick"))]
+    if intra_hours:
+        sides.insert(1, ("intraday", knew_from(hours, winner_id, "intraday_pick")))
+    settled = sorted([(v, n) for n, v in sides if v is not None], reverse=True)
+    never = [n for n, v in sides if v is None]
+    first = " · ".join(f"{n} {v:.0f}h before close" for v, n in settled)
+    lines.append("<b>Settled on the winner</b>")
+    lines.append("  " + " · ".join(x for x in (first, ", ".join(never) + " never" if never else "") if x))
 
     mb = sum(h.model_brier for h in hours) / len(hours)
     kb_vals = [h.market_brier for h in hours if h.market_brier is not None]
-    mw = sum(h.model_win for h in hours) / len(hours)
-    kw_vals = [h.market_win for h in hours if h.market_win is not None]
-    lines += [
-        "",
-        "<b>Until the close</b>",
-        f"  Brier (lower=better): model {mb:.3f} · market "
-        + (f"{sum(kb_vals) / len(kb_vals):.3f}" if kb_vals else "—"),
-        f"  avg prob. on winner:  model {mw * 100:.0f}% · market "
-        + (f"{sum(kw_vals) / len(kw_vals) * 100:.0f}%" if kw_vals else "—"),
-    ]
+    lines += ["", "<b>Accuracy until the close</b> (Brier, lower = better)",
+              f"  daily {mb:.3f} · market "
+              + (f"{sum(kb_vals) / len(kb_vals):.3f}" if kb_vals else "—")]
     both = [h for h in intra_hours if h.market_brier is not None]
     if both:
         n = len(both)
-        lines += [
-            "",
-            f"<b>Intraday hours only</b> ({n}h, same hours for both)",
-            f"  Brier: intraday {sum(h.intraday_brier for h in both) / n:.3f}"
-            f" · market {sum(h.market_brier for h in both) / n:.3f}",
-            f"  avg prob. on winner: intraday {sum(h.intraday_win for h in both) / n * 100:.0f}%"
-            f" · market {sum(h.market_win for h in both) / n * 100:.0f}%",
-        ]
+        lines.append(f"  intraday hours only ({n}h): intraday "
+                     f"{sum(h.intraday_brier for h in both) / n:.3f}"
+                     f" · market {sum(h.market_brier for h in both) / n:.3f}")
     return _cap("\n".join(lines))
 
 
