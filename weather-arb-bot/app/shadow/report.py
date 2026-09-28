@@ -57,6 +57,10 @@ class Hour:
     intraday_win: Optional[float] = None
     intraday_pick: Optional[int] = None
     intraday_brier: Optional[float] = None
+    # Each side's probability on its own favourite — shown next to the pick.
+    model_pick_p: Optional[float] = None
+    market_pick_p: Optional[float] = None
+    intraday_pick_p: Optional[float] = None
 
 
 def _brier(rs: list[Row], winner_id: int, winner_missing: bool, get) -> float:
@@ -75,6 +79,7 @@ def by_hour(rows: Iterable[Row], winner_id: int) -> list[Hour]:
     hours = []
     for t in sorted(grouped):
         rs = grouped[t]
+        top_model = max(rs, key=lambda r: r.model_p)
         win = next((r for r in rs if r.outcome_id == winner_id), None)
         model_win = win.model_p if win else 0.0
 
@@ -84,6 +89,8 @@ def by_hour(rows: Iterable[Row], winner_id: int) -> list[Hour]:
                       else (0.0 if win is None and market_complete else None))
         # The intraday model estimates every bucket of a market or none.
         has_intra = all(r.intraday_p is not None for r in rs)
+        top_market = max(priced, key=lambda r: r.market_p) if priced else None
+        top_intra = max(rs, key=lambda r: r.intraday_p) if has_intra else None
 
         hours.append(Hour(
             taken_at=t,
@@ -91,16 +98,18 @@ def by_hour(rows: Iterable[Row], winner_id: int) -> list[Hour]:
             local_hour=rs[0].local_hour,
             model_win=model_win,
             market_win=market_win,
-            model_pick=max(rs, key=lambda r: r.model_p).outcome_id,
-            market_pick=max(priced, key=lambda r: r.market_p).outcome_id if priced else None,
+            model_pick=top_model.outcome_id,
+            market_pick=top_market.outcome_id if top_market else None,
             model_brier=_brier(rs, winner_id, win is None, lambda r: r.model_p),
             market_brier=(_brier(rs, winner_id, win is None, lambda r: r.market_p)
                           if market_complete else None),
             intraday_win=((win.intraday_p if win else 0.0) if has_intra else None),
-            intraday_pick=(max(rs, key=lambda r: r.intraday_p).outcome_id
-                           if has_intra else None),
+            intraday_pick=top_intra.outcome_id if top_intra else None,
             intraday_brier=(_brier(rs, winner_id, win is None, lambda r: r.intraday_p)
                             if has_intra else None),
+            model_pick_p=top_model.model_p,
+            market_pick_p=top_market.market_p if top_market else None,
+            intraday_pick_p=top_intra.intraday_p if top_intra else None,
         ))
     return hours
 
@@ -124,31 +133,81 @@ def _pct(v: Optional[float]) -> str:
     return "-" if v is None else f"{v * 100:.0f}%"
 
 
-#: Hours before the close at which the winner's probability is shown. A fixed
-#: grid instead of one row per snapshot: the first version printed up to 24
-#: rows and nobody could read a story out of them.
-CHECKPOINTS = (48, 24, 12, 6, 3, 1)
-_ROW_LABEL_W = 10
-_CELL_W = 5
+#: Every snapshot in the last HOURLY_WINDOW hours before the close is a row;
+#: earlier ones only every EARLY_STEP hours, so a 70-hour record stays short
+#: enough to read on a phone.
+HOURLY_WINDOW = 48
+EARLY_STEP = 6
 
 
-def _at_checkpoint(hours: list[Hour], c: float) -> Optional[Hour]:
-    """The snapshot closest to `c` hours before the close, within an hour."""
-    near = [h for h in hours if abs(h.hours_to_close - c) <= 1.0]
-    return min(near, key=lambda h: abs(h.hours_to_close - c)) if near else None
+def short_label(label: Optional[str]) -> str:
+    """A bucket in at most a few ASCII characters: "83-84", "76-" (or below),
+    "87+" (or higher), "35C". Long labels are what broke the first table."""
+    if not label:
+        return "?"
+    t = label.replace("°F", "").replace("°C", "C").strip()
+    low = t.lower()
+    for words, sign in ((" or below", "-"), (" or lower", "-"), (" or higher", "+"),
+                        (" or above", "+")):
+        if low.endswith(words):
+            return t[: len(t) - len(words)].strip() + sign
+    return t.replace(" ", "")
 
 
-def _grid(hours: list[Hour], with_intraday: bool) -> list[str]:
-    """Three short rows, one column per checkpoint, ASCII only, fixed width —
-    nothing variable-length (bucket labels) goes inside it."""
-    points = [_at_checkpoint(hours, c) for c in CHECKPOINTS]
-    row = lambda name, cells: name.ljust(_ROW_LABEL_W) + "".join(x.rjust(_CELL_W) for x in cells)
-    out = [row("hours left", [f"{c}h" for c in CHECKPOINTS]),
-           row("daily", [_pct(p.model_win) if p else "-" for p in points])]
-    if with_intraday:
-        out.append(row("intraday", [_pct(p.intraday_win) if p else "-" for p in points]))
-    out.append(row("market", [_pct(p.market_win) if p else "-" for p in points]))
+def table_rows(hours: list[Hour]) -> list[Hour]:
+    """Hourly inside the last HOURLY_WINDOW hours, every EARLY_STEP before."""
+    out, seen_early = [], set()
+    for h in hours:
+        if h.hours_to_close <= HOURLY_WINDOW + 0.5:
+            out.append(h)
+            continue
+        whole = int(h.hours_to_close)
+        slot = whole // EARLY_STEP
+        if whole % EARLY_STEP == 0 and slot not in seen_early:
+            seen_early.add(slot)
+            out.append(h)
     return out
+
+
+def _cell(pick: Optional[int], p: Optional[float], labels: dict, winner_id: int, w: int) -> str:
+    """Always exactly w + 5 characters: label, winner mark, confidence."""
+    if pick is None:
+        return "-".rjust(w) + " " + " " * 4
+    mark = "*" if pick == winner_id else " "
+    return short_label(labels.get(pick)).rjust(w) + mark + (_pct(p).rjust(4) if p is not None else " " * 4)
+
+
+def _hourly(hours: list[Hour], labels: dict, winner_id: int, with_intraday: bool) -> list[str]:
+    """One row per hour: which bucket each side favoured, and how strongly.
+
+    Picks, not probabilities, are the comparison: the model spreads its
+    probability over many buckets, while a market price runs to 100% as the
+    day is decided — 29% against 100% does not mean the model was wrong.
+    "*" marks the bucket that won.
+    """
+    rows = table_rows(hours)
+    picks = [lbl for h in rows for lbl in (h.model_pick, h.market_pick, h.intraday_pick)
+             if lbl is not None]
+    w = max([len(short_label(labels.get(x))) for x in picks] + [5])
+    sides = [("daily", "model_pick", "model_pick_p")]
+    if with_intraday:
+        sides.append(("intraday", "intraday_pick", "intraday_pick_p"))
+    sides.append(("market", "market_pick", "market_pick_p"))
+    col = w + 5
+    # The header's column names sit over the label, left-aligned to the cell.
+    head = "left hr " + " ".join(name.ljust(col) for name, _, _ in sides)
+    out = [head.rstrip()]
+    for h in rows:
+        line = f"{h.hours_to_close:3.0f}h {h.local_hour:02d} "
+        line += " ".join(_cell(getattr(h, a), getattr(h, pa), labels, winner_id, w)
+                         for _, a, pa in sides)
+        out.append(html.escape(line.rstrip()))
+    return out
+
+
+def _right_hours(hours: list[Hour], attr: str, winner_id: int) -> tuple[int, int]:
+    seen = [h for h in hours if getattr(h, attr) is not None]
+    return sum(1 for h in seen if getattr(h, attr) == winner_id), len(seen)
 
 
 def _favourites(hours: list[Hour], attr: str, labels: dict) -> Optional[str]:
@@ -213,8 +272,8 @@ def build_summary(
         warnings.append(f"only {len(seen)} of {len(labels)} buckets were ever recorded")
     lines += [f"⚠️ {w}" for w in warnings]
 
-    lines += ["", f"<b>Chance given to the winner</b> ({winner})",
-              "<pre>", *_grid(hours, bool(intra_hours)), "</pre>"]
+    lines += ["", "<b>Favourite bucket, hour by hour</b> (* = the winner, % = that side's own confidence)",
+              "<pre>", *_hourly(hours, labels, winner_id, bool(intra_hours)), "</pre>"]
     if len(labels) <= 2:
         # With one or two buckets every side "favours" the winner by default;
         # favourites, who-settled-first and scores would only mislead.
@@ -237,17 +296,18 @@ def build_summary(
     lines.append("<b>Settled on the winner</b>")
     lines.append("  " + " · ".join(x for x in (first, ", ".join(never) + " never" if never else "") if x))
 
-    mb = sum(h.model_brier for h in hours) / len(hours)
-    kb_vals = [h.market_brier for h in hours if h.market_brier is not None]
-    lines += ["", "<b>Accuracy until the close</b> (Brier, lower = better)",
-              f"  daily {mb:.3f} · market "
-              + (f"{sum(kb_vals) / len(kb_vals):.3f}" if kb_vals else "—")]
-    both = [h for h in intra_hours if h.market_brier is not None]
-    if both:
-        n = len(both)
-        lines.append(f"  intraday hours only ({n}h): intraday "
-                     f"{sum(h.intraday_brier for h in both) / n:.3f}"
-                     f" · market {sum(h.market_brier for h in both) / n:.3f}")
+    # Hours on the right bucket — a comparison that does not depend on how
+    # each side scales its probabilities.
+    d_ok, d_n = _right_hours(hours, "model_pick", winner_id)
+    m_ok, m_n = _right_hours(hours, "market_pick", winner_id)
+    lines += ["", "<b>Hours on the winning bucket</b>",
+              f"  daily {d_ok}/{d_n} · market {m_ok}/{m_n}"]
+    if intra_hours:
+        same = [h for h in intra_hours if h.market_pick is not None]
+        i_ok, _ = _right_hours(same, "intraday_pick", winner_id)
+        mk_ok, _ = _right_hours(same, "market_pick", winner_id)
+        lines.append(f"  intraday hours only ({len(same)}h): intraday {i_ok}/{len(same)}"
+                     f" · market {mk_ok}/{len(same)}")
     return _cap("\n".join(lines))
 
 
