@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.city import City
-from app.models.market import Market, MarketOutcome
+from app.models.market import Market, MarketOutcome, MarketPrice
 from app.models.metar import MetarObservation
 from app.models.opportunity import Opportunity
 from app.models.alert import Alert, TelegramUser
@@ -2202,6 +2202,58 @@ async def admin_open_meteo_updates(
     """When each model's numbers actually changed — the hours new runs land."""
     from app.workers.open_meteo_job import update_report
     return await update_report(db, days=days)
+
+
+@router.get("/markets/duplicates")
+async def admin_duplicate_markets(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=10, ge=1, le=60),
+):
+    """Cities with more than one market on the same day — each with its
+    question, Polymarket slug, bucket count and whether a price was ever
+    collected. New York and London showed a second, never-priced 7-bucket
+    market every day, which the shadow study then scored as if it were the
+    city's own. Reads markets and outcomes; one indexed MAX per market for
+    the last price."""
+    since = date_cls.today() - timedelta(days=days)
+    markets = (await db.execute(
+        select(Market.id, Market.city_id, Market.event_date, Market.external_id,
+               Market.question, Market.resolved)
+        .where(Market.event_date >= since)
+        .order_by(Market.event_date, Market.city_id, Market.id)
+    )).all()
+    groups: dict = {}
+    for m in markets:
+        groups.setdefault((m.city_id, m.event_date), []).append(m)
+    dup = {k: v for k, v in groups.items() if len(v) > 1}
+    city_names = dict((await db.execute(select(City.id, City.name))).all())
+    out = []
+    for (city_id, event_date), ms in sorted(dup.items(), key=lambda kv: (kv[0][1], city_names.get(kv[0][0], ""))):
+        rows = []
+        for m in ms:
+            outcome_ids = [r[0] for r in (await db.execute(
+                select(MarketOutcome.id).where(MarketOutcome.market_id == m.id))).all()]
+            with_token = (await db.execute(
+                select(func.count(MarketOutcome.id)).where(
+                    MarketOutcome.market_id == m.id, MarketOutcome.token_id.isnot(None))
+            )).scalar() or 0
+            last_price = None
+            if outcome_ids:
+                last_price = (await db.execute(
+                    select(func.max(MarketPrice.timestamp)).where(
+                        MarketPrice.outcome_id.in_(outcome_ids))
+                )).scalar()
+            rows.append({
+                "market_id": m.id, "question": m.question, "slug": m.external_id,
+                "link": f"https://polymarket.com/event/{m.external_id}",
+                "buckets": len(outcome_ids), "buckets_with_token": with_token,
+                "last_price_at": last_price.isoformat() if last_price else None,
+                "resolved": bool(m.resolved),
+            })
+        out.append({"city": city_names.get(city_id, str(city_id)),
+                    "event_date": event_date.isoformat(), "markets": rows})
+    return {"days": days, "city_days_with_several_markets": len(out), "groups": out}
 
 
 @router.get("/peaks")
