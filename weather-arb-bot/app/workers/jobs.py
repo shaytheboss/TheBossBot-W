@@ -262,6 +262,41 @@ async def _refresh_outcome_bounds(db: AsyncSession, market: Market, raw_markets:
     return updated
 
 
+#: A market's own end date may sit a day or so after its event day (it closes
+#: the next morning in some zones); anything further off is a different event.
+EVENT_END_TOLERANCE_DAYS = 3
+
+
+def _event_end(event: dict) -> Optional[datetime]:
+    end_str = event.get("endDate") or event.get("end_date_iso")
+    if not end_str:
+        return None
+    try:
+        return datetime.fromisoformat(str(end_str).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _is_stale_event(event: dict, target_date: date) -> bool:
+    """True for an event that is not the one on `target_date` — in practice
+    last year's.
+
+    Polymarket's 2025 slugs had no year ("...-on-september-26"); 2026's end
+    in "-2026". _parse_date gives a year-less slug the current year, so the
+    slug probe re-found every 2025 New York and London market and stored it
+    under the 2026 date: never priced (closed a year ago), resolved with
+    2025's winner, and scored by the shadow study and model_skill as if it
+    were today's. The event's own end date and closed flag say which year it
+    really is.
+    """
+    if event.get("closed") is True:
+        return True       # ingest only takes today or later: a closed one is old
+    end = _event_end(event)
+    if end is not None and abs((end.date() - target_date).days) > EVENT_END_TOLERANCE_DAYS:
+        return True
+    return False
+
+
 async def _ingest_event(event: dict, city: City, db: AsyncSession) -> tuple[int, int]:
     slug = event.get("slug")
     if not slug:
@@ -285,14 +320,12 @@ async def _ingest_event(event: dict, city: City, db: AsyncSession) -> tuple[int,
     today = date.today()
     if target_date < today or target_date > today + timedelta(days=FORECAST_DAYS_AHEAD):
         return 0, 0
+    if _is_stale_event(event, target_date):
+        logger.info(f"Skipping stale event {slug}: ends {event.get('endDate')}, "
+                    f"closed={event.get('closed')}, parsed date {target_date}")
+        return 0, 0
 
-    end_str = event.get("endDate") or event.get("end_date_iso")
-    resolution_time: Optional[datetime] = None
-    if end_str:
-        try:
-            resolution_time = datetime.fromisoformat(str(end_str).replace("Z", "+00:00"))
-        except ValueError:
-            pass
+    resolution_time = _event_end(event)
 
     market = Market(
         city_id=city.id,

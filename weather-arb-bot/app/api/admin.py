@@ -2148,7 +2148,13 @@ async def admin_shadow_csv(
         select(ShadowSnapshot, MarketOutcome.bucket_label, MarketOutcome.won, City.name)
         .join(MarketOutcome, MarketOutcome.id == ShadowSnapshot.outcome_id)
         .join(City, City.id == ShadowSnapshot.city_id)
-        .where(ShadowSnapshot.taken_at >= cutoff)
+        # A market whose date was corrected (last year's New York / London
+        # events stored under this year's date — migration 028) no longer
+        # matches the date its snapshots were taken for: leave those rows out
+        # of the export. They are kept in the table, not deleted.
+        .join(Market, Market.id == ShadowSnapshot.market_id)
+        .where(ShadowSnapshot.taken_at >= cutoff,
+               Market.event_date == ShadowSnapshot.event_date)
         .order_by(ShadowSnapshot.taken_at)
     )
     fields = ["taken_at", "city", "event_date", "market_id", "outcome_id", "bucket",
