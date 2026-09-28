@@ -13,7 +13,7 @@ import pytest
 
 from app.shadow.clock import hour_floor, hours_to_close, local_close_utc, local_hour
 from app.shadow.report import (
-    CHECKPOINTS, TELEGRAM_LIMIT, Row, build_hourly_digest, build_summary,
+    EARLY_STEP, HOURLY_WINDOW, TELEGRAM_LIMIT, Row, build_hourly_digest, build_summary,
     by_hour, knew_from,
 )
 from app.shadow.snapshot import DEAD_MARKET_P, DEAD_MODEL_P, is_dead
@@ -156,22 +156,23 @@ class TestSummaryMessage:
         text = build_summary(city="Austin", event_date=date(2026, 9, 24),
                              labels=LABELS, winner_id=C, rows=self._rows(5))
         assert "Austin" in text and "95-96°F" in text
-        assert "Settled on the winner" in text and "Brier" in text
+        assert "Settled on the winner" in text and "Hours on the winning bucket" in text
 
     def test_nothing_to_report_is_none(self):
         assert build_summary(city="X", event_date=date(2026, 9, 24),
                              labels=LABELS, winner_id=C, rows=[]) is None
 
-    def test_a_long_history_is_a_short_grid(self):
-        """72 hourly snapshots become one row per side, six checkpoints wide —
-        the old one-row-per-snapshot table could not be read."""
+    def test_a_long_history_is_hourly_near_the_close_and_sparser_before(self):
+        """72 snapshots: one row an hour for the last 48, one every 6 before."""
         rows = [Row(r.taken_at, r.hours_to_close + 48, r.local_hour, r.outcome_id,
                     r.model_p, r.market_p) for r in self._rows(72)]
         text = build_summary(city="Austin", event_date=date(2026, 9, 24),
                              labels=LABELS, winner_id=C, rows=rows)
-        grid = text.split("<pre>")[1].split("</pre>")[0].strip().splitlines()
-        assert [ln.split()[0] for ln in grid] == ["hours", "daily", "market"]
-        assert grid[0].split()[2:] == [f"{c}h" for c in CHECKPOINTS]
+        table = text.split("<pre>")[1].split("</pre>")[0].strip().splitlines()[1:]
+        lefts = [int(ln.split()[0].rstrip("h")) for ln in table]
+        assert lefts[-HOURLY_WINDOW:] == list(range(HOURLY_WINDOW, 0, -1))
+        early = lefts[:-HOURLY_WINDOW]
+        assert early == [72, 66, 60, 54]      # every EARLY_STEP hours
 
     def test_user_text_is_escaped(self):
         """Bucket labels come from Polymarket. A stray '<' would make Telegram
@@ -286,12 +287,13 @@ class TestIntradayInTheSummary:
         return build_summary(city="Guangzhou", event_date=date(2026, 9, 24),
                              labels=self.LABELS, winner_id=self.W, rows=rows)
 
-    def test_the_grid_has_an_intraday_row(self):
+    def test_the_table_has_an_intraday_column(self):
         text = self._text(self._rows())
-        grid = text.split("<pre>")[1].split("</pre>")[0].strip().splitlines()
-        intra = next(ln for ln in grid if ln.startswith("intraday")).split()[1:]
-        # checkpoints 48 24 12 6 3 1 → tracked from 10.9h; intraday from 7.9h
-        assert intra == ["-", "-", "-", "97%", "97%", "97%"]
+        table = text.split("<pre>")[1].split("</pre>")[0].strip().splitlines()
+        assert "intraday" in table[0]
+        first, last = table[1], table[-1]          # 10.9h (before intraday) and 0.9h
+        assert first.split()[4] == "-", "no intraday estimate before its hours"
+        assert "35C* 97%" in last
 
     def test_who_knew_first_includes_the_intraday_model(self):
         text = self._text(self._rows())
@@ -301,64 +303,72 @@ class TestIntradayInTheSummary:
     def test_the_intraday_model_is_scored_on_its_own_hours_only(self):
         rows = self._rows()
         text = self._text(rows)
-        assert "intraday hours only (8h)" in text
-        hours = [h for h in by_hour(rows, self.W) if h.intraday_pick is not None]
-        mkt = sum(h.market_brier for h in hours) / len(hours)
-        assert f"market {mkt:.3f}" in text.split("intraday hours only")[1]
+        # 8 intraday hours: intraday on the winner in 7 (from 6.9h), market in 6.
+        assert "intraday hours only (8h): intraday 7/8 · market 6/8" in text
 
     def test_without_intraday_rows_the_summary_reads_as_before(self):
         text = self._text(self._rows(with_intraday=False))
         assert "intraday" not in text
 
 
-class TestGridLayout:
-    """The first table drifted out of line in Telegram and ran to 24 rows.
-    The grid has fixed-width cells, nothing variable-length inside it, and
-    one row per side."""
+class TestHourlyTable:
+    """One row per hour with each side's favourite bucket. The earlier tables
+    drifted out of line (long labels) and compared probabilities that do not
+    mean the same thing on both sides."""
 
-    def _grid(self, rows, labels=LABELS):
+    def _table(self, rows, labels=LABELS):
         text = build_summary(city="X", event_date=date(2026, 9, 24),
                              labels=labels, winner_id=C, rows=rows)
         return text.split("<pre>")[1].split("</pre>")[0].strip("\n").splitlines()
 
-    @staticmethod
-    def _ends(line):
-        import re
-        return [m.end() for m in re.finditer(r"\S+", line)]
-
-    def _rows(self):
+    def _rows(self, n=20, with_intra=True):
         rows = []
-        for i in range(48):
-            htc = 47.9 - i
-            intra = (0.97, 0.02) if htc < 10 else (None, None)
-            rows += [Row(T0 + timedelta(hours=i), htc, i % 24, C, .31, .63, intra[0]),
-                     Row(T0 + timedelta(hours=i), htc, i % 24, A, .2, .3, intra[1])]
+        for i in range(n):
+            htc = n - 0.1 - i
+            intra = (0.6, 0.3) if (with_intra and htc < 10) else (None, None)
+            rows += [Row(T0 + timedelta(hours=i), htc, i % 24, C, .2 + i * .01, .5, intra[0]),
+                     Row(T0 + timedelta(hours=i), htc, i % 24, A, .3, .3, intra[1])]
         return rows
 
-    def test_every_value_ends_where_its_checkpoint_ends(self):
-        grid = self._grid(self._rows())
-        header = self._ends(grid[0])[2:]          # skip "hours left" (two words)
-        assert len(header) == len(CHECKPOINTS)
-        for line in grid[1:]:
-            assert self._ends(line)[1:] == header, line
+    def test_the_winner_is_marked_and_the_confidence_shown(self):
+        last = self._table(self._rows())[-1]
+        assert "95-96*" in last and "50%" in last
 
-    def test_long_bucket_labels_never_enter_the_grid(self):
-        labels = {**LABELS, C: "76°F or below", A: "a very long bucket name"}
-        grid = self._grid(self._rows(), labels)
-        assert not any("below" in ln or "long" in ln for ln in grid)
+    def test_a_wrong_favourite_has_no_mark(self):
+        first = self._table(self._rows())[1]
+        assert "91-92 " in first and "91-92*" not in first
 
-    def test_only_ascii_in_the_grid(self):
-        assert all(ch.isascii() for line in self._grid(self._rows()) for ch in line)
+    def test_every_row_has_the_same_width_even_with_an_empty_cell(self):
+        """Rows before the intraday hours have "-" in the middle column; the
+        market column must still start where it does in every other row."""
+        table = self._table(self._rows())[1:]
+        assert any(" - " in ln or ln.split()[4] == "-" for ln in table)
+        assert len({len(ln) for ln in table}) == 1, {len(ln) for ln in table}
 
-    def test_it_fits_a_phone(self):
-        assert max(len(line) for line in self._grid(self._rows())) <= 40
+    def test_long_labels_are_shortened(self):
+        labels = {**LABELS, C: "87°F or higher", A: "76°F or below"}
+        table = self._table(self._rows(), labels)
+        assert any("87+" in ln for ln in table) and any("76-" in ln for ln in table)
+        assert not any("higher" in ln or "below" in ln for ln in table)
 
-    def test_a_checkpoint_with_no_snapshot_is_a_dash(self):
-        """Tracked from 11.9h only: 48h and 24h have nothing to show; 12h is
-        taken from the 11.9h snapshot (within an hour)."""
-        rows = [r for r in self._rows() if r.hours_to_close < 12.5]
-        daily = next(ln for ln in self._grid(rows) if ln.startswith("daily")).split()[1:]
-        assert daily[:2] == ["-", "-"] and daily[2] == "31%"
+    def test_only_ascii_and_fits_a_phone(self):
+        table = self._table(self._rows())
+        assert all(ch.isascii() for ln in table for ch in ln)
+        assert max(len(ln) for ln in table) <= 42
+
+    def test_without_intraday_there_is_no_intraday_column(self):
+        assert "intraday" not in self._table(self._rows(with_intra=False))[0]
+
+
+class TestShortLabels:
+    @pytest.mark.parametrize("label,short", [
+        ("83-84°F", "83-84"), ("76°F or below", "76-"), ("87°F or higher", "87+"),
+        ("35°C", "35C"), ("25°C or below", "25C-"), ("32°C or higher", "32C+"),
+        (None, "?"),
+    ])
+    def test_short_label(self, label, short):
+        from app.shadow.report import short_label
+        assert short_label(label) == short
 
 
 class TestBrokenRecordsAreFlagged:
@@ -379,7 +389,7 @@ class TestBrokenRecordsAreFlagged:
                              labels={C: "76°F or below"}, winner_id=C,
                              rows=self._rows(market_p=.5))
         assert "only 1 bucket(s)" in text
-        assert "Settled on the winner" not in text and "Brier" not in text
+        assert "Settled on the winner" not in text and "Hours on the winning bucket" not in text
 
     def test_most_buckets_never_recorded_is_flagged(self):
         labels = {i: f"{i}°F" for i in range(1, 11)}
@@ -396,18 +406,19 @@ class TestBrokenRecordsAreFlagged:
         assert "⚠️" not in text
 
 
-class TestCheckpointsAndOrder:
-    def test_a_snapshot_two_hours_off_is_not_a_checkpoint(self):
-        """A cell shows the snapshot within an hour of its checkpoint, or
-        nothing — never a reading from a different part of the day."""
-        rows = _hour(0, {A: (.3, .4), B: (.1, .1), C: (.6, .5)})
-        rows = [Row(r.taken_at, 22.0, r.local_hour, r.outcome_id, r.model_p, r.market_p)
-                for r in rows]
+class TestComparisonAndOrder:
+    def test_the_pick_comparison_counts_hours(self):
+        """Market on the winner for 8 of 12 hours, daily for 3."""
+        rows = []
+        for i in range(12):
+            htc = 11.5 - i
+            rows += [Row(T0 + timedelta(hours=i), htc, i, C, .6 if htc <= 3 else .2,
+                         .7 if htc <= 8 else .2),
+                     Row(T0 + timedelta(hours=i), htc, i, A, .4 if htc <= 3 else .7,
+                         .2 if htc <= 8 else .7)]
         text = build_summary(city="X", event_date=date(2026, 9, 24),
                              labels=LABELS, winner_id=C, rows=rows)
-        grid = text.split("<pre>")[1].split("</pre>")[0].strip().splitlines()
-        daily = next(ln for ln in grid if ln.startswith("daily")).split()[1:]
-        assert daily == ["-"] * len(CHECKPOINTS)
+        assert "daily 3/12 · market 8/12" in text
 
     def test_whoever_settled_first_is_named_first(self):
         rows = []
