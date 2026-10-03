@@ -32,7 +32,8 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from typing import AsyncIterator, Callable, Iterable
+import zipfile
+from typing import AsyncIterator, Callable, Iterable, Optional
 
 from fastapi.responses import StreamingResponse
 
@@ -57,17 +58,62 @@ def _drain(buf: io.StringIO) -> str:
     return text
 
 
+class _ZipSink(io.RawIOBase):
+    """Write-only, unseekable byte sink: ZipFile writes into it, the stream
+    takes whatever has accumulated. ZipFile handles unseekable output by
+    writing data descriptors after each member, so nothing is buffered beyond
+    one compressed chunk."""
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b) -> int:
+        self.buf += b
+        return len(b)
+
+    def take(self) -> bytes:
+        out = bytes(self.buf)
+        self.buf.clear()
+        return out
+
+
+async def zip_stream(text_chunks: AsyncIterator[str], inner_name: str) -> AsyncIterator[bytes]:
+    """Compress a stream of text chunks into a one-file .zip, as it goes.
+
+    For downloads too big to upload from a phone: a CSV of hourly snapshots
+    shrinks about tenfold.
+    """
+    sink = _ZipSink()
+    zf = zipfile.ZipFile(sink, mode="w", compression=zipfile.ZIP_DEFLATED)
+    member = zf.open(inner_name, mode="w", force_zip64=True)
+    async for chunk in text_chunks:
+        member.write(chunk.encode("utf-8"))
+        data = sink.take()
+        if data:
+            yield data
+    member.close()
+    zf.close()
+    tail = sink.take()
+    if tail:
+        yield tail
+
+
 async def stream_csv(
     filename: str,
     fieldnames: Iterable[str],
     row_source: Callable[[object], AsyncIterator[dict]],
     *,
     chunk_bytes: int = CHUNK_BYTES,
+    zipped: bool = False,
 ) -> StreamingResponse:
     """Build a CSV download that streams.
 
     `row_source` is called with a live `AsyncSession` and must be an async
-    generator yielding one dict per CSV row.
+    generator yielding one dict per CSV row. `zipped` sends it compressed as
+    `<filename>.zip`, still streaming.
     """
     fields = list(fieldnames)
 
@@ -93,6 +139,12 @@ async def stream_csv(
             yield _drain(buf)
             yield f"\n# EXPORT FAILED: {type(exc).__name__}: {exc}\n"
 
+    if zipped:
+        return StreamingResponse(
+            zip_stream(generate(), filename),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={filename}.zip"},
+        )
     return StreamingResponse(
         generate(),
         media_type="text/csv",
