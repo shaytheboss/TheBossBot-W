@@ -123,6 +123,8 @@ class SettingsIn(BaseModel):
     shadow_enabled: Optional[bool] = None
     shadow_alert_mode: Optional[str] = None
     intraday_min_entry_cost: Optional[float] = None
+    intraday_peak_guard_enabled: Optional[bool] = None
+    intraday_peak_guard_min_passed: Optional[float] = None
     model_fetch_mode: Optional[str] = None
     open_meteo_extra_models: Optional[str] = None
     open_meteo_hrrr_half_hourly: Optional[bool] = None
@@ -2263,6 +2265,54 @@ async def admin_duplicate_markets(
     return {"days": days, "city_days_with_several_markets": len(out), "groups": out}
 
 
+@router.get("/intraday/peak-guard")
+async def admin_peak_guard_report(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=60, ge=1, le=365),
+):
+    """What the peak guard would have done: intraday opportunities since it
+    started recording, split by whether it would have blocked the buy, with
+    how the settled ones ended. Reads only the columns it needs."""
+    from app.models.intraday import IntradayOpportunity
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = (await db.execute(
+        select(IntradayOpportunity.signals, IntradayOpportunity.virtual_status,
+               IntradayOpportunity.virtual_pnl, IntradayOpportunity.outcome)
+        .where(IntradayOpportunity.detected_at >= since)
+    )).all()
+    groups = {"would_block": [], "would_allow": [], "no_peak_data": []}
+    for sig, vstatus, vpnl, outcome in rows:
+        sig = sig or {}
+        if "_peak_guard_would_block" not in sig:
+            continue                      # recorded before the guard existed
+        key = ("no_peak_data" if sig.get("_peak_passed_share") is None
+               else "would_block" if sig.get("_peak_guard_would_block") else "would_allow")
+        groups[key].append((vstatus, vpnl, outcome))
+
+    def summary(items):
+        alerts_settled = [(o or "").upper() for _, _, o in items if (o or "").upper() in ("WIN", "LOSS")]
+        buys = [(s, p) for s, p, _ in items if s in ("win", "loss")]
+        return {
+            "opportunities": len(items),
+            "alerts_settled": len(alerts_settled),
+            "alert_win_rate": (round(sum(o == "WIN" for o in alerts_settled) / len(alerts_settled), 3)
+                               if alerts_settled else None),
+            "buys_settled": len(buys),
+            "buy_win_rate": round(sum(s == "win" for s, _ in buys) / len(buys), 3) if buys else None,
+            "buy_pnl": round(sum(float(p or 0) for _, p in buys), 2),
+        }
+    return {
+        "enabled": bool(getattr(settings, "intraday_peak_guard_enabled", False)),
+        "min_passed": float(getattr(settings, "intraday_peak_guard_min_passed", 0.5)),
+        "days": days,
+        **{k: summary(v) for k, v in groups.items()},
+        "note": ("would_block = fewer than min_passed of the city's days that month had "
+                 "peaked by the hour of the signal. While the guard is off these buys "
+                 "still happen, so their results show what blocking them would have saved."),
+    }
+
+
 @router.get("/peaks")
 async def admin_peaks(
     _: str = Depends(require_admin),
@@ -2445,6 +2495,8 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "shadow_enabled": getattr(settings, "shadow_enabled", True),
         "shadow_alert_mode": getattr(settings, "shadow_alert_mode", "summary"),
         "intraday_min_entry_cost": getattr(settings, "intraday_min_entry_cost", 0.70),
+        "intraday_peak_guard_enabled": getattr(settings, "intraday_peak_guard_enabled", False),
+        "intraday_peak_guard_min_passed": getattr(settings, "intraday_peak_guard_min_passed", 0.5),
         "model_fetch_mode": getattr(settings, "model_fetch_mode", "batched"),
         "open_meteo_extra_models": getattr(settings, "open_meteo_extra_models", ""),
         "open_meteo_hrrr_half_hourly": getattr(settings, "open_meteo_hrrr_half_hourly", True),
@@ -2527,6 +2579,11 @@ async def admin_set_settings(
     if payload.intraday_min_entry_cost is not None:
         _validate_unit(payload.intraday_min_entry_cost, "intraday_min_entry_cost")
         changed["intraday_min_entry_cost"] = payload.intraday_min_entry_cost
+    if payload.intraday_peak_guard_enabled is not None:
+        changed["intraday_peak_guard_enabled"] = bool(payload.intraday_peak_guard_enabled)
+    if payload.intraday_peak_guard_min_passed is not None:
+        _validate_unit(payload.intraday_peak_guard_min_passed, "intraday_peak_guard_min_passed")
+        changed["intraday_peak_guard_min_passed"] = payload.intraday_peak_guard_min_passed
 
     # ── Open-Meteo ────────────────────────────────────────────────────────
     if payload.model_fetch_mode is not None:
