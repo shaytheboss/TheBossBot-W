@@ -177,6 +177,9 @@ class TestBoundary:
             if "app.peaks" in p.read_text(encoding="utf-8")
             and not str(p.relative_to(app_dir)).startswith("peaks")
         }
+        # app/research/ is read-only and itself never imported by trading
+        # code (tests/flow/test_research.py), so it may read the peaks table.
+        importers = {p for p in importers if not p.startswith("research/")}
         assert importers <= {"main.py", "api/admin.py", "intraday/detector.py"}, importers
         det = (app_dir / "intraday" / "detector.py").read_text(encoding="utf-8")
         imports = [ln.strip() for ln in det.splitlines() if "app.peaks" in ln and "import" in ln]
