@@ -2265,6 +2265,36 @@ async def admin_duplicate_markets(
     return {"days": days, "city_days_with_several_markets": len(out), "groups": out}
 
 
+@router.get("/research/city-performance")
+async def admin_city_performance(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    since: date_cls = Query(default=date_cls(2026, 10, 4)),
+):
+    """Per-city results for trades detected on or after `since` — the
+    forward test of whether a city really beats the price."""
+    from app.research.performance import city_performance
+    return await city_performance(db, since)
+
+
+@router.get("/research/models-vs-actual.csv")
+async def admin_models_vs_actual_csv(
+    _: str = Depends(require_admin),
+    days: int = Query(default=120, ge=7, le=400),
+    zipped: bool = Query(default=False),
+):
+    """Every model's forecast (0-3 days ahead) beside the settled bucket and
+    the METAR high, per city and day. City by city, so memory stays flat."""
+    from app.research.models_vs_actual import fieldnames, rows
+    from app.utils.csv_stream import stream_csv
+
+    async def rows_for(session):
+        async for r in rows(session, days):
+            yield r
+
+    return await stream_csv("models_vs_actual.csv", fieldnames(), rows_for, zipped=zipped)
+
+
 @router.get("/intraday/peak-guard")
 async def admin_peak_guard_report(
     _: str = Depends(require_admin),
