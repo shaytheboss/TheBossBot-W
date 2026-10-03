@@ -150,6 +150,8 @@
         <button class="btn small" onclick="downloadServerCsv('/shadow/csv', 'shadow', this)" title="Every hourly shadow-study snapshot: model vs market per bucket, on each city's clock, with the outcome once resolved">⬇ Shadow study CSV</button>
         <button class="btn small" onclick="downloadServerCsv('/shadow/csv?zipped=true', 'shadow', this, 'zip')" title="The same file compressed (about 10x smaller) — easy to upload from a phone">⬇ Shadow study (ZIP, small)</button>
         <button class="btn small" onclick="showShadowStatus(this)" title="What the last hourly shadow run recorded, and how large the table is">🔬 Shadow status</button>
+        <button class="btn small" onclick="showCityPerformance(this)" title="Per-city results since a date you choose — the forward test">📈 Cities since…</button>
+        <button class="btn small" onclick="downloadServerCsv('/research/models-vs-actual.csv?zipped=true', 'models-vs-actual', this, 'zip')" title="Every model's forecast next to the settled bucket and the measured high, per city and day (ZIP)">⬇ Models vs actual (ZIP)</button>
         <button class="btn small" onclick="showDuplicateMarkets(this)" title="Cities with more than one market on the same day, with each market's name, link and whether it ever got a price">🔎 Duplicate markets</button>
       </h3>
       <p class="small">One row per settled bet (last 90 days) with <strong>each model's forecast, its probability, the per-city weights, sigma, stated confidence, entry price — and the actual win/loss</strong>. This is the full decision-time record used to reconstruct exactly how the % is computed and to backtest scoring improvements against real results.</p>
@@ -2262,6 +2264,30 @@ async function applyStation(cityId, btn) {
   alert(`${j.city} updated:\n${lines}`);
   btn.textContent = '✓ applied';
   loadCities();
+}
+
+async function showCityPerformance(btn) {
+  const since = prompt('Count trades detected on or after (YYYY-MM-DD):', '2026-10-04');
+  if (!since) return;
+  const out = document.getElementById('dbOut') || document.getElementById('memOut');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await api('/research/city-performance?since=' + encodeURIComponent(since));
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) { out.textContent = 'Failed: ' + (j.detail || r.status) + '\n\n' + out.textContent; return; }
+    const line = (c, v) => `${c.padEnd(15).slice(0, 15)}${String(v.trades).padStart(5)}`
+      + `${(v.win_rate * 100).toFixed(0).padStart(6)}%${(v.avg_entry * 100).toFixed(0).padStart(6)}c`
+      + `${(v.edge_pp >= 0 ? '+' : '') + v.edge_pp}`.padStart(8) + `${('$' + v.pnl.toFixed(2)).padStart(10)}  ${v.verdict}`;
+    let s = `[${new Date().toLocaleTimeString()}] Cities since ${j.since}\n${j.note}\n`;
+    for (const kind of ['daily', 'intraday']) {
+      s += `\n${kind.toUpperCase()}\ncity           trades   win  paid    edge       P&L  verdict\n`;
+      const rows = Object.entries(j[kind] || {});
+      if (!rows.length) s += '   (no settled trades yet)\n';
+      for (const [c, v] of rows) s += line(c, v) + '\n';
+    }
+    out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
 async function showDuplicateMarkets(btn) {
