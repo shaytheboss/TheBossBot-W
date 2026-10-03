@@ -2136,6 +2136,19 @@ async function loadSettings() {
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=1', 'omOut')">🏁 Best model per city (1 day ahead)</button>
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=0', 'omOut')">Same day</button>
         <div style="margin-top:6px"><button class="btn small" onclick="copyOut('omOut', this)">📋 Copy</button> <button class="btn small" onclick="saveOut('omOut', 'open-meteo')">⬇ Save as file</button></div><pre id="omOut" class="small" style="white-space:pre;overflow-x:auto;max-height:480px;margin-top:8px;"></pre></td></tr>
+      <tr><td>Peak guard — block the buy before the city's usual peak</td><td>
+        <select id="set-peak-guard">
+          <option value="0" ${s.intraday_peak_guard_enabled ? '' : 'selected'}>Off — only record what it would do</option>
+          <option value="1" ${s.intraday_peak_guard_enabled ? 'selected' : ''}>On — block those buys</option>
+        </select></td></tr>
+      <tr><td>…when fewer than this share of days had peaked by that hour</td>
+          <td><input id="set-peak-min" type="number" step="0.05" min="0" max="1" value="${s.intraday_peak_guard_min_passed}" /></td></tr>
+      <tr><td colspan="2" class="small">
+        On 500 settled intraday trades, buys made while the high was still ahead on most days
+        (for that city and month) won 65%; the rest won 78%. Off, the bot records on every signal
+        whether the guard would have blocked it; the report shows how those trades ended.
+        <button class="btn small" onclick="showJson(this, '/intraday/peak-guard', 'suspOut')">⏱ Peak guard report</button>
+      </td></tr>
       <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🔬 Shadow study (research only — never affects trading)</td></tr>
       <tr><td>Recording</td><td>
         <select id="set-shadow-on">
@@ -2184,6 +2197,8 @@ async function saveSettings() {
     shadow_enabled: document.getElementById('set-shadow-on').value === '1',
     shadow_alert_mode: document.getElementById('set-shadow-mode').value,
     intraday_min_entry_cost: parseFloat(document.getElementById('set-intra-minentry').value),
+    intraday_peak_guard_enabled: document.getElementById('set-peak-guard').value === '1',
+    intraday_peak_guard_min_passed: parseFloat(document.getElementById('set-peak-min').value),
     model_fetch_mode: document.getElementById('set-om-mode').value,
     open_meteo_extra_models: document.getElementById('set-om-extra').value,
     open_meteo_hrrr_half_hourly: document.getElementById('set-om-hrrr30').value === '1',

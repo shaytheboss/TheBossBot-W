@@ -167,9 +167,9 @@ class TestClimatology:
 
 
 class TestBoundary:
-    def test_trading_code_does_not_depend_on_it(self):
-        """Record-only: until a measured change wires it in, nothing that
-        makes a trading decision may import the peaks package."""
+    def test_trading_code_depends_on_it_only_through_the_guard(self):
+        """The intraday detector reads app.peaks.guard (the peak guard) and
+        nothing else; no other trading code imports the package."""
         from pathlib import Path
         app_dir = Path(__file__).resolve().parents[2] / "app"
         importers = {
@@ -177,4 +177,7 @@ class TestBoundary:
             if "app.peaks" in p.read_text(encoding="utf-8")
             and not str(p.relative_to(app_dir)).startswith("peaks")
         }
-        assert importers <= {"main.py", "api/admin.py"}, importers
+        assert importers <= {"main.py", "api/admin.py", "intraday/detector.py"}, importers
+        det = (app_dir / "intraday" / "detector.py").read_text(encoding="utf-8")
+        imports = [ln.strip() for ln in det.splitlines() if "app.peaks" in ln and "import" in ln]
+        assert imports == ["from app.peaks.guard import share_passed"], imports

@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     # the market was right: these lost in both halves of a time split (see
     # detector.py). Alerts still fire. 0 disables.
     intraday_min_entry_cost: float = 0.70
+    # Peak guard (app/peaks/guard.py): block the virtual buy when fewer than
+    # this share of the city's days in the month had peaked by now. Off by
+    # default — recorded on every opportunity so its effect is measured first.
+    intraday_peak_guard_enabled: bool = False
+    intraday_peak_guard_min_passed: float = 0.5
 
     # מאגר דיוק-המודלים הפר-עירוני (model_skill): מרווח העדכון התקופתי
     # בשניות. בנוסף לכך העדכון רץ מיד אחרי כל settlement של פולימרקט.

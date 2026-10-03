@@ -709,6 +709,18 @@ async def _evaluate_intraday_outcome(
     min_entry_cost = float(getattr(settings, "intraday_min_entry_cost", 0.70))
     entry_too_cheap = min_entry_cost > 0 and entry_cost < min_entry_cost
 
+    # Peak guard. On 500 settled intraday trades, those entered when fewer
+    # than half of the city's days in that month had already peaked by that
+    # hour won 65% vs 78% otherwise (z=3.0, both halves of a time split,
+    # within cities). Recorded on every opportunity; it blocks the virtual
+    # buy only when intraday_peak_guard_enabled is on (default off, so the
+    # rule is measured before it acts). Alerts are never gated.
+    from app.peaks.guard import share_passed
+    peak_share, peak_days = await share_passed(db, city.id, market.event_date.month, loc_hour)
+    peak_min = float(getattr(settings, "intraday_peak_guard_min_passed", 0.5))
+    peak_guard_on = bool(getattr(settings, "intraday_peak_guard_enabled", False))
+    peak_would_block = peak_share is not None and peak_share < peak_min
+
     # Coherence guard: never open a virtual buy on a bucket where we already
     # hold an OPEN position on the opposite side — that's a locked-in loss
     # (London 15/6 cross-bet). The contradictory signal can still alert/realert;
@@ -728,6 +740,7 @@ async def _evaluate_intraday_outcome(
         and not entry_too_expensive
         and not entry_too_cheap
         and not has_open_opposite
+        and not (peak_guard_on and peak_would_block)
     )
 
     # Per-source forecast highs (bias-corrected — the same values the blend
@@ -759,6 +772,11 @@ async def _evaluate_intraday_outcome(
         "_max_entry_cost": max_entry_cost,
         "_entry_too_cheap": bool(entry_too_cheap),
         "_min_entry_cost": min_entry_cost,
+        "_peak_passed_share": None if peak_share is None else round(peak_share, 3),
+        "_peak_days": peak_days,
+        "_peak_guard_would_block": bool(peak_would_block),
+        "_peak_guard_enabled": peak_guard_on,
+        "_peak_guard_min_passed": peak_min,
         "_wu_confirmed_for_lock": bool(wu_confirmed_for_lock),
         "_bucket_unit": bucket_unit,
         "_forecast_sources": forecast_sources,
