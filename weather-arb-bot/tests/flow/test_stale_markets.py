@@ -92,7 +92,8 @@ class TestIngest:
 
 class TestShadowExport:
     @pytest.mark.asyncio
-    async def test_snapshots_of_a_moved_market_are_left_out_not_deleted(self, monkeypatch):
+    @pytest.mark.parametrize("zipped", [False, True], ids=["csv", "zip"])
+    async def test_snapshots_of_a_moved_market_are_left_out_not_deleted(self, monkeypatch, zipped):
         from app.database import Base
         import app.models  # noqa: F401
         from app.api.admin import admin_shadow_csv
@@ -115,8 +116,14 @@ class TestShadowExport:
                                       model_p=.2, raw_p=.2, normalized=False))
             await db.commit()
         try:
-            resp = await admin_shadow_csv("t", days=5)
-            body = "".join([c if isinstance(c, str) else c.decode() async for c in resp.body_iterator])
+            resp = await admin_shadow_csv("t", days=5, zipped=zipped)
+            if zipped:
+                import io
+                import zipfile
+                raw = b"".join([c async for c in resp.body_iterator])
+                body = zipfile.ZipFile(io.BytesIO(raw)).read("shadow.csv").decode()
+            else:
+                body = "".join([c async for c in resp.body_iterator])
             async with maker() as db:
                 kept = len((await db.execute(select(ShadowSnapshot))).scalars().all())
         finally:

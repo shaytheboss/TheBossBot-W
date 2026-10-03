@@ -212,3 +212,60 @@ class TestEndpointsConverted:
         code = src.split('"""', 2)[-1]
         code = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("#"))
         assert "Depends" not in code
+
+
+# ── Zipped downloads (uploading 47 MB from a phone is not practical) ──────
+
+async def _collect_bytes(response) -> bytes:
+    return b"".join([chunk async for chunk in response.body_iterator])
+
+
+class TestZipped:
+    @pytest.mark.asyncio
+    async def test_the_zip_opens_to_exactly_the_plain_csv(self):
+        import zipfile
+        plain = await _collect(await stream_csv("shadow.csv", ["a", "b"], _rows(3000)))
+        resp = await stream_csv("shadow.csv", ["a", "b"], _rows(3000), zipped=True)
+        data = await _collect_bytes(resp)
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        assert zf.namelist() == ["shadow.csv"]
+        assert zf.read("shadow.csv").decode() == plain
+        assert resp.headers["content-disposition"].endswith("filename=shadow.csv.zip")
+        assert resp.media_type == "application/zip"
+
+    @pytest.mark.asyncio
+    async def test_it_is_much_smaller(self):
+        plain = await _collect(await stream_csv("s.csv", ["a", "b"], _rows(5000)))
+        zipped = await _collect_bytes(await stream_csv("s.csv", ["a", "b"], _rows(5000), zipped=True))
+        assert len(zipped) * 10 < len(plain.encode())
+
+    @pytest.mark.asyncio
+    async def test_it_still_streams(self):
+        """Compressed chunks go out as the rows arrive — the whole file is
+        never held in memory, zipped or not."""
+        import random
+        def noisy(n):
+            async def source(_s):
+                rnd = random.Random(1)
+                for i in range(n):
+                    yield {"a": i, "b": "".join(rnd.choice("abcdefghij") for _ in range(300))}
+            return source
+        resp = await stream_csv("s.csv", ["a", "b"], noisy(5000), zipped=True)
+        chunks = [c async for c in resp.body_iterator]
+        assert len(chunks) > 5
+        assert max(len(c) for c in chunks) < 4 * CHUNK_BYTES
+
+    @pytest.mark.asyncio
+    async def test_a_failure_mid_export_is_written_inside_a_valid_zip(self):
+        import zipfile
+
+        async def broken(_s):
+            yield {"a": 1, "b": "ok"}
+            raise RuntimeError("db went away")
+        data = await _collect_bytes(await stream_csv("s.csv", ["a", "b"], broken, zipped=True))
+        text = zipfile.ZipFile(io.BytesIO(data)).read("s.csv").decode()
+        assert "EXPORT FAILED: RuntimeError: db went away" in text
+
+    def test_the_shadow_export_offers_it(self):
+        src = ADMIN.read_text(encoding="utf-8")
+        assert 'stream_csv("shadow.csv", fields, rows_for, zipped=zipped)' in src

@@ -148,6 +148,7 @@
       <h3 style="margin-top:24px;">🔬 Backtest export (for model tuning)
         <button class="btn primary small" onclick="downloadServerCsv('/export/backtest-csv?days=90', 'backtest', this)" title="Download every settled bet of the last 90 days WITH each model's forecast and the real outcome — the dataset used to rebuild and validate the confidence scoring">⬇ Download backtest CSV</button>
         <button class="btn small" onclick="downloadServerCsv('/shadow/csv', 'shadow', this)" title="Every hourly shadow-study snapshot: model vs market per bucket, on each city's clock, with the outcome once resolved">⬇ Shadow study CSV</button>
+        <button class="btn small" onclick="downloadServerCsv('/shadow/csv?zipped=true', 'shadow', this, 'zip')" title="The same file compressed (about 10x smaller) — easy to upload from a phone">⬇ Shadow study (ZIP, small)</button>
         <button class="btn small" onclick="showShadowStatus(this)" title="What the last hourly shadow run recorded, and how large the table is">🔬 Shadow status</button>
         <button class="btn small" onclick="showDuplicateMarkets(this)" title="Cities with more than one market on the same day, with each market's name, link and whether it ever got a price">🔎 Duplicate markets</button>
       </h3>
@@ -165,7 +166,7 @@
         <strong>Shrink DB</strong> then returns that freed space to disk — deleting rows alone does <em>not</em> shrink Postgres. Run de-dup first, then Shrink. Shrink briefly locks the tables it rewrites, so prefer a quiet moment.
       </p>
       <div><button class="btn small" onclick="copyPre('dbOut', this)" title="Copy this output to the clipboard">📋 Copy</button></div>
-      <pre id="dbOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:340px;overflow:auto"></pre>
+      <div style="margin-top:6px"><button class="btn small" onclick="copyOut('dbOut', this)">📋 Copy</button> <button class="btn small" onclick="saveOut('dbOut', 'db')">⬇ Save as file</button></div><pre id="dbOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:340px;overflow:auto"></pre>
       <h3 style="margin-top:24px;">🧠 Memory diagnostic
         <button class="btn small" onclick="showMemory(this,false)" title="Safe: reads RAM + allocator counters only. Sub-millisecond, cannot affect trading.">📸 Quick check (safe)</button>
         <button class="btn small" onclick="showMemory(this,true)" title="Full heap census. FREEZES the bot for ~1 second — do not use during an active market close.">🔬 Deep scan (~1s freeze)</button>
@@ -178,7 +179,7 @@
         The automatic 15-minute heartbeat in the Logs tab uses the safe path only.
       </p>
       <div><button class="btn small" onclick="copyPre('memOut', this)" title="Copy this output to the clipboard">📋 Copy</button></div>
-      <pre id="memOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:320px;overflow:auto"></pre>
+      <div style="margin-top:6px"><button class="btn small" onclick="copyOut('memOut', this)">📋 Copy</button> <button class="btn small" onclick="saveOut('memOut', 'memory')">⬇ Save as file</button></div><pre id="memOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:320px;overflow:auto"></pre>
       <h3 style="margin-top:24px;">🔍 Missing model coverage <button class="btn small" onclick="downloadServerCsv('/collector-miss/csv' + (document.getElementById('statsCity').value ? '?city_id=' + document.getElementById('statsCity').value : ''), 'collector-miss', this)" title="Download which weather sources returned no data per city/date (respects the City filter; opens in Excel)">⬇ CSV</button></h3>
       <p class="small">Which weather models returned <strong>no data</strong> for which city/date — the gaps behind a weak per-city blend. Grouped by city + source with a miss count and the date range seen. Use it to spot systematic holes like "ECMWF never responds for Tokyo" or an unconfigured API key.</p>
       <div id="statsCollectorMiss"></div>
@@ -1538,7 +1539,7 @@ async function showMemory(btn, deep) {
   }
 }
 
-async function downloadServerCsv(path, filenameBase, btn) {
+async function downloadServerCsv(path, filenameBase, btn, ext = 'csv') {
   const orig = btn ? btn.textContent : null;
   if (btn) { btn.disabled = true; btn.textContent = '…'; }
   try {
@@ -1549,7 +1550,7 @@ async function downloadServerCsv(path, filenameBase, btn) {
     const a = document.createElement('a');
     const stamp = new Date().toISOString().slice(0, 10);
     a.href = url;
-    a.download = `${filenameBase}-${stamp}.csv`;
+    a.download = `${filenameBase}-${stamp}.${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -2095,7 +2096,7 @@ async function loadSettings() {
         the Cities tab.
       </td></tr>
       <tr><td colspan="2"><button class="btn" onclick="showSuspensionReport(this)">📋 Why are cities being suspended?</button>
-        <pre id="suspOut" class="small" style="white-space:pre;overflow-x:auto;margin-top:8px;"></pre></td></tr>
+        <div style="margin-top:6px"><button class="btn small" onclick="copyOut('suspOut', this)">📋 Copy</button> <button class="btn small" onclick="saveOut('suspOut', 'suspension')">⬇ Save as file</button></div><pre id="suspOut" class="small" style="white-space:pre;overflow-x:auto;margin-top:8px;"></pre></td></tr>
       <tr><td colspan="2" style="padding-top:14px;font-weight:600;">⚡ Intraday buy guard</td></tr>
       <tr><td>Minimum entry price for a virtual buy (0 = off)</td>
           <td><input id="set-intra-minentry" type="number" step="0.01" min="0" max="1" value="${s.intraday_min_entry_cost}" /></td></tr>
@@ -2131,10 +2132,10 @@ async function loadSettings() {
       <tr><td colspan="2">
         <button class="btn" onclick="showJson(this, '/open-meteo/status', 'omOut')">📶 Open-Meteo usage today</button>
         <button class="btn" onclick="showJson(this, '/open-meteo/updates?days=3', 'omOut')">🕐 When models update</button>
-        <button class="btn" onclick="showJson(this, '/peaks', 'omOut')">🌡️ Daily peak hour per city</button>
+        <button class="btn" onclick="showPeaks(this)">🌡️ Daily peak hour per city</button>
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=1', 'omOut')">🏁 Best model per city (1 day ahead)</button>
         <button class="btn" onclick="showJson(this, '/models/compare?days_ahead=0', 'omOut')">Same day</button>
-        <pre id="omOut" class="small" style="white-space:pre;overflow-x:auto;max-height:480px;margin-top:8px;"></pre></td></tr>
+        <div style="margin-top:6px"><button class="btn small" onclick="copyOut('omOut', this)">📋 Copy</button> <button class="btn small" onclick="saveOut('omOut', 'open-meteo')">⬇ Save as file</button></div><pre id="omOut" class="small" style="white-space:pre;overflow-x:auto;max-height:480px;margin-top:8px;"></pre></td></tr>
       <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🔬 Shadow study (research only — never affects trading)</td></tr>
       <tr><td>Recording</td><td>
         <select id="set-shadow-on">
@@ -2327,6 +2328,60 @@ async function showJobStats(btn, reset) {
     s += `\n${j.note}\n`;
     if (reset) s += `Counters reset — come back in an hour for a clean window.\n`;
     out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+// Copy / save the whole text of an output box — selecting it by hand on a
+// phone cut long outputs off.
+async function copyOut(id, btn) {
+  const text = (document.getElementById(id) || {}).textContent || '';
+  const orig = btn.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+  }
+  btn.textContent = '✓ Copied'; setTimeout(() => { btn.textContent = orig; }, 1500);
+}
+
+function saveOut(id, base) {
+  const text = (document.getElementById(id) || {}).textContent || '';
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `${base}-${new Date().toISOString().slice(0, 10)}.txt`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Peak hours as one short line per city and measured month, instead of the
+// raw JSON (which ran to thousands of lines and got cut off when pasted).
+async function showPeaks(btn) {
+  const out = document.getElementById('omOut');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Loading…';
+  try {
+    const r = await api('/peaks');
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) { out.textContent = 'Failed: ' + (j.detail || r.status); return; }
+    const M = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const pct = v => (v == null ? '-' : Math.round(v * 100) + '%').padStart(5);
+    let s = `Daily peak hour — measured months only (${j.incomplete_days_left_out} incomplete days left out; `
+          + `the high comes ${j.hours_after_solar_noon ?? '?'} h after solar noon on average)\n`
+          + `14h..17h = share of days whose high had already come by that hour\n\n`
+          + 'city'.padEnd(15) + 'month'.padEnd(6) + 'days'.padStart(4) + '  ' + 'peak'.padEnd(5) + '  '
+          + '80% range'.padEnd(13) + ['14h', '15h', '16h', '17h'].map(h => h.padStart(5)).join('') + '\n';
+    for (const c of j.cities) {
+      for (const m of c.months.filter(m => m.source === 'measured')) {
+        const p = m.passed_by || {};
+        s += `${c.city.padEnd(15).slice(0, 15)}${M[m.month].padEnd(6)}${String(m.days).padStart(4)}  `
+           + `${m.median}  ${m.range_80pct[0]}-${m.range_80pct[1]}  `
+           + `${pct(p['14:00'])}${pct(p['15:00'])}${pct(p['16:00'])}${pct(p['17:00'])}\n`;
+      }
+    }
+    out.textContent = s;
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
 

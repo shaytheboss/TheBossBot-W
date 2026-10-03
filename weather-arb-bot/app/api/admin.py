@@ -2136,6 +2136,7 @@ async def admin_shadow_status(
 async def admin_shadow_csv(
     _: str = Depends(require_admin),
     days: int = Query(default=45, ge=1, le=400),
+    zipped: bool = Query(default=False),
 ):
     """Every shadow snapshot with its bucket, city and — once resolved —
     whether that bucket won. The raw material for the per-time-window
@@ -2184,7 +2185,7 @@ async def admin_shadow_csv(
                 "won": "" if won is None else int(won),
             }
 
-    return await stream_csv("shadow.csv", fields, rows_for)
+    return await stream_csv("shadow.csv", fields, rows_for, zipped=zipped)
 
 
 @router.get("/open-meteo/status")
