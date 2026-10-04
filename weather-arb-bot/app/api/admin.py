@@ -2164,7 +2164,7 @@ async def admin_shadow_csv(
               "hours_to_close", "local_hour", "model_p", "raw_p", "normalized",
               "market_p", "bid", "ask", "price_live", "price_job_age_min",
               "n_sources", "forecast_age_min", "forecast_high_f", "sigma",
-              "intraday_p", "won"]
+              "intraday_p", "v2_p", "v2_mu", "won"]
 
     async def rows_for(session):
         async for snap, label, won, city in stream_rows(session, q):
@@ -2184,6 +2184,7 @@ async def admin_shadow_csv(
                 "n_sources": snap.n_sources, "forecast_age_min": snap.forecast_age_min,
                 "forecast_high_f": snap.forecast_high_f, "sigma": snap.sigma,
                 "intraday_p": snap.intraday_p,
+                "v2_p": snap.v2_p, "v2_mu": snap.v2_mu,
                 "won": "" if won is None else int(won),
             }
 
@@ -2263,6 +2264,18 @@ async def admin_duplicate_markets(
         out.append({"city": city_names.get(city_id, str(city_id)),
                     "event_date": event_date.isoformat(), "markets": rows})
     return {"days": days, "city_days_with_several_markets": len(out), "groups": out}
+
+
+@router.get("/shadow/v2-report")
+async def admin_shadow_v2_report(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    since: date_cls = Query(default=date_cls(2026, 10, 5)),
+):
+    """Model v2 against live prices, on markets settled since `since` —
+    next to the current model on the same rows."""
+    from app.shadow.v2_report import v2_forward_report
+    return await v2_forward_report(db, since)
 
 
 @router.get("/research/city-performance")

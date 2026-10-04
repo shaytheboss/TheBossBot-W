@@ -143,6 +143,9 @@ class Settings(BaseSettings):
     # showing the hour-by-hour story) | "summary_hourly" (also a single digest
     # each hour of the largest model-vs-market gaps).
     shadow_alert_mode: str = "summary"
+    # Model v2 (app/shadow/v2.py): record the per-city bias-corrected,
+    # accuracy-weighted probability next to the current model. Research only.
+    shadow_v2_enabled: bool = True
     shadow_retention_days: int = 45
     shadow_max_days_ahead: int = 3
     # ── Auto-suspension ─────────────────────────────────────────────────────

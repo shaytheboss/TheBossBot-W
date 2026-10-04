@@ -41,6 +41,7 @@ class Row:
     model_p: float
     market_p: Optional[float]
     intraday_p: Optional[float] = None
+    v2_p: Optional[float] = None
 
 
 @dataclass
@@ -61,6 +62,7 @@ class Hour:
     model_pick_p: Optional[float] = None
     market_pick_p: Optional[float] = None
     intraday_pick_p: Optional[float] = None
+    v2_pick: Optional[int] = None
 
 
 def _brier(rs: list[Row], winner_id: int, winner_missing: bool, get) -> float:
@@ -91,6 +93,7 @@ def by_hour(rows: Iterable[Row], winner_id: int) -> list[Hour]:
         has_intra = all(r.intraday_p is not None for r in rs)
         top_market = max(priced, key=lambda r: r.market_p) if priced else None
         top_intra = max(rs, key=lambda r: r.intraday_p) if has_intra else None
+        has_v2 = all(r.v2_p is not None for r in rs)
 
         hours.append(Hour(
             taken_at=t,
@@ -110,6 +113,7 @@ def by_hour(rows: Iterable[Row], winner_id: int) -> list[Hour]:
             model_pick_p=top_model.model_p,
             market_pick_p=top_market.market_p if top_market else None,
             intraday_pick_p=top_intra.intraday_p if top_intra else None,
+            v2_pick=max(rs, key=lambda r: r.v2_p).outcome_id if has_v2 else None,
         ))
     return hours
 
@@ -282,6 +286,8 @@ def build_summary(
     fav = [("daily", _favourites(hours, "model_pick", labels))]
     if intra_hours:
         fav.append(("intraday", _favourites(hours, "intraday_pick", labels)))
+    if any(h.v2_pick is not None for h in hours):
+        fav.append(("v2", _favourites(hours, "v2_pick", labels)))
     fav.append(("market", _favourites(hours, "market_pick", labels)))
     lines.append("<b>Favourite bucket</b>")
     lines += [f"  {name}: {text or '—'}" for name, text in fav]
@@ -302,6 +308,9 @@ def build_summary(
     m_ok, m_n = _right_hours(hours, "market_pick", winner_id)
     lines += ["", "<b>Hours on the winning bucket</b>",
               f"  daily {d_ok}/{d_n} · market {m_ok}/{m_n}"]
+    if any(h.v2_pick is not None for h in hours):
+        v_ok, v_n = _right_hours(hours, "v2_pick", winner_id)
+        lines.append(f"  v2 (research model) {v_ok}/{v_n}")
     if intra_hours:
         same = [h for h in intra_hours if h.market_pick is not None]
         i_ok, _ = _right_hours(same, "intraday_pick", winner_id)

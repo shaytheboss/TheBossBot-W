@@ -38,6 +38,7 @@ from typing import Optional
 import pytz
 
 from app.analyzers.opportunity_detector import normalization_scale
+from app.config import settings
 from app.analyzers.probability_estimator import (
     _DET_SOURCES,
     _clip as _prob_clip,
@@ -79,6 +80,10 @@ class BucketEstimate:
     forecast_age_min: Optional[int]
     # The intraday model's P(YES); None outside its hours or without METAR.
     intraday_p: Optional[float] = None
+    # Model v2 (app/shadow/v2.py): P(YES) and its mean forecast (°F); None
+    # until the city has enough settled days to calibrate on.
+    v2_p: Optional[float] = None
+    v2_mu: Optional[float] = None
 
 
 def intraday_hour(city, market, now: datetime, params) -> Optional[float]:
@@ -240,6 +245,15 @@ async def estimate_market(
         logger.warning(f"[shadow] intraday estimate failed for market {market.id}: {e}")
         intraday = {}
 
+    v2, v2_mu = {}, None
+    if getattr(settings, "shadow_v2_enabled", True):
+        try:
+            from app.shadow.v2 import v2_for_market
+            v2, v2_mu = await v2_for_market(db, city, market, outcomes, base, days_ahead,
+                                            today or date.today())
+        except Exception as e:     # research only: never costs the daily row
+            logger.warning(f"[shadow] v2 estimate failed for market {market.id}: {e}")
+
     priced = [r for r in rows if r[3]]
     scale = normalization_scale([r[1] for r in priced], len(outcomes)) if priced else None
 
@@ -257,5 +271,7 @@ async def estimate_market(
             sigma=bd.get("sigma_used"),
             forecast_age_min=age,
             intraday_p=intraday.get(outcome.id),
+            v2_p=v2.get(outcome.id),
+            v2_mu=v2_mu,
         ))
     return out
