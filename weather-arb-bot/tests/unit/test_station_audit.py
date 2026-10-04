@@ -206,3 +206,65 @@ class TestFieldNotes:
     def test_notes_are_part_of_every_verdict(self):
         a = judge(_city(primary_icao="ICAO"), None, None, None, None)
         assert a.notes
+
+
+# ── The weather.gov form (Polymarket moved off Wunderground in 2026) ─────
+
+PARIS_NWS = ("https://www.weather.gov/wrh/timeseries?site=LFPB&hours=72&units=metric"
+             "&chart=on&headers=on&obs=tabular&hourly=false&pview=standard&font=12&plot=")
+
+
+class TestWeatherGov:
+    def test_the_station_is_read_from_the_site_parameter(self):
+        """The exact link Polymarket's Paris rules use."""
+        from app.utils.station_audit import extract_nws_station
+        icao, url = extract_nws_station(f"Resolution source: {PARIS_NWS}.")
+        assert icao == "LFPB" and url.startswith("https://www.weather.gov/wrh/timeseries?site=LFPB")
+
+    def test_a_link_without_a_scheme_and_a_lowercase_site(self):
+        from app.utils.station_audit import extract_nws_station
+        assert extract_nws_station("see weather.gov/wrh/timeseries?site=rksi&hours=72")[0] == "RKSI"
+
+    def test_the_hong_kong_observatory_is_not_weather_gov(self):
+        """www.weather.gov.hk is a different source; it must never be read as
+        an NWS station."""
+        from app.utils.station_audit import extract_nws_station
+        assert extract_nws_station("https://www.weather.gov.hk/en/cis/climat.htm?site=HKOA") is None
+
+    def test_a_weather_gov_link_with_no_station_is_none(self):
+        from app.utils.station_audit import extract_nws_station
+        assert extract_nws_station("https://www.weather.gov/") is None
+
+    def test_rules_on_weather_gov_are_judged_not_called_not_wunderground(self):
+        from app.utils.station_audit import extract_resolution_station
+        text = f"This market resolves on the NWS observations: {PARIS_NWS}"
+        a = judge(_city(name="Paris", primary_icao="LFPB",
+                        wunderground_url="https://www.wunderground.com/history/daily/fr/paris/LFPB"),
+                  extract_resolution_station(text), None, other_source_domain(text), "slug")
+        assert a.verdict == VERDICT_OK and a.resolution_icao == "LFPB"
+
+    def test_a_mismatch_found_on_weather_gov_is_actionable(self):
+        from app.utils.station_audit import extract_resolution_station
+        text = "Resolves per https://www.weather.gov/wrh/timeseries?site=RKSI&hours=72"
+        a = judge(_city(name="Seoul", primary_icao="RKSS",
+                        wunderground_url="https://www.wunderground.com/history/daily/kr/seoul/RKSS"),
+                  extract_resolution_station(text), None, None, "slug")
+        assert a.verdict == VERDICT_BOTH and a.verdict in ACTIONABLE
+
+    def test_applying_it_rebuilds_the_wunderground_url_for_the_same_station(self):
+        """The scraper cannot read a weather.gov page, so the Wunderground URL
+        is pointed at the new station instead of being replaced by the link."""
+        from app.utils.station_audit import extract_resolution_station
+        city = _city(name="Seoul", primary_icao="RKSS", reference_icao=None,
+                     wunderground_url="https://www.wunderground.com/history/daily/kr/seoul/RKSS")
+        a = judge(city, extract_resolution_station(
+            "https://www.weather.gov/wrh/timeseries?site=RKSI"), None, None, "slug")
+        apply_fix(city, a)
+        assert city.primary_icao == "RKSI" and city.reference_icao == "RKSS"
+        assert city.wunderground_url == "https://www.wunderground.com/history/daily/kr/seoul/RKSI"
+
+    def test_a_wunderground_url_without_a_station_gets_the_short_form(self):
+        from app.utils.station_audit import wunderground_url_for
+        assert wunderground_url_for("https://www.wunderground.com/weather/tr/istanbul", "LTFM") \
+            == "https://www.wunderground.com/history/daily/LTFM"
+        assert wunderground_url_for(None, "LLBG") == "https://www.wunderground.com/history/daily/LLBG"

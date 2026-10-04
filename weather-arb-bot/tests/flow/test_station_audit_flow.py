@@ -121,3 +121,31 @@ class TestEvidence:
         pipeline.http.prepend(pm.GAMMA_EVENTS, {"error": "down"}, status=503)
         a = await _audit(pipeline)
         assert a.read_from == "stored (gamma failed)"
+
+
+class TestWeatherGovRules:
+    @pytest.mark.asyncio
+    async def test_stored_rules_pointing_at_weather_gov_are_read(self, pipeline):
+        """Since Polymarket moved to weather.gov, the stored description names
+        the station in a `site=` parameter. No Gamma call is needed."""
+        await _set_rules(pipeline, "highest temperature recorded at the Austin Camp Mabry "
+                         "station ... https://www.weather.gov/wrh/timeseries?site=KATT&hours=72")
+        before = len(pipeline.http.requests)
+        a = await _audit(pipeline)
+        assert a.resolution_icao == "KATT" and a.verdict == VERDICT_BOTH
+        assert len(pipeline.http.requests) == before
+
+    @pytest.mark.asyncio
+    async def test_apply_then_reaudit_is_ok(self, pipeline):
+        await _set_rules(pipeline, "https://www.weather.gov/wrh/timeseries?site=KATT&hours=72")
+        async with pipeline.session() as db:
+            city = (await db.execute(select(City))).scalars().one()
+            async with httpx.AsyncClient() as client:
+                audit = (await audit_cities(db, client, [city]))[0]
+            apply_fix(city, audit)
+            await db.commit()
+        async with pipeline.session() as db:
+            city = (await db.execute(select(City))).scalars().one()
+            assert city.primary_icao == "KATT" and city.wunderground_url.endswith("/KATT")
+            assert "weather.gov" not in city.wunderground_url
+        assert (await _audit(pipeline)).verdict == VERDICT_OK
