@@ -9,10 +9,13 @@ thermometer. In the settled intraday data, "impossible" NO bets lost with
 gaps no rounding explains — Seoul read 31°C and the 26°C bucket won; London
 34°C lost with the max 1.1°C past the edge.
 
-Polymarket states the station in each market's rules, normally as a
+Polymarket states the station in each market's rules. It used to be a
 Wunderground history URL ending in the ICAO code, e.g.
-`https://www.wunderground.com/history/daily/gb/london/EGLC`. This module reads
-that — first from the description the discovery job already stored on the
+`https://www.wunderground.com/history/daily/gb/london/EGLC`; in 2026 it moved
+to the NWS observation time series on weather.gov, with the station in the
+query, e.g. `https://www.weather.gov/wrh/timeseries?site=LFPB&hours=72...`.
+Before the parser knew the second form, 45 cities read as "resolves on
+www.weather.gov". This module reads either — first from the description the discovery job already stored on the
 market, and only if that was truncated, from the event on Gamma — and compares.
 
 It changes nothing on its own. `apply_fix` is called only from the admin
@@ -40,6 +43,12 @@ _WU_LINK = re.compile(
 # An ICAO code in a Wunderground path is upper-case; city slugs are lower-case.
 # Case-sensitive on purpose, so "/weather/it/rome" never yields a station "ROME".
 _ICAO_SEGMENT = re.compile(r"^[A-Z][A-Z0-9]{3}$")
+# weather.gov itself — "weather\.gov/" needs the slash, so the Hong Kong
+# Observatory (www.weather.gov.hk), a genuinely different source, never matches.
+_NWS_LINK = re.compile(
+    r"(?:https?://)?(?:www\.)?weather\.gov/[^\s\"'<>)\]]*", re.IGNORECASE,
+)
+_NWS_SITE = re.compile(r"[?&]site=([A-Za-z][A-Za-z0-9]{3})(?![A-Za-z0-9])")
 _ANY_URL = re.compile(r"https?://([^/\s\"'<>)]+)", re.IGNORECASE)
 _STATION_NAME = re.compile(
     r"recorded (?:at|by) (?:the )?(.{3,80}?)(?: [Ss]tation| in degrees|,|\.)"
@@ -92,6 +101,37 @@ def extract_wu_station(text: Optional[str]) -> Optional[tuple[str, str]]:
         if _ICAO_SEGMENT.match(last):
             return last, url
     return None
+
+
+def extract_nws_station(text: Optional[str]) -> Optional[tuple[str, str]]:
+    """(ICAO, URL) of the first weather.gov link that names a station with
+    `site=` — the source Polymarket's rules point at since the move away from
+    Wunderground."""
+    for m in _NWS_LINK.finditer(text or ""):
+        url = m.group(0).rstrip(".,)]")
+        site = _NWS_SITE.search(url)
+        if site:
+            if not url.lower().startswith("http"):
+                url = "https://" + url.lstrip("/")
+            return site.group(1).upper(), url
+    return None
+
+
+def extract_resolution_station(text: Optional[str]) -> Optional[tuple[str, str]]:
+    """The station the rules resolve on, from either link form."""
+    return extract_wu_station(text) or extract_nws_station(text)
+
+
+def wunderground_url_for(current_url: Optional[str], icao: str) -> str:
+    """A Wunderground history URL for `icao`. The intraday running max is
+    scraped from Wunderground whatever Polymarket resolves on, so the field
+    must name the same station. Keeps the existing country/city path when it
+    already ends in a station code; otherwise the short form Wunderground
+    also serves."""
+    url = (current_url or "").rstrip("/")
+    if url and _ICAO_SEGMENT.match(url.rsplit("/", 1)[-1]):
+        return url.rsplit("/", 1)[0] + "/" + icao
+    return f"https://www.wunderground.com/history/daily/{icao}"
 
 
 def mentions_wunderground(text: Optional[str]) -> bool:
@@ -244,7 +284,7 @@ async def resolution_for_city(db, city, client, markets_to_check: int = 3) -> di
         out["checked"] = out["checked"] or market.external_id
         texts = [market.resolution_source or ""]
         read_from = "stored"
-        if not extract_wu_station(texts[0]) and client is not None and market.external_id:
+        if not extract_resolution_station(texts[0]) and client is not None and market.external_id:
             try:
                 event = await fetch_event_by_slug(client, market.external_id)
             except Exception as e:
@@ -258,7 +298,7 @@ async def resolution_for_city(db, city, client, markets_to_check: int = 3) -> di
         for t in texts:
             out["name"] = out["name"] or extract_station_name(t)
             out["saw_wunderground"] = out["saw_wunderground"] or mentions_wunderground(t)
-            hit = extract_wu_station(t)
+            hit = extract_resolution_station(t)
             if hit:
                 out.update(resolution=hit, checked=market.external_id,
                            evidence=evidence_snippet([t]))
@@ -300,7 +340,12 @@ def apply_fix(city, audit: StationAudit) -> dict:
         city.primary_icao = new_icao
         if "reference_icao" in changes:
             city.reference_icao = changes["reference_icao"][1]
-    if audit.resolution_url and _icao_in_url(city.wunderground_url) != new_icao:
-        changes["wunderground_url"] = (city.wunderground_url, audit.resolution_url)
-        city.wunderground_url = audit.resolution_url
+    if _icao_in_url(city.wunderground_url) != new_icao:
+        # A Wunderground resolution link is used as is; a weather.gov one is
+        # not a page the scraper can read, so the Wunderground URL is rebuilt
+        # for the same station.
+        new_url = (audit.resolution_url if extract_wu_station(audit.resolution_url)
+                   else wunderground_url_for(city.wunderground_url, new_icao))
+        changes["wunderground_url"] = (city.wunderground_url, new_url)
+        city.wunderground_url = new_url
     return changes

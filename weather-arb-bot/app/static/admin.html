@@ -150,6 +150,7 @@
         <button class="btn small" onclick="downloadServerCsv('/shadow/csv', 'shadow', this)" title="Every hourly shadow-study snapshot: model vs market per bucket, on each city's clock, with the outcome once resolved">⬇ Shadow study CSV</button>
         <button class="btn small" onclick="downloadServerCsv('/shadow/csv?zipped=true', 'shadow', this, 'zip')" title="The same file compressed (about 10x smaller) — easy to upload from a phone">⬇ Shadow study (ZIP, small)</button>
         <button class="btn small" onclick="showShadowStatus(this)" title="What the last hourly shadow run recorded, and how large the table is">🔬 Shadow status</button>
+        <button class="btn small" onclick="showJson(this, '/shadow/v2-report', 'dbOut')" title="Model v2 vs the current model against live prices, on markets settled since v2 started recording">🧪 v2 report</button>
         <button class="btn small" onclick="showCityPerformance(this)" title="Per-city results since a date you choose — the forward test">📈 Cities since…</button>
         <button class="btn small" onclick="downloadServerCsv('/research/models-vs-actual.csv?zipped=true', 'models-vs-actual', this, 'zip')" title="Every model's forecast next to the settled bucket and the measured high, per city and day (ZIP)">⬇ Models vs actual (ZIP)</button>
         <button class="btn small" onclick="showDuplicateMarkets(this)" title="Cities with more than one market on the same day, with each market's name, link and whether it ever got a price">🔎 Duplicate markets</button>

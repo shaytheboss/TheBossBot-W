@@ -65,6 +65,11 @@ class ShadowSnapshot(Base):
     # The intraday model's P(YES) — the one that sees the running max. Only
     # for the city's local today inside the intraday hours; NULL otherwise.
     intraday_p = Column(REAL)
+    # Model v2 (app/shadow/v2.py) — per-city bias-corrected, accuracy-weighted
+    # P(YES) and the mean forecast (°F) it was built around. NULL until the
+    # city has enough settled days to calibrate on.
+    v2_p = Column(REAL)
+    v2_mu = Column(REAL)
 
     __table_args__ = (
         Index("ix_shadow_market_time", "market_id", "taken_at"),
