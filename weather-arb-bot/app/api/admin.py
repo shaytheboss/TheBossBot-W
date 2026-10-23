@@ -2144,9 +2144,10 @@ async def admin_shadow_csv(
     whether that bucket won. The raw material for the per-time-window
     analysis. Streams, so it never holds the export in memory."""
     from app.shadow.models import ShadowSnapshot
-    from app.utils.csv_stream import stream_csv, stream_rows
+    from app.utils.csv_stream import stream_csv, stream_rows_by_day
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
     q = (
         select(ShadowSnapshot, MarketOutcome.bucket_label, MarketOutcome.won, City.name)
         .join(MarketOutcome, MarketOutcome.id == ShadowSnapshot.outcome_id)
@@ -2156,9 +2157,7 @@ async def admin_shadow_csv(
         # matches the date its snapshots were taken for: leave those rows out
         # of the export. They are kept in the table, not deleted.
         .join(Market, Market.id == ShadowSnapshot.market_id)
-        .where(ShadowSnapshot.taken_at >= cutoff,
-               Market.event_date == ShadowSnapshot.event_date)
-        .order_by(ShadowSnapshot.taken_at)
+        .where(Market.event_date == ShadowSnapshot.event_date)
     )
     fields = ["taken_at", "city", "event_date", "market_id", "outcome_id", "bucket",
               "hours_to_close", "local_hour", "model_p", "raw_p", "normalized",
@@ -2167,7 +2166,10 @@ async def admin_shadow_csv(
               "intraday_p", "v2_p", "v2_mu", "won"]
 
     async def rows_for(session):
-        async for snap, label, won, city in stream_rows(session, q):
+        # One day at a time: the single query over ~1.5M rows failed in
+        # production on 23 Oct and the export came back empty.
+        async for snap, label, won, city in stream_rows_by_day(
+                session, q, ShadowSnapshot.taken_at, cutoff, now + timedelta(minutes=1)):
             yield {
                 "taken_at": snap.taken_at.isoformat(), "city": city,
                 "event_date": snap.event_date.isoformat(), "market_id": snap.market_id,

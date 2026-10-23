@@ -152,6 +152,26 @@ async def stream_csv(
     )
 
 
+async def stream_rows_by_day(db, query, time_col, start, end) -> AsyncIterator:
+    """Yield the rows of `query` one day of `time_col` at a time, in order.
+
+    For the large time-ordered exports (the shadow study has ~1.5 million
+    rows over its 45 days): each statement is a small range read the BRIN
+    index on the time column serves directly, nothing stays open between
+    days, and memory is bounded by one day's rows.
+    """
+    from datetime import timedelta
+    day = start
+    while day < end:
+        nxt = min(day + timedelta(days=1), end)
+        rows = (await db.execute(
+            query.where(time_col >= day, time_col < nxt).order_by(None).order_by(time_col)
+        )).all()
+        for row in rows:
+            yield row
+        day = nxt
+
+
 async def stream_rows(db, query, batch: int = DB_BATCH):
     """Yield result rows from `query` without materialising the whole set.
 
@@ -162,7 +182,12 @@ async def stream_rows(db, query, batch: int = DB_BATCH):
     try:
         result = await db.stream(query.execution_options(yield_per=batch))
     except Exception as exc:
-        logger.debug(f"[csv_stream] server-side cursor unavailable ({exc}); buffering")
+        # The failed statement leaves the transaction aborted; without a
+        # rollback the fallback fails too ("current transaction is aborted"),
+        # which is how the 23 Oct shadow export came back empty.
+        logger.warning(f"[csv_stream] server-side cursor failed ({type(exc).__name__}: {exc}); "
+                       f"falling back to a buffered read")
+        await db.rollback()
         for row in (await db.execute(query)).all():
             yield row
         return
