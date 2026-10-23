@@ -173,6 +173,9 @@ class TestStreamRows:
             async def stream(self, q):
                 raise NotImplementedError("no server-side cursor")
 
+            async def rollback(self):
+                pass
+
             async def execute(self, q):
                 class _R:
                     def all(self):
@@ -269,3 +272,82 @@ class TestZipped:
     def test_the_shadow_export_offers_it(self):
         src = ADMIN.read_text(encoding="utf-8")
         assert 'stream_csv("shadow.csv", fields, rows_for, zipped=zipped)' in src
+
+
+# ── 23 Oct: the shadow export came back as one header and an error ────────
+
+class TestFallbackAfterAFailedStream:
+    @pytest.mark.asyncio
+    async def test_the_failed_transaction_is_rolled_back_before_the_fallback(self):
+        """A failed server-side cursor leaves the transaction aborted; reading
+        again in it fails with 'current transaction is aborted'."""
+        calls = []
+
+        class _Result:
+            def all(self):
+                return [("row",)]
+
+        class _Session:
+            aborted = False
+
+            async def stream(self, q):
+                calls.append("stream")
+                self.aborted = True
+                raise RuntimeError("cursor failed")
+
+            async def rollback(self):
+                calls.append("rollback")
+                self.aborted = False
+
+            async def execute(self, q):
+                calls.append("execute")
+                if self.aborted:
+                    raise RuntimeError("current transaction is aborted")
+                return _Result()
+
+        class _Q:
+            def execution_options(self, **k):
+                return self
+
+        rows = [r async for r in stream_rows(_Session(), _Q())]
+        assert rows == [("row",)]
+        assert calls == ["stream", "rollback", "execute"]
+
+
+class TestByDay:
+    @pytest.mark.asyncio
+    async def test_every_row_once_in_time_order(self, sqlite_db):
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select
+        import app.shadow.models  # noqa: F401
+        from app.shadow.models import ShadowSnapshot
+        from app.utils.csv_stream import stream_rows_by_day
+        t0 = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+        times = [t0 + timedelta(hours=h) for h in (0, 5, 23, 24, 30, 47, 48)]   # day edges included
+        for i, t in enumerate(times):
+            sqlite_db.add(ShadowSnapshot(outcome_id=i, taken_at=t, market_id=1, city_id=1,
+                                         event_date=t.date(), hours_to_close=5.0, local_hour=1,
+                                         model_p=.1, raw_p=.1, normalized=False))
+        await sqlite_db.commit()
+        q = select(ShadowSnapshot.outcome_id, ShadowSnapshot.taken_at)
+        got = [r async for r in stream_rows_by_day(sqlite_db, q, ShadowSnapshot.taken_at,
+                                                   t0, t0 + timedelta(days=3))]
+        assert [r[0] for r in got] == list(range(len(times))), "each row once, in order"
+
+    @pytest.mark.asyncio
+    async def test_the_window_bounds_are_respected(self, sqlite_db):
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select
+        import app.shadow.models  # noqa: F401
+        from app.shadow.models import ShadowSnapshot
+        from app.utils.csv_stream import stream_rows_by_day
+        t0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        for i, h in enumerate((-1, 1, 50)):
+            sqlite_db.add(ShadowSnapshot(outcome_id=i, taken_at=t0 + timedelta(hours=h), market_id=1,
+                                         city_id=1, event_date=t0.date(), hours_to_close=5.0,
+                                         local_hour=1, model_p=.1, raw_p=.1, normalized=False))
+        await sqlite_db.commit()
+        q = select(ShadowSnapshot.outcome_id)
+        got = [r[0] async for r in stream_rows_by_day(sqlite_db, q, ShadowSnapshot.taken_at,
+                                                      t0, t0 + timedelta(days=2))]
+        assert got == [1]
