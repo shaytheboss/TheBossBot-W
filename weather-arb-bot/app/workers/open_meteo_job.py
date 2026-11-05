@@ -57,6 +57,7 @@ from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.city import City
 from app.models.forecast import Forecast
+from app.models.model_run_value import ModelRunValue
 from app.models.model_update_event import ModelUpdateEvent
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,10 @@ EXTRA_PREFIX = "om_"
 TIER_ORDER = ("core", "hrrr", "probe", "ensemble", "extra")
 # Change events older than this are pruned by the job itself.
 UPDATE_EVENT_RETENTION_DAYS = 30
+# Per-run model values (model_run_values): kept long enough to score each run
+# against a month of outcomes, and only for the dates trading can touch.
+RUN_VALUE_RETENTION_DAYS = 60
+RUN_VALUE_DAYS = (-1, 2)          # yesterday .. two days ahead, by server date
 MODES = ("batched", "legacy")
 
 # Models that only cover part of the globe. Asking outside the domain spends
@@ -213,6 +218,7 @@ def reset_budget() -> None:
     """For tests: the budget is module state, like the other caches."""
     global BUDGET
     _LAST_FETCH.clear()
+    _LAST_VALUE.clear()
     BUDGET = Budget()
 
 
@@ -383,6 +389,7 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
     start_requests = BUDGET.requests
 
     changes: dict[str, list] = {}   # source → [changed, compared, latest prev fetch]
+    values: list = []               # ModelRunValue rows, written with the events
 
     for tier in TIER_ORDER:
         if tier not in due:
@@ -418,7 +425,7 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
                                  BUDGET.paused_until, e)
                     summary["requests"] = BUDGET.requests - start_requests
                     BUDGET.last_run = summary
-                    await _record_changes(db, changes, now)
+                    await _record_changes(db, changes, now, values)
                     return summary
                 except ModelRejected as e:
                     if spec.source.startswith(EXTRA_PREFIX):
@@ -438,6 +445,7 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
 
                 rows = parse(spec, data, dates)
                 _note_change(changes, spec, city.id, rows, data, now)
+                _note_values(values, spec, city.id, rows, data, now, today)
                 for d, parsed in rows.items():
                     db.add(to_forecast(spec, city.id, d, parsed))
                 if rows:
@@ -446,8 +454,9 @@ async def run_open_meteo(db, cities, *, now: Optional[datetime] = None,
 
     summary["requests"] = BUDGET.requests - start_requests
     summary["changed"] = {k: v[0] for k, v in changes.items() if v[0]}
+    summary["run_values"] = len(values)
     BUDGET.last_run = summary
-    await _record_changes(db, changes, now)
+    await _record_changes(db, changes, now, values)
     logger.info("Open-Meteo run: %s", summary)
     return summary
 
@@ -498,9 +507,52 @@ def _note_change(changes: dict, spec: Spec, city_id: int, rows: dict, data: dict
         entry[2] = prev_at if entry[2] is None else max(entry[2], prev_at)
 
 
-async def _record_changes(db, changes: dict, now: datetime) -> None:
+# (source, city_id, date) → (fetched_at, unrounded high). Memory only, like
+# _LAST_FETCH: after a restart the first value is written as a baseline.
+_LAST_VALUE: dict[tuple, tuple] = {}
+
+
+def _unrounded_highs(spec: Spec, rows: dict, data: dict) -> dict:
+    if spec.kind == "ensemble":
+        return {d: sum(r["ensemble_highs"]) / len(r["ensemble_highs"])
+                for d, r in rows.items() if r.get("ensemble_highs")}
+    daily = data.get("daily") or {}
+    index = {t: i for i, t in enumerate(daily.get("time") or [])}
+    out = {}
+    for d in rows:
+        v = _at(daily.get("temperature_2m_max"), index[str(d)])
+        if v is not None:
+            out[d] = float(v)
+    return out
+
+
+def _note_values(values: list, spec: Spec, city_id: int, rows: dict, data: dict,
+                 now: datetime, today: date) -> None:
+    """Queue a ModelRunValue for every date whose unrounded high moved since
+    the last fetch. Never raises: the measurement must not cost a forecast."""
+    try:
+        lo, hi = today + timedelta(days=RUN_VALUE_DAYS[0]), today + timedelta(days=RUN_VALUE_DAYS[1])
+        for d, high in _unrounded_highs(spec, rows, data).items():
+            if not lo <= d <= hi:
+                continue
+            key = (spec.source, city_id, d)
+            prev = _LAST_VALUE.get(key)
+            _LAST_VALUE[key] = (now, high)
+            if prev is not None and abs(prev[1] - high) < 1e-6:
+                continue
+            values.append(ModelRunValue(
+                source=spec.source, city_id=city_id, forecast_for_date=d, detected_at=now,
+                prev_fetch_at=None if prev is None else prev[0], high_f=round(high, 2)))
+    except Exception as e:
+        logger.warning("model run value skipped for %s: %s", spec.source, e)
+
+
+async def _record_changes(db, changes: dict, now: datetime, values: Optional[list] = None) -> None:
     try:
         wrote = False
+        if values:
+            db.add_all(values)
+            wrote = True
         for source, (changed, compared, prev_at) in changes.items():
             if changed:
                 db.add(ModelUpdateEvent(source=source, detected_at=now, prev_fetch_at=prev_at,
@@ -510,11 +562,14 @@ async def _record_changes(db, changes: dict, now: datetime) -> None:
             await db.execute(delete(ModelUpdateEvent).where(
                 ModelUpdateEvent.detected_at
                 < now - timedelta(days=UPDATE_EVENT_RETENTION_DAYS)))
+            await db.execute(delete(ModelRunValue).where(
+                ModelRunValue.detected_at
+                < now - timedelta(days=RUN_VALUE_RETENTION_DAYS)))
             wrote = True
         if wrote:
             await db.commit()
     except Exception as e:   # a measurement must never cost a forecast run
-        logger.warning("model_update_events write failed: %s", e)
+        logger.warning("model_update_events / model_run_values write failed: %s", e)
         await db.rollback()
 
 
