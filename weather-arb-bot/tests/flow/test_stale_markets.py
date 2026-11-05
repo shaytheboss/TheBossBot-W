@@ -116,7 +116,7 @@ class TestShadowExport:
                                       model_p=.2, raw_p=.2, normalized=False))
             await db.commit()
         try:
-            resp = await admin_shadow_csv("t", days=5, zipped=zipped)
+            resp = await admin_shadow_csv("t", days=5, zipped=zipped, since=None)
             if zipped:
                 import io
                 import zipfile
@@ -130,3 +130,42 @@ class TestShadowExport:
             await engine.dispose()
         assert "b10" in body and "b20" not in body
         assert kept == 2, "nothing is deleted"
+
+    @pytest.mark.asyncio
+    async def test_since_exports_only_the_days_from_that_date(self, monkeypatch):
+        """The full window no longer fits a phone upload; `since` cuts it to
+        the new days. A date further back than `days` still wins."""
+        from app.database import Base
+        import app.models  # noqa: F401
+        from app.api.admin import admin_shadow_csv
+
+        engine = sqlite_compat.make_engine()
+        await sqlite_compat.create_schema(engine, Base.metadata)
+        maker = sqlite_compat.make_sessionmaker(engine)
+        monkeypatch.setattr("app.utils.csv_stream.AsyncSessionLocal", maker)
+        ny = city_fixtures.get("New York")
+        today = datetime.now(timezone.utc).date()
+        async with maker() as db:
+            db.add(ny.as_row())
+            db.add(Market(id=1, city_id=ny.id, external_id=WITH_YEAR, question="q", event_date=DAY))
+            for oid, ago in ((10, 1), (20, 6), (30, 20)):
+                db.add(MarketOutcome(id=oid, market_id=1, bucket_label=f"b{oid}", bucket_unit="F"))
+                db.add(ShadowSnapshot(outcome_id=oid, market_id=1, city_id=ny.id, event_date=DAY,
+                                      taken_at=datetime.combine(today - timedelta(days=ago), time(12),
+                                                                tzinfo=timezone.utc),
+                                      hours_to_close=10.0, local_hour=12,
+                                      model_p=.2, raw_p=.2, normalized=False))
+            await db.commit()
+
+        async def body(**kw):
+            resp = await admin_shadow_csv("t", zipped=False, **kw)
+            return "".join([c async for c in resp.body_iterator])
+        try:
+            recent = await body(days=45, since=today - timedelta(days=3))
+            wide = await body(days=2, since=today - timedelta(days=10))
+            default = await body(days=45, since=None)
+        finally:
+            await engine.dispose()
+        assert "b10" in recent and "b20" not in recent and "b30" not in recent
+        assert "b10" in wide and "b20" in wide and "b30" not in wide
+        assert all(b in default for b in ("b10", "b20", "b30"))

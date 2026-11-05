@@ -2139,15 +2139,23 @@ async def admin_shadow_csv(
     _: str = Depends(require_admin),
     days: int = Query(default=45, ge=1, le=400),
     zipped: bool = Query(default=False),
+    since: Optional[date_cls] = Query(default=None, description="Only snapshots taken from this day (UTC) on; overrides `days`"),
 ):
     """Every shadow snapshot with its bucket, city and — once resolved —
     whether that bucket won. The raw material for the per-time-window
-    analysis. Streams, so it never holds the export in memory."""
+    analysis. Streams, so it never holds the export in memory.
+
+    `since` exists because the full window no longer fits a phone upload even
+    zipped (~30 MB on 5 Nov); a follow-up export only needs the new days."""
     from app.shadow.models import ShadowSnapshot
     from app.utils.csv_stream import stream_csv, stream_rows_by_day
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
+    if since is not None:
+        # Never further back than the longest `days` allows.
+        cutoff = max(datetime(since.year, since.month, since.day, tzinfo=timezone.utc),
+                     now - timedelta(days=400))
     q = (
         select(ShadowSnapshot, MarketOutcome.bucket_label, MarketOutcome.won, City.name)
         .join(MarketOutcome, MarketOutcome.id == ShadowSnapshot.outcome_id)
