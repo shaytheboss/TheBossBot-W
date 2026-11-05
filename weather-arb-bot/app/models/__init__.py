@@ -12,6 +12,7 @@ from app.models.collector_miss import CollectorMiss
 from app.models.virtual_exit import VirtualExit
 from app.models.app_setting import AppSetting
 from app.models.model_update_event import ModelUpdateEvent
+from app.models.model_run_value import ModelRunValue
 
 __all__ = [
     "City",
@@ -31,4 +32,5 @@ __all__ = [
     "VirtualExit",
     "AppSetting",
     "ModelUpdateEvent",
+    "ModelRunValue",
 ]

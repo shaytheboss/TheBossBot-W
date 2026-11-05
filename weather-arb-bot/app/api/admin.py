@@ -2201,6 +2201,81 @@ async def admin_shadow_csv(
     return await stream_csv("shadow.csv", fields, rows_for, zipped=zipped)
 
 
+@router.get("/model-runs/csv")
+async def admin_model_runs_csv(
+    _: str = Depends(require_admin),
+    days: int = Query(default=30, ge=1, le=60),
+    zipped: bool = Query(default=False),
+    since: Optional[date_cls] = Query(default=None, description="Only values detected from this day (UTC) on; overrides `days`"),
+):
+    """Every recorded change of an Open-Meteo model's forecast high, per city
+    and date (model_run_values): which run said what, and when it appeared."""
+    from app.models.model_run_value import ModelRunValue
+    from app.utils.csv_stream import stream_csv, stream_rows_by_day
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    if since is not None:
+        cutoff = max(datetime(since.year, since.month, since.day, tzinfo=timezone.utc),
+                     now - timedelta(days=60))
+    q = (select(ModelRunValue, City.name)
+         .join(City, City.id == ModelRunValue.city_id))
+    fields = ["detected_at", "prev_fetch_at", "source", "city", "forecast_for_date", "high_f"]
+
+    async def rows_for(session):
+        async for v, city in stream_rows_by_day(
+                session, q, ModelRunValue.detected_at, cutoff, now + timedelta(minutes=1)):
+            yield {"detected_at": v.detected_at.isoformat(),
+                   "prev_fetch_at": "" if v.prev_fetch_at is None else v.prev_fetch_at.isoformat(),
+                   "source": v.source, "city": city,
+                   "forecast_for_date": v.forecast_for_date.isoformat(), "high_f": round(v.high_f, 2)}
+
+    return await stream_csv("model_runs.csv", fields, rows_for, zipped=zipped)
+
+
+@router.get("/prices/csv")
+async def admin_prices_csv(
+    _: str = Depends(require_admin),
+    days: int = Query(default=7, ge=1, le=45),
+    zipped: bool = Query(default=False),
+    since: Optional[date_cls] = Query(default=None, description="Markets whose event date is on or after this day; overrides `days`"),
+):
+    """The stored price history (every change, polled every 5 minutes) of
+    every market whose event date falls from `since` to three days ahead.
+
+    Read market by market so each query rides the (outcome_id, timestamp)
+    index — a time-range scan over market_prices would read the whole table."""
+    from app.utils.csv_stream import stream_csv
+
+    today = date_cls.today()
+    start = since if since is not None else today - timedelta(days=days)
+    start = max(start, today - timedelta(days=45))
+    markets_q = (select(Market.id, Market.event_date, City.name)
+                 .join(City, City.id == Market.city_id)
+                 .where(Market.event_date >= start, Market.event_date <= today + timedelta(days=3))
+                 .order_by(Market.event_date, Market.id))
+    fields = ["timestamp", "city", "event_date", "market_id", "outcome_id", "bucket",
+              "yes_price", "won"]
+
+    async def rows_for(session):
+        markets = (await session.execute(markets_q)).all()
+        for market_id, event_date, city in markets:
+            prices = (await session.execute(
+                select(MarketPrice.timestamp, MarketPrice.outcome_id, MarketPrice.yes_price,
+                       MarketOutcome.bucket_label, MarketOutcome.won)
+                .join(MarketOutcome, MarketOutcome.id == MarketPrice.outcome_id)
+                .where(MarketOutcome.market_id == market_id)
+                .order_by(MarketPrice.outcome_id, MarketPrice.timestamp)
+            )).all()
+            for ts, outcome_id, yes_price, label, won in prices:
+                yield {"timestamp": ts.isoformat(), "city": city,
+                       "event_date": event_date.isoformat(), "market_id": market_id,
+                       "outcome_id": outcome_id, "bucket": label,
+                       "yes_price": float(yes_price), "won": "" if won is None else int(won)}
+
+    return await stream_csv("prices.csv", fields, rows_for, zipped=zipped)
+
+
 @router.get("/open-meteo/status")
 async def admin_open_meteo_status(
     _: str = Depends(require_admin),
