@@ -2233,6 +2233,42 @@ async def admin_model_runs_csv(
     return await stream_csv("model_runs.csv", fields, rows_for, zipped=zipped)
 
 
+@router.get("/nws-obs/csv")
+async def admin_nws_obs_csv(
+    _: str = Depends(require_admin),
+    days: int = Query(default=14, ge=1, le=60),
+    zipped: bool = Query(default=False),
+    since: Optional[date_cls] = Query(default=None, description="Only observations from this day (UTC) on; overrides `days`"),
+):
+    """Every recorded weather.gov observation of the US stations: the
+    five-minute readings and the hourly METARs, with the city they belong to."""
+    from app.nwsobs.models import NwsObservation
+    from app.utils.csv_stream import stream_csv, stream_rows_by_day
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    if since is not None:
+        cutoff = max(datetime(since.year, since.month, since.day, tzinfo=timezone.utc),
+                     now - timedelta(days=60))
+    city_of = {}
+
+    async def rows_for(session):
+        for icao, name in (await session.execute(select(City.primary_icao, City.name))).all():
+            city_of.setdefault((icao or "").upper(), name)
+        async for o in stream_rows_by_day(session, select(NwsObservation),
+                                          NwsObservation.observed_at, cutoff,
+                                          now + timedelta(minutes=1)):
+            o = o[0]
+            yield {"observed_at": o.observed_at.isoformat(), "icao": o.icao,
+                   "city": city_of.get(o.icao, ""),
+                   "temperature_c": "" if o.temperature_c is None else round(o.temperature_c, 2),
+                   "is_metar": int(o.is_metar), "qc": o.qc or ""}
+
+    return await stream_csv("nws_obs.csv",
+                            ["observed_at", "icao", "city", "temperature_c", "is_metar", "qc"],
+                            rows_for, zipped=zipped)
+
+
 @router.get("/prices/csv")
 async def admin_prices_csv(
     _: str = Depends(require_admin),

@@ -22,6 +22,7 @@ METEOSOURCE = "meteosource.com/api/v1/free/point"
 NWS_POINTS = "api.weather.gov/points"
 NWS_GRIDPOINT = "api.weather.gov/gridpoints"
 METAR = "aviationweather.gov/api/data/metar"
+NWS_OBS = "api.weather.gov/stations"
 PIREP = "aviationweather.gov/api/data/pirep"
 BUOY = "ndbc.noaa.gov"
 
@@ -242,6 +243,24 @@ def metar_records(
             f"{int(temp_c):02d}/{int(dew_c):02d} A2993"
         ),
     }]
+
+
+def nws_observations(icao: str = "KAUS", readings=()) -> dict:
+    """api.weather.gov `/stations/{icao}/observations` (GeoJSON), newest
+    first, as the real API answers it. `readings` is a list of
+    (timestamp, temperature °C or None, is_metar). The 5-minute ASOS
+    readings carry whole °C and no rawMessage; the hourly METAR carries
+    tenths and its raw text."""
+    feats = []
+    for ts, temp_c, is_metar in sorted(readings, key=lambda r: r[0], reverse=True):
+        feats.append({"properties": {
+            "station": f"https://api.weather.gov/stations/{icao}",
+            "timestamp": ts.isoformat(),
+            "rawMessage": f"{icao} {ts:%d%H%M}Z 18009KT 10SM FEW040" if is_metar else "",
+            "temperature": {"unitCode": "wmoUnit:degC", "value": temp_c,
+                            "qualityControl": "V" if temp_c is not None else "Z"},
+        }})
+    return {"type": "FeatureCollection", "features": feats}
 
 
 def metar_empty() -> list:

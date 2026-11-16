@@ -189,6 +189,12 @@ async def lifespan(app: FastAPI):
         _add_tracked_job(job_record_peaks, CronTrigger(hour="*/3", minute=40),
                          id="peaks", max_instances=1, misfire_grace_time=1800)
 
+        # weather.gov five-minute observations for US cities (app/nwsobs/) —
+        # record-only. Off the :00 minute the price and METAR jobs crowd.
+        from app.nwsobs.job import job_record_nws_observations
+        _add_tracked_job(job_record_nws_observations, CronTrigger(minute="3-59/10"),
+                         id="nws_obs", max_instances=1, misfire_grace_time=300)
+
         _scheduler.start()
         logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
     except Exception as e:
