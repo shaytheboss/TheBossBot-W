@@ -2233,6 +2233,52 @@ async def admin_model_runs_csv(
     return await stream_csv("model_runs.csv", fields, rows_for, zipped=zipped)
 
 
+@router.get("/metar/csv")
+async def admin_metar_csv(
+    _: str = Depends(require_admin),
+    days: int = Query(default=14, ge=1, le=60),
+    zipped: bool = Query(default=False),
+    since: Optional[date_cls] = Query(default=None, description="Only observations from this day (UTC) on; overrides `days`"),
+):
+    """Stored METARs of every settlement station, reference station and nearby
+    station (app/nearby/), each labelled with its city and role. Read station
+    by station on the (icao, observed_at) index."""
+    from app.nearby.stations import NEARBY
+    from app.utils.csv_stream import stream_csv
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    if since is not None:
+        cutoff = max(datetime(since.year, since.month, since.day, tzinfo=timezone.utc),
+                     now - timedelta(days=60))
+
+    async def rows_for(session):
+        roles: dict[str, tuple[str, str]] = {}
+        for name, primary, reference in (await session.execute(
+                select(City.name, City.primary_icao, City.reference_icao))).all():
+            if primary:
+                roles.setdefault(primary.upper(), (name, "settlement"))
+                for icao, _, _ in NEARBY.get(primary.upper(), ()):
+                    roles.setdefault(icao, (name, "nearby"))
+            if reference:
+                roles.setdefault(reference.upper(), (name, "reference"))
+        for icao in sorted(roles):
+            city, role = roles[icao]
+            rows = (await session.execute(
+                select(MetarObservation.observed_at, MetarObservation.temperature_f,
+                       MetarObservation.wind_direction, MetarObservation.wind_speed_kt)
+                .where(MetarObservation.icao == icao, MetarObservation.observed_at >= cutoff)
+                .order_by(MetarObservation.observed_at))).all()
+            for at, temp, wdir, wspd in rows:
+                yield {"observed_at": at.isoformat(), "icao": icao, "city": city, "role": role,
+                       "temperature_f": "" if temp is None else float(temp),
+                       "wind_direction": "" if wdir is None else wdir,
+                       "wind_speed_kt": "" if wspd is None else wspd}
+
+    return await stream_csv("metar.csv", ["observed_at", "icao", "city", "role", "temperature_f",
+                                          "wind_direction", "wind_speed_kt"], rows_for, zipped=zipped)
+
+
 @router.get("/nws-obs/csv")
 async def admin_nws_obs_csv(
     _: str = Depends(require_admin),

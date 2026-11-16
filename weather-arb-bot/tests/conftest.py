@@ -119,6 +119,7 @@ def reset_module_caches():
     import app.workers.open_meteo_job as open_meteo_job
     import app.peaks.job as peaks_job
     import app.nwsobs.job as nwsobs_job
+    import app.nearby.job as nearby_job
     import app.peaks.guard as peaks_guard
     import app.shadow.v2 as shadow_v2
     from app.utils import jobstats
@@ -141,6 +142,7 @@ def reset_module_caches():
         open_meteo_job.reset_budget()
         peaks_job.LAST_RUN.clear()
         nwsobs_job.LAST_RUN.clear()
+        nearby_job.LAST_RUN.clear()
         peaks_guard.reset_cache()
         shadow_v2.reset_cache()
 

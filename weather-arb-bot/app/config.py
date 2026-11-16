@@ -135,6 +135,8 @@ class Settings(BaseSettings):
     peaks_enabled: bool = True
     # weather.gov observations for US cities (app/nwsobs/) — record-only.
     nws_obs_enabled: bool = True
+    # Nearby stations' METARs around each settlement station (app/nearby/) — record-only.
+    nearby_obs_enabled: bool = True
 
     # ── Shadow study (app/shadow/) ──────────────────────────────────────────
     # Hourly record of the model's estimate vs the market price for EVERY
