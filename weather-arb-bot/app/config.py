@@ -133,6 +133,8 @@ class Settings(BaseSettings):
 
     # ── Daily peak times (app/peaks/) — record-only, never read by trading ──
     peaks_enabled: bool = True
+    # weather.gov observations for US cities (app/nwsobs/) — record-only.
+    nws_obs_enabled: bool = True
 
     # ── Shadow study (app/shadow/) ──────────────────────────────────────────
     # Hourly record of the model's estimate vs the market price for EVERY
