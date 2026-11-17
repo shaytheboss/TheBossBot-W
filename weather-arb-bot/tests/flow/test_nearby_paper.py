@@ -82,8 +82,12 @@ class TestTheSignal:
         assert (s.bid, s.ask, s.ask_size) == (0.58, 0.62, 100.0)
         assert http.param(pm.CLOB_BOOK, "token_id") == "tok70"
         msg = fake_telegram.only()
-        assert "Nearby signal — Austin" in msg.text and "4 of 5" in msg.text and "62.0¢" in msg.text
-        assert "paper" in msg.text and msg.chat_id == 111
+        first = msg.text.splitlines()[0]
+        assert "YES 70-71°F" in first and "Austin" in first, "the bet comes first"
+        assert "Ask <b>62.0¢</b>" in msg.text.splitlines()[1]
+        assert "4 of 5" in msg.text and "°C" not in msg.text, "a °F market speaks °F"
+        assert "Paper only" in msg.text and msg.chat_id == 111
+        assert s.tradable is True
 
     @pytest.mark.asyncio
     async def test_only_the_first_signal_per_market(self, http, world, fake_telegram):
@@ -111,6 +115,23 @@ class TestTheSignal:
         await _run(world, http, T + timedelta(minutes=5))
         (s,) = await _signals(world)
         assert s.ask == 0.74
+
+    @pytest.mark.asyncio
+    async def test_a_wide_book_is_recorded_but_not_announced_or_scored(self, http, world, fake_telegram):
+        """Munich, first day live: mid 84c sat inside the band, but the ask was
+        99.5c on a 30c spread — there was no trade to make."""
+        from app.api.admin import admin_nearby_report
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.692, ask=0.995))
+        stats = await _run(world, http)
+        (s,) = await _signals(world)
+        assert stats["recorded"] == 1 and stats["not_tradable"] == 1 and stats["alerted"] == 0
+        assert s.tradable is False and fake_telegram.sent == []
+        async with world() as db:
+            (await db.get(MarketOutcome, 11)).won = True
+            await db.commit()
+            rep = await admin_nearby_report("t", db, days=30)
+        assert rep["signals"] == 1 and rep["tradable"] == 0 and rep["settled"] == 0
+        assert rep["pnl_per_share_at_ask"] is None
 
     @pytest.mark.asyncio
     async def test_alerts_can_be_switched_off(self, http, world, fake_telegram, monkeypatch):

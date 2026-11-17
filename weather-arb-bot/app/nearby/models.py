@@ -25,6 +25,9 @@ class NearbySignal(Base):
     bid = Column(REAL)
     ask = Column(REAL)
     ask_size = Column(REAL)
+    # Could the paper buy actually have been made at that ask (signal.tradable)?
+    # Only tradable signals are announced and counted in the result.
+    tradable = Column(Boolean)
     # The mid 10 and 30 minutes later: how fast the market caught up.
     mid_10 = Column(REAL)
     mid_30 = Column(REAL)
