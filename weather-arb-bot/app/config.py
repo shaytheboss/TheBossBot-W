@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     nws_obs_enabled: bool = True
     # Nearby stations' METARs around each settlement station (app/nearby/) — record-only.
     nearby_obs_enabled: bool = True
+    # Paper trades on the nearby-station signal (app/nearby/paper.py), priced at
+    # the live book, and their Telegram messages. Nothing is bought.
+    nearby_paper_enabled: bool = True
+    nearby_alerts_enabled: bool = True
 
     # ── Shadow study (app/shadow/) ──────────────────────────────────────────
     # Hourly record of the model's estimate vs the market price for EVERY

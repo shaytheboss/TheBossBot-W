@@ -124,6 +124,10 @@ class SettingsIn(BaseModel):
     shadow_alert_mode: Optional[str] = None
     intraday_min_entry_cost: Optional[float] = None
     intraday_peak_guard_enabled: Optional[bool] = None
+    nws_obs_enabled: Optional[bool] = None
+    nearby_obs_enabled: Optional[bool] = None
+    nearby_paper_enabled: Optional[bool] = None
+    nearby_alerts_enabled: Optional[bool] = None
     intraday_peak_guard_min_passed: Optional[float] = None
     model_fetch_mode: Optional[str] = None
     open_meteo_extra_models: Optional[str] = None
@@ -2233,6 +2237,59 @@ async def admin_model_runs_csv(
     return await stream_csv("model_runs.csv", fields, rows_for, zipped=zipped)
 
 
+@router.get("/nearby/report")
+async def admin_nearby_report(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=30, ge=1, le=120),
+):
+    """The nearby-station paper test: every signal, what a buy would have paid
+    at the live ask, how the market moved after it, and — once settled — the
+    result. Small table; one query."""
+    from app.nearby import job as nearby_job
+    from app.nearby.models import NearbySignal
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = (await db.execute(
+        select(NearbySignal, City.name, MarketOutcome.bucket_label, MarketOutcome.won)
+        .join(City, City.id == NearbySignal.city_id)
+        .join(MarketOutcome, MarketOutcome.id == NearbySignal.outcome_id)
+        .where(NearbySignal.signaled_at >= since)
+        .order_by(desc(NearbySignal.signaled_at))
+    )).all()
+    out = []
+    for s, city, bucket, won in rows:
+        mid = None if s.bid is None or s.ask is None else (s.bid + s.ask) / 2
+        out.append({
+            "at": s.signaled_at.isoformat(), "city": city, "date": s.event_date.isoformat(),
+            "local_hour": s.local_hour, "bucket": bucket, "nearby": f"{s.n_falling}/{s.n_nearby}",
+            "ask": s.ask, "bid": s.bid, "ask_size": s.ask_size,
+            "move_10": None if s.mid_10 is None or mid is None else round(s.mid_10 - mid, 4),
+            "move_30": None if s.mid_30 is None or mid is None else round(s.mid_30 - mid, 4),
+            "won": None if won is None else bool(won),
+            "pnl_per_share": None if won is None or s.ask is None else round(int(won) - s.ask, 4),
+        })
+
+    def mean(xs):
+        xs = [x for x in xs if x is not None]
+        return round(sum(xs) / len(xs), 4) if xs else None
+    settled = [r for r in out if r["won"] is not None]
+    return {
+        "days": days,
+        "signals": len(out),
+        "settled": len(settled),
+        "wins": sum(1 for r in settled if r["won"]),
+        "avg_ask": mean([r["ask"] for r in out]),
+        "avg_spread": mean([None if r["ask"] is None or r["bid"] is None else r["ask"] - r["bid"] for r in out]),
+        "pnl_per_share_at_ask": mean([r["pnl_per_share"] for r in settled]),
+        "total_pnl_one_share_each": round(sum(r["pnl_per_share"] for r in settled if r["pnl_per_share"] is not None), 2),
+        "avg_move_10": mean([r["move_10"] for r in out]),
+        "avg_move_30": mean([r["move_30"] for r in out]),
+        "last_run": dict(nearby_job.LAST_RUN),
+        "rows": out,
+    }
+
+
 @router.get("/metar/csv")
 async def admin_metar_csv(
     _: str = Depends(require_admin),
@@ -2706,6 +2763,10 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "shadow_alert_mode": getattr(settings, "shadow_alert_mode", "summary"),
         "intraday_min_entry_cost": getattr(settings, "intraday_min_entry_cost", 0.70),
         "intraday_peak_guard_enabled": getattr(settings, "intraday_peak_guard_enabled", False),
+        "nws_obs_enabled": getattr(settings, "nws_obs_enabled", True),
+        "nearby_obs_enabled": getattr(settings, "nearby_obs_enabled", True),
+        "nearby_paper_enabled": getattr(settings, "nearby_paper_enabled", True),
+        "nearby_alerts_enabled": getattr(settings, "nearby_alerts_enabled", True),
         "intraday_peak_guard_min_passed": getattr(settings, "intraday_peak_guard_min_passed", 0.5),
         "model_fetch_mode": getattr(settings, "model_fetch_mode", "batched"),
         "open_meteo_extra_models": getattr(settings, "open_meteo_extra_models", ""),
@@ -2806,7 +2867,8 @@ async def admin_set_settings(
         if len(names) > 10 or any(not re.fullmatch(r"[a-z0-9_]{2,26}", m) for m in names):
             raise HTTPException(400, "open_meteo_extra_models: up to 10 Open-Meteo model ids, comma-separated")
         changed["open_meteo_extra_models"] = ",".join(names)
-    for flag in ("open_meteo_hrrr_half_hourly", "open_meteo_probe_enabled"):
+    for flag in ("open_meteo_hrrr_half_hourly", "open_meteo_probe_enabled", "nws_obs_enabled",
+                 "nearby_obs_enabled", "nearby_paper_enabled", "nearby_alerts_enabled"):
         val = getattr(payload, flag)
         if val is not None:
             changed[flag] = bool(val)

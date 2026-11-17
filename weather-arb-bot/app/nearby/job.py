@@ -1,4 +1,4 @@
-"""Collect the nearby stations' METARs. Every 10 minutes, one request.
+"""Collect the nearby stations' METARs. Every 5 minutes, one request.
 
 Frugal by construction:
   - only cities with a market for the city's local today that is not yet
@@ -133,6 +133,9 @@ async def job_record_nearby() -> None:
         return
     async with AsyncSessionLocal() as db:
         stats = await record_nearby(db)
+        if getattr(settings, "nearby_paper_enabled", True):
+            from app.nearby.paper import run_paper
+            stats["paper"] = await run_paper(db)
     LAST_RUN.clear()
     LAST_RUN.update(stats)
     logger.info(f"[nearby] {stats}")

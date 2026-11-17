@@ -53,6 +53,12 @@ PERSISTABLE_KEYS: frozenset = frozenset({
     "open_meteo_extra_models",
     "open_meteo_hrrr_half_hourly",
     "open_meteo_probe_enabled",
+    # Research collectors and the nearby-station paper test — switchable from
+    # the screen so they can be turned off without a deploy.
+    "nws_obs_enabled",
+    "nearby_obs_enabled",
+    "nearby_paper_enabled",
+    "nearby_alerts_enabled",
 })
 
 
