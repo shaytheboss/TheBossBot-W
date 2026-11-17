@@ -154,8 +154,13 @@ async def run_paper(db, now: Optional[datetime] = None,
                 Market.city_id == city.id, Market.event_date == day, Market.resolved == False))).scalars().first()
             if market is None:
                 continue
-            if (await db.execute(select(NearbySignal.id).where(NearbySignal.market_id == market.id))).first():
-                continue                                    # first signal per market only
+            existing = (await db.execute(
+                select(NearbySignal).where(NearbySignal.market_id == market.id))).scalars().first()
+            if existing is not None and existing.tradable:
+                continue                                    # one tradable signal per market
+            # A signal met at an untradable book does NOT close the market: it is
+            # re-checked every run until the book allows a buy (live since #136,
+            # the first wide book had silenced the market for the whole day).
             stats["checked"] += 1
             midnight = datetime.combine(day, time(0), tzinfo=ZoneInfo(city.timezone or "UTC")).astimezone(timezone.utc)
             target_icao = city.primary_icao.upper()
@@ -175,15 +180,24 @@ async def run_paper(db, now: Optional[datetime] = None,
                 continue                                    # not recorded: may still fire later in band
             km = {s: d for s, d, _ in nb}
             local = now.astimezone(ZoneInfo(city.timezone or "UTC"))
-            row = NearbySignal(
-                city_id=city.id, market_id=market.id, outcome_id=hold.id, event_date=day, signaled_at=now,
-                local_hour=round(local.hour + local.minute / 60, 2), icao=target_icao,
+            tradable = sig.tradable(book["bid"], book["ask"])
+            if existing is not None and not tradable:
+                continue                                    # keep the first sighting; try again next run
+            fields = dict(
+                outcome_id=hold.id, signaled_at=now, local_hour=round(local.hour + local.minute / 60, 2),
                 max_f=v.target.high_f, current_f=v.target.now_f, n_nearby=len(v.nearby), n_falling=len(v.falling),
                 detail=[{"icao": s.icao, "km": km.get(s.icao), "now_f": s.now_f, "high_f": s.high_f,
                          "below_f": round(s.below_f, 1)} for s in v.nearby],
-                bid=book["bid"], ask=book["ask"], ask_size=book["ask_size"],
-                tradable=sig.tradable(book["bid"], book["ask"]), alerted=False)
-            db.add(row)
+                bid=book["bid"], ask=book["ask"], ask_size=book["ask_size"], tradable=tradable,
+                mid_10=None, mid_30=None, alerted=False)
+            if existing is None:
+                row = NearbySignal(city_id=city.id, market_id=market.id, event_date=day, icao=target_icao,
+                                   first_seen_at=now, **fields)
+                db.add(row)
+            else:                                           # the book now allows the buy
+                row = existing
+                for k, val in fields.items():
+                    setattr(row, k, val)
             await db.commit()
             stats["recorded"] += 1
             if not row.tradable:

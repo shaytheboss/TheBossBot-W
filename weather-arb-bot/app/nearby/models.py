@@ -13,7 +13,10 @@ class NearbySignal(Base):
     market_id = Column(Integer, nullable=False)
     outcome_id = Column(Integer, nullable=False)       # the bucket holding the max
     event_date = Column(Date, nullable=False)
-    signaled_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    signaled_at = Column(TIMESTAMP(timezone=True), nullable=False)   # the tradable moment (or the first sighting)
+    # When the signal first fired, tradable or not: signaled_at - first_seen_at
+    # is how long the book took to allow the buy.
+    first_seen_at = Column(TIMESTAMP(timezone=True))
     local_hour = Column(REAL, nullable=False)
     icao = Column(String(4), nullable=False)
     max_f = Column(REAL, nullable=False)              # settlement station's high so far
