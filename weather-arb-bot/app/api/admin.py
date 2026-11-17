@@ -2264,6 +2264,8 @@ async def admin_nearby_report(
             "at": s.signaled_at.isoformat(), "city": city, "date": s.event_date.isoformat(),
             "local_hour": s.local_hour, "bucket": bucket, "nearby": f"{s.n_falling}/{s.n_nearby}",
             "ask": s.ask, "bid": s.bid, "ask_size": s.ask_size, "tradable": bool(s.tradable),
+            "waited_min": None if s.first_seen_at is None or not s.tradable
+            else round((s.signaled_at - s.first_seen_at).total_seconds() / 60),
             "move_10": None if s.mid_10 is None or mid is None else round(s.mid_10 - mid, 4),
             "move_30": None if s.mid_30 is None or mid is None else round(s.mid_30 - mid, 4),
             "won": None if won is None else bool(won),

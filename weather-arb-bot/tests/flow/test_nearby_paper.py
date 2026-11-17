@@ -134,6 +134,24 @@ class TestTheSignal:
         assert rep["pnl_per_share_at_ask"] is None
 
     @pytest.mark.asyncio
+    async def test_a_wide_book_does_not_lock_the_market_for_the_day(self, http, world, fake_telegram):
+        """Live since #136: the first signal met a 30c spread, was recorded as not
+        tradable, and the market was never looked at again — no alert at all,
+        even once the book tightened five minutes later."""
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.692, ask=0.995), once=True)
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.62, ask=0.65))
+        await _run(world, http)
+        assert fake_telegram.sent == []
+        stats = await _run(world, http, T + timedelta(minutes=5))
+        (s,) = await _signals(world)
+        assert stats["alerted"] == 1 and len(fake_telegram.sent) == 1
+        assert s.tradable is True and s.ask == 0.65
+        assert s.first_seen_at.replace(tzinfo=timezone.utc) == T, "when it first fired is kept"
+        assert s.signaled_at.replace(tzinfo=timezone.utc) == T + timedelta(minutes=5)
+        await _run(world, http, T + timedelta(minutes=10))
+        assert len(fake_telegram.sent) == 1, "a tradable signal still closes the market"
+
+    @pytest.mark.asyncio
     async def test_alerts_can_be_switched_off(self, http, world, fake_telegram, monkeypatch):
         monkeypatch.setattr("app.config.settings.nearby_alerts_enabled", False)
         http.add(pm.CLOB_BOOK, json=pm.book(bid=0.58, ask=0.62))

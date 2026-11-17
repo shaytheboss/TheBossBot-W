@@ -2381,7 +2381,8 @@ async function showNearby(btn) {
     h += '<div style="overflow-x:auto"><table class="small"><thead><tr><th>When (UTC)</th><th>City</th><th>Bucket</th><th>Nearby past high</th>'
       + '<th>Ask</th><th>Size</th><th>+10m</th><th>+30m</th><th>Result</th></tr></thead><tbody>';
     for (const x of j.rows) {
-      const res = !x.tradable ? 'not buyable' : x.won == null ? 'open' : (x.won ? '✅ ' : '❌ ') + sc(x.pnl_per_share);
+      const res = (!x.tradable ? 'not buyable' : x.won == null ? 'open' : (x.won ? '✅ ' : '❌ ') + sc(x.pnl_per_share))
+        + (x.waited_min ? ` (waited ${x.waited_min} min)` : '');
       h += `<tr><td>${escapeHtml(x.at.slice(5, 16).replace('T', ' '))}</td><td>${escapeHtml(x.city)}</td><td>${escapeHtml(x.bucket)}</td>`
         + `<td>${escapeHtml(x.nearby)}</td><td>${c(x.ask)}</td><td>${x.ask_size == null ? '—' : Math.round(x.ask_size)}</td>`
         + `<td>${sc(x.move_10)}</td><td>${sc(x.move_30)}</td><td>${res}</td></tr>`;
