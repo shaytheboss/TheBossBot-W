@@ -199,7 +199,9 @@ async def lifespan(app: FastAPI):
         # record-only; one batched request, only for cities with an open
         # market inside their local decision window.
         from app.nearby.job import job_record_nearby
-        _add_tracked_job(job_record_nearby, CronTrigger(minute="6-59/10"),
+        # Every 5 minutes: the signal is only worth anything within minutes
+        # of a new METAR (the market caught up within the hour in history).
+        _add_tracked_job(job_record_nearby, CronTrigger(minute="*/5"),
                          id="nearby_obs", max_instances=1, misfire_grace_time=300)
 
         _scheduler.start()

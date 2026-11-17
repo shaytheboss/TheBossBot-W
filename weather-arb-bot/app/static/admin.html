@@ -175,6 +175,11 @@
       </p>
       <div><button class="btn small" onclick="copyPre('dbOut', this)" title="Copy this output to the clipboard">📋 Copy</button></div>
       <div style="margin-top:6px"><button class="btn small" onclick="copyOut('dbOut', this)">📋 Copy</button> <button class="btn small" onclick="saveOut('dbOut', 'db')">⬇ Save as file</button></div><pre id="dbOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:340px;overflow:auto"></pre>
+      <h3 style="margin-top:24px;">🛰 Nearby-station paper test
+        <button class="btn small" onclick="showNearby(this)" title="Every signal from the stations around each settlement station, what a buy would have paid at the live ask, and how it ended. Paper only — nothing is bought.">Show</button>
+      </h3>
+      <p class="small">When most of the stations around a city's settlement station are already past their own high, the bucket holding the high so far is bought <strong>on paper</strong> at the live ask. In July–November history this made money only if bought within minutes, so this measures it on live prices before any real money. Switches are on the Settings tab.</p>
+      <div id="nearbyOut"></div>
       <h3 style="margin-top:24px;">🧠 Memory diagnostic
         <button class="btn small" onclick="showMemory(this,false)" title="Safe: reads RAM + allocator counters only. Sub-millisecond, cannot affect trading.">📸 Quick check (safe)</button>
         <button class="btn small" onclick="showMemory(this,true)" title="Full heap census. FREEZES the bot for ~1 second — do not use during an active market close.">🔬 Deep scan (~1s freeze)</button>
@@ -2141,6 +2146,27 @@ async function loadSettings() {
           <option value="1" ${s.open_meteo_hrrr_half_hourly ? 'selected' : ''}>On (:20 and :50)</option>
           <option value="0" ${s.open_meteo_hrrr_half_hourly ? '' : 'selected'}>Off (:20 only)</option>
         </select></td></tr>
+      <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🛰 Research collectors (cost: small; switch off to save Railway)</td></tr>
+      <tr><td>Nearby stations — collect METARs</td><td>
+        <select id="set-nearby-obs">
+          <option value="1" ${s.nearby_obs_enabled ? 'selected' : ''}>On</option>
+          <option value="0" ${s.nearby_obs_enabled ? '' : 'selected'}>Off</option>
+        </select></td></tr>
+      <tr><td>Nearby stations — paper test</td><td>
+        <select id="set-nearby-paper">
+          <option value="1" ${s.nearby_paper_enabled ? 'selected' : ''}>On (paper only)</option>
+          <option value="0" ${s.nearby_paper_enabled ? '' : 'selected'}>Off</option>
+        </select></td></tr>
+      <tr><td>Nearby stations — Telegram message per signal</td><td>
+        <select id="set-nearby-alerts">
+          <option value="1" ${s.nearby_alerts_enabled ? 'selected' : ''}>On</option>
+          <option value="0" ${s.nearby_alerts_enabled ? '' : 'selected'}>Off</option>
+        </select></td></tr>
+      <tr><td>weather.gov 5-minute observations (US)</td><td>
+        <select id="set-nws-obs">
+          <option value="1" ${s.nws_obs_enabled ? 'selected' : ''}>On</option>
+          <option value="0" ${s.nws_obs_enabled ? '' : 'selected'}>Off — the METAR already matched settlement on 98.7% of days</option>
+        </select></td></tr>
       <tr><td>Measure model update times</td><td>
         <select id="set-om-probe">
           <option value="1" ${s.open_meteo_probe_enabled ? 'selected' : ''}>On — probe one city hourly (~320 req/day)</option>
@@ -2226,6 +2252,10 @@ async function saveSettings() {
     open_meteo_extra_models: document.getElementById('set-om-extra').value,
     open_meteo_hrrr_half_hourly: document.getElementById('set-om-hrrr30').value === '1',
     open_meteo_probe_enabled: document.getElementById('set-om-probe').value === '1',
+    nearby_obs_enabled: document.getElementById('set-nearby-obs').value === '1',
+    nearby_paper_enabled: document.getElementById('set-nearby-paper').value === '1',
+    nearby_alerts_enabled: document.getElementById('set-nearby-alerts').value === '1',
+    nws_obs_enabled: document.getElementById('set-nws-obs').value === '1',
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
@@ -2330,6 +2360,35 @@ async function showDuplicateMarkets(btn) {
       }
     }
     out.textContent = s + '\n' + out.textContent;
+  } finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+async function showNearby(btn) {
+  const out = document.getElementById('nearbyOut');
+  const orig = btn.textContent; btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await api('/nearby/report?days=30');
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { out.textContent = 'Failed: ' + (j.detail || r.status); return; }
+    const c = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+    const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+    const verdict = j.settled < 30 ? 'too early to judge (needs ~30+ settled)' :
+      (j.pnl_per_share_at_ask > 0 ? 'positive at the real ask so far' : 'negative at the real ask so far');
+    let h = `<p><strong>${j.signals}</strong> signals in ${j.days} days · <strong>${j.settled}</strong> settled · won <strong>${j.wins}</strong>`
+      + ` · average ask ${c(j.avg_ask)} · spread ${c(j.avg_spread)}<br>`
+      + `Result per share at the ask: <strong>${sc(j.pnl_per_share_at_ask)}</strong> (${escapeHtml(verdict)})`
+      + ` · market moved ${sc(j.avg_move_10)} after 10 min, ${sc(j.avg_move_30)} after 30 min</p>`;
+    h += '<div style="overflow-x:auto"><table class="small"><thead><tr><th>When (UTC)</th><th>City</th><th>Bucket</th><th>Nearby past high</th>'
+      + '<th>Ask</th><th>Size</th><th>+10m</th><th>+30m</th><th>Result</th></tr></thead><tbody>';
+    for (const x of j.rows) {
+      const res = x.won == null ? 'open' : (x.won ? '✅ ' : '❌ ') + sc(x.pnl_per_share);
+      h += `<tr><td>${escapeHtml(x.at.slice(5, 16).replace('T', ' '))}</td><td>${escapeHtml(x.city)}</td><td>${escapeHtml(x.bucket)}</td>`
+        + `<td>${escapeHtml(x.nearby)}</td><td>${c(x.ask)}</td><td>${x.ask_size == null ? '—' : Math.round(x.ask_size)}</td>`
+        + `<td>${sc(x.move_10)}</td><td>${sc(x.move_30)}</td><td>${res}</td></tr>`;
+    }
+    h += '</tbody></table></div>';
+    if (!j.rows.length) h += '<p class="small">No signal yet. The job runs every 5 minutes for cities with an open market between 10:00 and 20:00 local.</p>';
+    out.innerHTML = h;
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
