@@ -67,6 +67,39 @@ class TestBucket:
         assert not sig.mid_in_band(0.29) and not sig.mid_in_band(0.86) and not sig.mid_in_band(None)
 
 
+class TestTradable:
+    @pytest.mark.parametrize("bid,ask,ok", [(0.58, 0.62, True), (0.80, 0.88, True), (0.81, 0.89, False),
+                                            (0.692, 0.995, False), (0.40, 0.51, False), (None, 0.6, False)])
+    def test_ask_and_spread_limits(self, bid, ask, ok):
+        assert sig.tradable(bid, ask) is ok
+
+
+class TestMessage:
+    def _verdict(self):
+        t = sig.StationState("EDDM", 55.4, 57.2, NOW)                      # 13.0°C now, high 14.0°C
+        nb = [sig.StationState("ETSI", 60.0, 61.8, NOW), sig.StationState("EDMO", 58.0, 58.0, NOW)]
+        return sig.evaluate(t, nb)
+
+    def test_a_celsius_market_is_all_celsius_and_the_bet_comes_first(self):
+        from types import SimpleNamespace
+        from app.nearby.paper import message
+        o = SimpleNamespace(bucket_label="14°C")
+        text = message("Munich", o, "C", self._verdict(), {"bid": 0.60, "ask": 0.64, "ask_size": 46}, {"ETSI": 45, "EDMO": 50})
+        lines = text.splitlines()
+        assert "YES 14°C" in lines[0] and "Munich" in lines[0]
+        assert "64.0¢" in lines[1] and "46 shares" in lines[1]
+        assert "14.0°C" in text and "13.0°C" in text
+        assert "1.0°C below its high" in text, "a 1.8°F difference is 1.0°C, not -16.8°C"
+        assert "°F" not in text
+
+    def test_a_fahrenheit_market_is_all_fahrenheit(self):
+        from types import SimpleNamespace
+        from app.nearby.paper import message
+        text = message("Austin", SimpleNamespace(bucket_label="70-71°F"), "F", self._verdict(),
+                       {"bid": 0.60, "ask": 0.64, "ask_size": 5}, {})
+        assert "1.8°F below its high" in text and "57.2°F" in text and "°C" not in text
+
+
 class TestBook:
     def test_best_prices_and_size_at_the_ask(self):
         b = book_summary({"bids": [{"price": "0.58", "size": "10"}, {"price": "0.55", "size": "5"}],

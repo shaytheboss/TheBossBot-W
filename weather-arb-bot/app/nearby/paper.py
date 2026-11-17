@@ -70,21 +70,29 @@ async def _readings(db, icaos: list[str], since: datetime, now: datetime) -> dic
 
 
 def _fmt(temp_f: float, unit: str) -> str:
+    """A temperature in the market's own unit."""
     return f"{(temp_f - 32) * 5 / 9:.1f}°C" if unit == "C" else f"{temp_f:.1f}°F"
+
+
+def _fmt_delta(delta_f: float, unit: str) -> str:
+    """A temperature DIFFERENCE in the market's own unit (no -32)."""
+    return f"{delta_f * 5 / 9:.1f}°C" if unit == "C" else f"{delta_f:.1f}°F"
 
 
 def message(city: str, outcome: MarketOutcome, unit: str, v: sig.Verdict, book: dict,
             km: dict[str, float]) -> str:
-    lines = [f"🛰 <b>Nearby signal — {escape(city)}</b>  <i>(paper, no money)</i>",
-             f"Bucket <b>{escape(outcome.bucket_label)}</b> holds the high so far: "
-             f"{_fmt(v.target.high_f, unit)} at {escape(v.target.icao)}, now {_fmt(v.target.now_f, unit)}",
+    """The bet first, then its price, then why — everything in the market's unit."""
+    lines = [f"🟢 <b>Paper buy: YES {escape(outcome.bucket_label)}</b> — {escape(city)}",
+             f"Ask <b>{book['ask'] * 100:.1f}¢</b> ({book['ask_size']:.0f} shares) · "
+             f"bid {book['bid'] * 100:.1f}¢ · spread {(book['ask'] - book['bid']) * 100:.1f}¢",
+             f"High so far {_fmt(v.target.high_f, unit)} at {escape(v.target.icao)}, "
+             f"now {_fmt(v.target.now_f, unit)}",
              f"<b>{len(v.falling)} of {len(v.nearby)}</b> nearby stations are past their own high:"]
     for s in sorted(v.nearby, key=lambda s: km.get(s.icao, 999)):
         mark = "↓" if s in v.falling else "↑"
-        lines.append(f"  {mark} {escape(s.icao)} ({km.get(s.icao, 0):.0f} km): "
-                     f"{s.below_f:.1f}°F under its high")
-    lines.append(f"Book: ask <b>{book['ask'] * 100:.1f}¢</b> (size {book['ask_size']:.0f}), "
-                 f"bid {book['bid'] * 100:.1f}¢, spread {(book['ask'] - book['bid']) * 100:.1f}¢")
+        lines.append(f"  {mark} {escape(s.icao)} {km.get(s.icao, 0):.0f} km: "
+                     f"{_fmt_delta(s.below_f, unit)} below its high")
+    lines.append("<i>Paper only — nothing is bought. The bet: today's high stays in this bucket.</i>")
     return "\n".join(lines)
 
 
@@ -173,10 +181,14 @@ async def run_paper(db, now: Optional[datetime] = None,
                 max_f=v.target.high_f, current_f=v.target.now_f, n_nearby=len(v.nearby), n_falling=len(v.falling),
                 detail=[{"icao": s.icao, "km": km.get(s.icao), "now_f": s.now_f, "high_f": s.high_f,
                          "below_f": round(s.below_f, 1)} for s in v.nearby],
-                bid=book["bid"], ask=book["ask"], ask_size=book["ask_size"], alerted=False)
+                bid=book["bid"], ask=book["ask"], ask_size=book["ask_size"],
+                tradable=sig.tradable(book["bid"], book["ask"]), alerted=False)
             db.add(row)
             await db.commit()
             stats["recorded"] += 1
+            if not row.tradable:
+                stats["not_tradable"] = stats.get("not_tradable", 0) + 1
+                continue                                    # recorded for the report, never announced
             if getattr(settings, "nearby_alerts_enabled", True):
                 if await send_text(db, message(city.name, hold, resolve_bucket_unit(hold), v, book, km)):
                     row.alerted = True

@@ -2263,7 +2263,7 @@ async def admin_nearby_report(
         out.append({
             "at": s.signaled_at.isoformat(), "city": city, "date": s.event_date.isoformat(),
             "local_hour": s.local_hour, "bucket": bucket, "nearby": f"{s.n_falling}/{s.n_nearby}",
-            "ask": s.ask, "bid": s.bid, "ask_size": s.ask_size,
+            "ask": s.ask, "bid": s.bid, "ask_size": s.ask_size, "tradable": bool(s.tradable),
             "move_10": None if s.mid_10 is None or mid is None else round(s.mid_10 - mid, 4),
             "move_30": None if s.mid_30 is None or mid is None else round(s.mid_30 - mid, 4),
             "won": None if won is None else bool(won),
@@ -2273,18 +2273,22 @@ async def admin_nearby_report(
     def mean(xs):
         xs = [x for x in xs if x is not None]
         return round(sum(xs) / len(xs), 4) if xs else None
-    settled = [r for r in out if r["won"] is not None]
+    # The result counts only signals that could actually have been bought at
+    # that ask (signal.tradable); the rest are shown, never scored.
+    buyable = [r for r in out if r["tradable"]]
+    settled = [r for r in buyable if r["won"] is not None]
     return {
         "days": days,
         "signals": len(out),
+        "tradable": len(buyable),
         "settled": len(settled),
         "wins": sum(1 for r in settled if r["won"]),
-        "avg_ask": mean([r["ask"] for r in out]),
+        "avg_ask": mean([r["ask"] for r in buyable]),
         "avg_spread": mean([None if r["ask"] is None or r["bid"] is None else r["ask"] - r["bid"] for r in out]),
         "pnl_per_share_at_ask": mean([r["pnl_per_share"] for r in settled]),
         "total_pnl_one_share_each": round(sum(r["pnl_per_share"] for r in settled if r["pnl_per_share"] is not None), 2),
-        "avg_move_10": mean([r["move_10"] for r in out]),
-        "avg_move_30": mean([r["move_30"] for r in out]),
+        "avg_move_10": mean([r["move_10"] for r in buyable]),
+        "avg_move_30": mean([r["move_30"] for r in buyable]),
         "last_run": dict(nearby_job.LAST_RUN),
         "rows": out,
     }

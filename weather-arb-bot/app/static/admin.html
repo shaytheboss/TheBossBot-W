@@ -2374,14 +2374,14 @@ async function showNearby(btn) {
     const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
     const verdict = j.settled < 30 ? 'too early to judge (needs ~30+ settled)' :
       (j.pnl_per_share_at_ask > 0 ? 'positive at the real ask so far' : 'negative at the real ask so far');
-    let h = `<p><strong>${j.signals}</strong> signals in ${j.days} days · <strong>${j.settled}</strong> settled · won <strong>${j.wins}</strong>`
+    let h = `<p><strong>${j.signals}</strong> signals in ${j.days} days, <strong>${j.tradable}</strong> buyable (ask ≤ 88¢, spread ≤ 10¢) · <strong>${j.settled}</strong> of those settled · won <strong>${j.wins}</strong>`
       + ` · average ask ${c(j.avg_ask)} · spread ${c(j.avg_spread)}<br>`
       + `Result per share at the ask: <strong>${sc(j.pnl_per_share_at_ask)}</strong> (${escapeHtml(verdict)})`
       + ` · market moved ${sc(j.avg_move_10)} after 10 min, ${sc(j.avg_move_30)} after 30 min</p>`;
     h += '<div style="overflow-x:auto"><table class="small"><thead><tr><th>When (UTC)</th><th>City</th><th>Bucket</th><th>Nearby past high</th>'
       + '<th>Ask</th><th>Size</th><th>+10m</th><th>+30m</th><th>Result</th></tr></thead><tbody>';
     for (const x of j.rows) {
-      const res = x.won == null ? 'open' : (x.won ? '✅ ' : '❌ ') + sc(x.pnl_per_share);
+      const res = !x.tradable ? 'not buyable' : x.won == null ? 'open' : (x.won ? '✅ ' : '❌ ') + sc(x.pnl_per_share);
       h += `<tr><td>${escapeHtml(x.at.slice(5, 16).replace('T', ' '))}</td><td>${escapeHtml(x.city)}</td><td>${escapeHtml(x.bucket)}</td>`
         + `<td>${escapeHtml(x.nearby)}</td><td>${c(x.ask)}</td><td>${x.ask_size == null ? '—' : Math.round(x.ask_size)}</td>`
         + `<td>${sc(x.move_10)}</td><td>${sc(x.move_30)}</td><td>${res}</td></tr>`;

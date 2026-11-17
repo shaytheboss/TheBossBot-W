@@ -24,6 +24,12 @@ MIN_NEARBY = 2
 MIN_FALLING_SHARE = 0.6
 FALL_F = 1.0
 MID_LO, MID_HI = 0.30, 0.85
+# Execution guard on the live book (not part of the signal): the research
+# priced a buy at mid + ~2.5c, so a buy is only counted when the real ask is
+# within that (mid band top 85c + ~3c) and the book is not wide open. A
+# 99.5c ask with a 30c spread (Munich, first day live) is not a trade.
+ASK_MAX = 0.88
+SPREAD_MAX = 0.10
 MIN_READINGS = 3
 STALE = timedelta(minutes=80)
 
@@ -85,6 +91,10 @@ def holds(bucket_min, bucket_max, unit: str, temp_f: float) -> bool:
     if bucket_max is not None:
         return r <= bucket_max
     return False
+
+
+def tradable(bid: Optional[float], ask: Optional[float]) -> bool:
+    return bid is not None and ask is not None and ask <= ASK_MAX and ask - bid <= SPREAD_MAX
 
 
 def mid_in_band(mid: Optional[float]) -> bool:
