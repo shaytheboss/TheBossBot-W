@@ -129,7 +129,7 @@ class TestTheSignal:
         async with world() as db:
             (await db.get(MarketOutcome, 11)).won = True
             await db.commit()
-            rep = await admin_nearby_report("t", db, days=30)
+            rep = await admin_nearby_report("t", db, days=30, from_date=None, to_date=None, city_id=None)
         assert rep["signals"] == 1 and rep["tradable"] == 0 and rep["settled"] == 0
         assert rep["pnl_per_share_at_ask"] is None
 
@@ -192,12 +192,35 @@ class TestFollowUpsAndReport:
         async with world() as db:
             (await db.get(MarketOutcome, 11)).won = True
             await db.commit()
-            rep = await admin_nearby_report("t", db, days=30)
+            rep = await admin_nearby_report("t", db, days=30, from_date=None, to_date=None, city_id=None)
         assert rep["signals"] == rep["settled"] == rep["wins"] == 1
         (r,) = rep["rows"]
         assert r["pnl_per_share"] == pytest.approx(0.38) and r["nearby"] == "4/5"
         assert r["move_10"] == pytest.approx(0.07) and r["move_30"] == pytest.approx(0.14)
         assert rep["pnl_per_share_at_ask"] == pytest.approx(0.38)
+
+
+class TestReportFilters:
+    @pytest.mark.asyncio
+    async def test_dates_city_and_the_per_row_fields(self, http, world, fake_telegram):
+        from app.api.admin import admin_nearby_report
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.692, ask=0.995))
+        await _run(world, http)
+        async with world() as db:
+            rep = lambda **kw: admin_nearby_report("t", db, days=30, **{"from_date": None, "to_date": None, "city_id": None, **kw})
+            r = await rep()
+            (row,) = r["rows"]
+            assert row["local_time"] == "14:00" and row["city_id"] == AUSTIN.id
+            assert row["spread"] == pytest.approx(0.303) and row["result"] == "open" and row["tradable"] is False
+            assert (await rep(city_id=AUSTIN.id + 1))["signals"] == 0
+            assert (await rep(from_date=DAY + timedelta(days=1)))["signals"] == 0
+            assert (await rep(from_date=DAY, to_date=DAY))["signals"] == 1
+            (await db.get(MarketOutcome, 11)).won = False
+            await db.commit()
+            r = await rep()
+        assert r["rows"][0]["result"] == "lost"
+        assert r["rows"][0]["pnl_per_share"] == pytest.approx(-0.995), "what it WOULD have made, shown faded"
+        assert r["settled"] == 0, "not buyable: never scored"
 
 
 class TestSettings:

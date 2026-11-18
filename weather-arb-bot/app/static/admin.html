@@ -106,6 +106,7 @@
       <button data-tab="positions">Positions</button>
       <button data-tab="intraday">⚡ Intraday Stats</button>
       <button data-tab="intradaypos">⚡ Intraday Positions</button>
+      <button data-tab="nearby">🛰 Nearby (paper)</button>
       <button data-tab="lessons">Lessons</button>
       <button data-tab="cities">Cities</button>
       <button data-tab="exits">🚨 Exit Signals</button>
@@ -175,11 +176,6 @@
       </p>
       <div><button class="btn small" onclick="copyPre('dbOut', this)" title="Copy this output to the clipboard">📋 Copy</button></div>
       <div style="margin-top:6px"><button class="btn small" onclick="copyOut('dbOut', this)">📋 Copy</button> <button class="btn small" onclick="saveOut('dbOut', 'db')">⬇ Save as file</button></div><pre id="dbOut" style="white-space:pre-wrap;font-size:12px;background:var(--panel,#111);padding:8px;border-radius:6px;max-height:340px;overflow:auto"></pre>
-      <h3 style="margin-top:24px;">🛰 Nearby-station paper test
-        <button class="btn small" onclick="showNearby(this)" title="Every signal from the stations around each settlement station, what a buy would have paid at the live ask, and how it ended. Paper only — nothing is bought.">Show</button>
-      </h3>
-      <p class="small">When most of the stations around a city's settlement station are already past their own high, the bucket holding the high so far is bought <strong>on paper</strong> at the live ask. In July–November history this made money only if bought within minutes, so this measures it on live prices before any real money. Switches are on the Settings tab.</p>
-      <div id="nearbyOut"></div>
       <h3 style="margin-top:24px;">🧠 Memory diagnostic
         <button class="btn small" onclick="showMemory(this,false)" title="Safe: reads RAM + allocator counters only. Sub-millisecond, cannot affect trading.">📸 Quick check (safe)</button>
         <button class="btn small" onclick="showMemory(this,true)" title="Full heap census. FREEZES the bot for ~1 second — do not use during an active market close.">🔬 Deep scan (~1s freeze)</button>
@@ -342,6 +338,54 @@
         </tr></thead>
         <tbody id="intradayBody"></tbody>
       </table>
+    </section>
+    <section id="tab-nearby" class="hidden">
+      <p class="small">When most of the stations around a city's settlement station are already past their own high, the bucket holding the high so far is bought <strong>on paper</strong> (YES) at the live ask — nothing is bought. A signal is <strong>buyable</strong> when the ask is ≤ 88¢ and the spread ≤ 10¢; only buyable signals are announced on Telegram and counted in the result. The rest are kept to show what they would have done. Switches are on the Settings tab.</p>
+      <div class="toolbar">
+        <label class="row small">Event date from <input type="date" id="nbFrom" /></label>
+        <label class="row small">To <input type="date" id="nbTo" /></label>
+        <label class="row small">City
+          <select id="nbCity"><option value="">All cities</option></select>
+        </label>
+        <select id="nbBuyable" onchange="applyNbClientFilter()" title="Could the paper buy have been made at that ask?">
+          <option value="">Buyable and not</option>
+          <option value="1">Buyable only</option>
+          <option value="0">Not buyable only</option>
+        </select>
+        <select id="nbResult" onchange="applyNbClientFilter()" title="How the bucket settled">
+          <option value="">All results</option>
+          <option value="won">Won</option>
+          <option value="lost">Lost</option>
+          <option value="open">Open (not settled)</option>
+        </select>
+        <button class="btn primary" onclick="loadNearby()">Apply Filter</button>
+        <button class="btn" onclick="resetNbFilter()">Reset</button>
+        <button class="btn" onclick="exportCsv('nearbyBody', 'nearby-paper')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
+      </div>
+      <div class="cards" id="nearbyCards"></div>
+      <div style="overflow-x:auto">
+      <table id="nearbyTable">
+        <thead><tr>
+          <th data-sort-key="at" data-sort-type="date">Signal (UTC)</th>
+          <th data-sort-key="local_time" data-sort-type="str">Local</th>
+          <th data-sort-key="date" data-sort-type="date">Event date</th>
+          <th data-sort-key="city" data-sort-type="str">City</th>
+          <th data-sort-key="bucket" data-sort-type="str">Bet (YES)</th>
+          <th data-sort-key="nearby" data-sort-type="str">Nearby past high</th>
+          <th data-sort-key="ask" data-sort-type="num">Ask</th>
+          <th data-sort-key="bid" data-sort-type="num">Bid</th>
+          <th data-sort-key="spread" data-sort-type="num">Spread</th>
+          <th data-sort-key="ask_size" data-sort-type="num">Size</th>
+          <th data-sort-key="waited_min" data-sort-type="num">Waited</th>
+          <th data-sort-key="move_10" data-sort-type="num">+10m</th>
+          <th data-sort-key="move_30" data-sort-type="num">+30m</th>
+          <th data-sort-key="_buyable" data-sort-type="str">Buyable</th>
+          <th data-sort-key="result" data-sort-type="str">Result</th>
+          <th data-sort-key="pnl_per_share" data-sort-type="num">P&amp;L / share</th>
+        </tr></thead>
+        <tbody id="nearbyBody"></tbody>
+      </table>
+      </div>
     </section>
 
     <section id="tab-lessons" class="hidden">
@@ -763,6 +807,7 @@ function bindTabs() {
       if (tab === 'positions') loadPositions();
       if (tab === 'intraday') loadIntraday();
       if (tab === 'intradaypos') loadIntradayPos();
+      if (tab === 'nearby') loadNearby();
       if (tab === 'lessons') loadLessons();
       if (tab === 'cities') loadCities();
       if (tab === 'settings') loadSettings();
@@ -793,7 +838,7 @@ async function ensureCitiesLoaded() {
   if (!r.ok) return [];
   const rows = await r.json();
   window._citiesCache = rows;
-  ['statsCity','posCity','lesCity','oppCity','idCity','idpCity'].forEach(id => {
+  ['statsCity','posCity','lesCity','oppCity','idCity','idpCity','nbCity'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel || sel.dataset.populated === '1') return;
     rows.forEach(c => {
@@ -2363,34 +2408,82 @@ async function showDuplicateMarkets(btn) {
   } finally { btn.disabled = false; btn.textContent = orig; }
 }
 
-async function showNearby(btn) {
-  const out = document.getElementById('nearbyOut');
-  const orig = btn.textContent; btn.disabled = true; btn.textContent = '…';
-  try {
-    const r = await api('/nearby/report?days=30');
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) { out.textContent = 'Failed: ' + (j.detail || r.status); return; }
-    const c = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
-    const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
-    const verdict = j.settled < 30 ? 'too early to judge (needs ~30+ settled)' :
-      (j.pnl_per_share_at_ask > 0 ? 'positive at the real ask so far' : 'negative at the real ask so far');
-    let h = `<p><strong>${j.signals}</strong> signals in ${j.days} days, <strong>${j.tradable}</strong> buyable (ask ≤ 88¢, spread ≤ 10¢) · <strong>${j.settled}</strong> of those settled · won <strong>${j.wins}</strong>`
-      + ` · average ask ${c(j.avg_ask)} · spread ${c(j.avg_spread)}<br>`
-      + `Result per share at the ask: <strong>${sc(j.pnl_per_share_at_ask)}</strong> (${escapeHtml(verdict)})`
-      + ` · market moved ${sc(j.avg_move_10)} after 10 min, ${sc(j.avg_move_30)} after 30 min</p>`;
-    h += '<div style="overflow-x:auto"><table class="small"><thead><tr><th>When (UTC)</th><th>City</th><th>Bucket</th><th>Nearby past high</th>'
-      + '<th>Ask</th><th>Size</th><th>+10m</th><th>+30m</th><th>Result</th></tr></thead><tbody>';
-    for (const x of j.rows) {
-      const res = (!x.tradable ? 'not buyable' : x.won == null ? 'open' : (x.won ? '✅ ' : '❌ ') + sc(x.pnl_per_share))
-        + (x.waited_min ? ` (waited ${x.waited_min} min)` : '');
-      h += `<tr><td>${escapeHtml(x.at.slice(5, 16).replace('T', ' '))}</td><td>${escapeHtml(x.city)}</td><td>${escapeHtml(x.bucket)}</td>`
-        + `<td>${escapeHtml(x.nearby)}</td><td>${c(x.ask)}</td><td>${x.ask_size == null ? '—' : Math.round(x.ask_size)}</td>`
-        + `<td>${sc(x.move_10)}</td><td>${sc(x.move_30)}</td><td>${res}</td></tr>`;
-    }
-    h += '</tbody></table></div>';
-    if (!j.rows.length) h += '<p class="small">No signal yet. The job runs every 5 minutes for cities with an open market between 10:00 and 20:00 local.</p>';
-    out.innerHTML = h;
-  } finally { btn.disabled = false; btn.textContent = orig; }
+// --- 🛰 Nearby (paper) tab ---------------------------------------------------
+async function loadNearby() {
+  await ensureCitiesLoaded();
+  _initFilterDefaults('nbFrom', 'nbTo');
+  const p = new URLSearchParams();
+  const f = document.getElementById('nbFrom').value;
+  const t = document.getElementById('nbTo').value;
+  const c = document.getElementById('nbCity').value;
+  if (f) p.set('from_date', f);
+  if (t) p.set('to_date', t);
+  if (c) p.set('city_id', c);
+  const r = await api('/nearby/report?' + p); if (!r.ok) return;
+  const j = await r.json();
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  const res = j.pnl_per_share_at_ask;
+  document.getElementById('nearbyCards').innerHTML =
+    card('Signals', j.signals) +
+    card('Buyable', j.tradable) +
+    card('Buyable & settled', j.settled) +
+    card('Won', j.settled ? `${j.wins} (${Math.round(100 * j.wins / j.settled)}%)` : '—') +
+    card('Avg ask (buyable)', cent(j.avg_ask)) +
+    card('Avg spread (all)', cent(j.avg_spread)) +
+    `<div class="card"><div class="label">Result / share at ask</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
+      + `<div class="small">${j.settled < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
+    card('Market after 10 / 30 min', `${sc(j.avg_move_10)} / ${sc(j.avg_move_30)}`);
+  j.rows.forEach(x => { x._buyable = x.tradable ? 'yes' : 'no'; });
+  _registerTable('nearbyBody', j.rows, _renderNearby, { key: 'at', dir: 'desc', type: 'date' });
+}
+
+function resetNbFilter() {
+  ['nbFrom', 'nbTo', 'nbCity', 'nbBuyable', 'nbResult'].forEach(id => { document.getElementById(id).value = ''; });
+  _clientFilters['nearbyBody'] = null;
+  loadNearby();
+}
+
+function applyNbClientFilter() {
+  const b = document.getElementById('nbBuyable').value;
+  const res = document.getElementById('nbResult').value;
+  _clientFilters['nearbyBody'] = (b || res) ? (x => {
+    if (b === '1' && !x.tradable) return false;
+    if (b === '0' && x.tradable) return false;
+    if (res && x.result !== res) return false;
+    return true;
+  }) : null;
+  _rerenderTable('nearbyBody');
+}
+
+function _renderNearby(rows) {
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  document.getElementById('nearbyBody').innerHTML = rows.map(x => {
+    const result = x.result === 'won' ? '✅ Won' : x.result === 'lost' ? '❌ Lost' : '⏳ Open';
+    const cls = !x.tradable ? '' : (x.result === 'won' ? 'win' : x.result === 'lost' ? 'loss' : '');
+    // Not buyable: the P&L is what the bet WOULD have made at that ask, shown faded.
+    const pnl = x.pnl_per_share == null ? '—'
+      : (x.tradable ? sc(x.pnl_per_share) : `<span class="small" style="opacity:.6" title="would have — not buyable at that ask">(${sc(x.pnl_per_share)})</span>`);
+    return `<tr class="${cls}">
+      <td class="small">${escapeHtml(x.at.slice(5, 16).replace('T', ' '))}</td>
+      <td class="small">${escapeHtml(x.local_time || '')}${x.waited_min ? `<div class="small" style="opacity:.7">first ${escapeHtml(x.first_seen_local || '')}</div>` : ''}</td>
+      <td>${escapeHtml(x.date)}</td>
+      <td>${escapeHtml(x.city)}</td>
+      <td>${escapeHtml(x.bucket)}</td>
+      <td>${escapeHtml(x.nearby)}</td>
+      <td>${cent(x.ask)}</td>
+      <td>${cent(x.bid)}</td>
+      <td>${cent(x.spread)}</td>
+      <td>${x.ask_size == null ? '—' : Math.round(x.ask_size)}</td>
+      <td>${x.waited_min == null ? '—' : x.waited_min + ' min'}</td>
+      <td>${sc(x.move_10)}</td>
+      <td>${sc(x.move_30)}</td>
+      <td>${x.tradable ? '✅' : '—'}</td>
+      <td>${result}</td>
+      <td>${pnl}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="16" class="small">No signal in this range. The job runs every 5 minutes for cities with an open market between 10:00 and 20:00 local.</td></tr>';
 }
 
 async function showShadowStatus(btn) {

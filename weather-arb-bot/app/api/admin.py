@@ -2242,27 +2242,44 @@ async def admin_nearby_report(
     _: str = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     days: int = Query(default=30, ge=1, le=120),
+    from_date: Optional[date_cls] = Query(default=None, description="Event date from (overrides `days`)"),
+    to_date: Optional[date_cls] = Query(default=None, description="Event date to, inclusive"),
+    city_id: Optional[int] = Query(default=None),
 ):
     """The nearby-station paper test: every signal, what a buy would have paid
     at the live ask, how the market moved after it, and — once settled — the
-    result. Small table; one query."""
+    result. Small table; one query. Summary figures follow the filters."""
+    from zoneinfo import ZoneInfo
     from app.nearby import job as nearby_job
     from app.nearby.models import NearbySignal
 
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = (await db.execute(
-        select(NearbySignal, City.name, MarketOutcome.bucket_label, MarketOutcome.won)
-        .join(City, City.id == NearbySignal.city_id)
-        .join(MarketOutcome, MarketOutcome.id == NearbySignal.outcome_id)
-        .where(NearbySignal.signaled_at >= since)
-        .order_by(desc(NearbySignal.signaled_at))
-    )).all()
+    q = (select(NearbySignal, City.name, City.timezone, MarketOutcome.bucket_label, MarketOutcome.won)
+         .join(City, City.id == NearbySignal.city_id)
+         .join(MarketOutcome, MarketOutcome.id == NearbySignal.outcome_id))
+    if from_date is not None:
+        q = q.where(NearbySignal.event_date >= from_date)
+    else:
+        q = q.where(NearbySignal.signaled_at >= datetime.now(timezone.utc) - timedelta(days=days))
+    if to_date is not None:
+        q = q.where(NearbySignal.event_date <= to_date)
+    if city_id is not None:
+        q = q.where(NearbySignal.city_id == city_id)
+    rows = (await db.execute(q.order_by(desc(NearbySignal.signaled_at)))).all()
+
+    def local(at, tz):
+        if at is None:
+            return None
+        at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+        return at.astimezone(ZoneInfo(tz or "UTC")).strftime("%H:%M")
     out = []
-    for s, city, bucket, won in rows:
+    for s, city, tz, bucket, won in rows:
         mid = None if s.bid is None or s.ask is None else (s.bid + s.ask) / 2
         out.append({
-            "at": s.signaled_at.isoformat(), "city": city, "date": s.event_date.isoformat(),
+            "at": s.signaled_at.isoformat(), "city": city, "city_id": s.city_id, "date": s.event_date.isoformat(),
+            "local_time": local(s.signaled_at, tz), "first_seen_local": local(s.first_seen_at, tz),
             "local_hour": s.local_hour, "bucket": bucket, "nearby": f"{s.n_falling}/{s.n_nearby}",
+            "spread": None if s.bid is None or s.ask is None else round(s.ask - s.bid, 4),
+            "result": "open" if won is None else ("won" if won else "lost"),
             "ask": s.ask, "bid": s.bid, "ask_size": s.ask_size, "tradable": bool(s.tradable),
             "waited_min": None if s.first_seen_at is None or not s.tradable
             else round((s.signaled_at - s.first_seen_at).total_seconds() / 60),
