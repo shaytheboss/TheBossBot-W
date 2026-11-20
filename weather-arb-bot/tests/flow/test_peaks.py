@@ -177,10 +177,11 @@ class TestBoundary:
             if "app.peaks" in p.read_text(encoding="utf-8")
             and not str(p.relative_to(app_dir)).startswith("peaks")
         }
-        # app/research/ and app/shadow/ are read-only research and are fenced
-        # off from trading imports by their own boundary tests, so they may
-        # read the peaks table (shadow model v2 calibrates on it).
-        importers = {p for p in importers if not p.startswith(("research/", "shadow/"))}
+        # app/research/, app/shadow/ and app/nearby/ are research (nearby
+        # trades on paper only) and are fenced off from trading imports by
+        # their own boundary tests, so they may read the peaks table (shadow
+        # model v2 calibrates on it; the nearby signal waits for the peak).
+        importers = {p for p in importers if not p.startswith(("research/", "shadow/", "nearby/"))}
         assert importers <= {"main.py", "api/admin.py", "intraday/detector.py"}, importers
         det = (app_dir / "intraday" / "detector.py").read_text(encoding="utf-8")
         imports = [ln.strip() for ln in det.splitlines() if "app.peaks" in ln and "import" in ln]

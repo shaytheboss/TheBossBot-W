@@ -340,7 +340,7 @@
       </table>
     </section>
     <section id="tab-nearby" class="hidden">
-      <p class="small">When most of the stations around a city's settlement station are already past their own high, the bucket holding the high so far is bought <strong>on paper</strong> (YES) at the live ask — nothing is bought. A signal is <strong>buyable</strong> when the ask is ≤ 88¢ and the spread ≤ 10¢; only buyable signals are announced on Telegram and counted in the result. The rest are kept to show what they would have done. Switches are on the Settings tab.</p>
+      <p class="small">When most of the stations around a city's settlement station are already past their own high, the bucket holding the high so far is bought <strong>on paper</strong> (YES) at the live ask — nothing is bought. A signal fires only after the city's usual peak hour, and is <strong>buyable</strong> when the ask is at least 2¢ below what such a bucket has been worth at that price (e.g. mid 75¢ → worth ~85¢ → buy up to 83¢); only buyable signals are announced on Telegram and counted in the result. The rest are kept to show what they would have done. Switches are on the Settings tab.</p>
       <div class="toolbar">
         <label class="row small">Event date from <input type="date" id="nbFrom" /></label>
         <label class="row small">To <input type="date" id="nbTo" /></label>
@@ -382,6 +382,7 @@
           <th data-sort-key="_buyable" data-sort-type="str">Buyable</th>
           <th data-sort-key="result" data-sort-type="str">Result</th>
           <th data-sort-key="pnl_per_share" data-sort-type="num">P&amp;L / share</th>
+          <th>Link</th>
         </tr></thead>
         <tbody id="nearbyBody"></tbody>
       </table>
@@ -2482,8 +2483,9 @@ function _renderNearby(rows) {
       <td>${x.tradable ? '✅' : '—'}</td>
       <td>${result}</td>
       <td>${pnl}</td>
+      <td>${x.link ? `<a href="${escapeHtml(x.link)}" target="_blank" rel="noopener">Polymarket ↗</a>` : '—'}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="16" class="small">No signal in this range. The job runs every 5 minutes for cities with an open market between 10:00 and 20:00 local.</td></tr>';
+  }).join('') || '<tr><td colspan="17" class="small">No signal in this range. The job runs every 5 minutes for cities with an open market between 10:00 and 20:00 local.</td></tr>';
 }
 
 async function showShadowStatus(btn) {

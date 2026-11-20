@@ -2253,9 +2253,11 @@ async def admin_nearby_report(
     from app.nearby import job as nearby_job
     from app.nearby.models import NearbySignal
 
-    q = (select(NearbySignal, City.name, City.timezone, MarketOutcome.bucket_label, MarketOutcome.won)
+    q = (select(NearbySignal, City.name, City.timezone, MarketOutcome.bucket_label, MarketOutcome.won,
+                Market.external_id)
          .join(City, City.id == NearbySignal.city_id)
-         .join(MarketOutcome, MarketOutcome.id == NearbySignal.outcome_id))
+         .join(MarketOutcome, MarketOutcome.id == NearbySignal.outcome_id)
+         .join(Market, Market.id == NearbySignal.market_id))
     if from_date is not None:
         q = q.where(NearbySignal.event_date >= from_date)
     else:
@@ -2272,13 +2274,14 @@ async def admin_nearby_report(
         at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
         return at.astimezone(ZoneInfo(tz or "UTC")).strftime("%H:%M")
     out = []
-    for s, city, tz, bucket, won in rows:
+    for s, city, tz, bucket, won, slug in rows:
         mid = None if s.bid is None or s.ask is None else (s.bid + s.ask) / 2
         out.append({
             "at": s.signaled_at.isoformat(), "city": city, "city_id": s.city_id, "date": s.event_date.isoformat(),
             "local_time": local(s.signaled_at, tz), "first_seen_local": local(s.first_seen_at, tz),
             "local_hour": s.local_hour, "bucket": bucket, "nearby": f"{s.n_falling}/{s.n_nearby}",
             "spread": None if s.bid is None or s.ask is None else round(s.ask - s.bid, 4),
+            "link": f"https://polymarket.com/event/{slug}" if slug else None,
             "result": "open" if won is None else ("won" if won else "lost"),
             "ask": s.ask, "bid": s.bid, "ask_size": s.ask_size, "tradable": bool(s.tradable),
             "waited_min": None if s.first_seen_at is None or not s.tradable

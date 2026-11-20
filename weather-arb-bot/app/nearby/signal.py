@@ -7,7 +7,9 @@ untouched, on September and on October-November:
   - at least MIN_FALLING_SHARE of them already FALL_F or more below their own
     high of the day;
   - the bucket holding the settlement station's high so far trades at a mid
-    between MID_LO and MID_HI.
+    between MID_LO and MID_HI;
+  - (added after the first live days, tested on the whole history) it is
+    past the city's usual peak hour — see PEAK_SHARE_MIN.
 
 Net of a modelled spread it made +6.5 / +4.0 / +4.5 c/share in the three
 periods, but only when bought within ~5 minutes: the market caught up within
@@ -24,12 +26,21 @@ MIN_NEARBY = 2
 MIN_FALLING_SHARE = 0.6
 FALL_F = 1.0
 MID_LO, MID_HI = 0.30, 0.85
-# Execution guard on the live book (not part of the signal): the research
-# priced a buy at mid + ~2.5c, so a buy is only counted when the real ask is
-# within that (mid band top 85c + ~3c) and the book is not wide open. A
-# 99.5c ask with a 30c spread (Munich, first day live) is not a trade.
-ASK_MAX = 0.88
-SPREAD_MAX = 0.10
+# Only after the city's usual peak: at least this share of its days (same
+# month, daily_peaks) had their high by the current local hour. Of the first
+# ten live signals, the two that lost had fired before the peak (San
+# Francisco, Los Angeles: the settlement station was still climbing). On
+# Jul-Nov history the condition lifted the rule from +6.5/+4.0/+4.5 c/share
+# (Jul-Aug/Sep/Oct-Nov) to +7.4/+8.3/+7.0, the win rate from ~71% to ~79%,
+# out-of-sample t 1.85 -> 2.96.
+PEAK_SHARE_MIN = 0.5
+# A buy is counted only when the real ask is below what the bucket has been
+# worth: how often, after the peak, a holding bucket at this mid went on to
+# win (Jul-Aug history; Sep-Nov matched within a few points), less MARGIN.
+# Replaces a flat spread cap: a 16c spread is fine at mid 75c (fair 85c, ask
+# 83c), and a 99.5c ask is never fine (Munich, first day live).
+FAIR_BY_MID = ((0.50, 0.538), (0.60, 0.667), (0.70, 0.735), (0.80, 0.850), (0.85, 0.915))
+MARGIN = 0.02
 MIN_READINGS = 3
 STALE = timedelta(minutes=80)
 
@@ -93,8 +104,26 @@ def holds(bucket_min, bucket_max, unit: str, temp_f: float) -> bool:
     return False
 
 
+def fair_value(mid: Optional[float]) -> Optional[float]:
+    """What a holding bucket at this mid has been worth after the peak."""
+    if mid is None or mid < MID_LO or mid > MID_HI:
+        return None
+    for upper, fair in FAIR_BY_MID:
+        if mid <= upper:
+            return fair
+    return None
+
+
 def tradable(bid: Optional[float], ask: Optional[float]) -> bool:
-    return bid is not None and ask is not None and ask <= ASK_MAX and ask - bid <= SPREAD_MAX
+    """Could the paper buy be made at a price worth paying?"""
+    if bid is None or ask is None or ask < bid:
+        return False
+    fair = fair_value((bid + ask) / 2)
+    return fair is not None and ask <= fair - MARGIN
+
+
+def past_peak(share: Optional[float]) -> bool:
+    return share is not None and share >= PEAK_SHARE_MIN
 
 
 def mid_in_band(mid: Optional[float]) -> bool:
