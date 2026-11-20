@@ -2312,8 +2312,84 @@ async def admin_nearby_report(
         "avg_move_10": mean([r["move_10"] for r in buyable]),
         "avg_move_30": mean([r["move_30"] for r in buyable]),
         "last_run": dict(nearby_job.LAST_RUN),
+        "by_city": _nearby_by_city(out),
         "rows": out,
     }
+
+
+#: Settled buyable signals a city needs before its own figures mean anything.
+NEARBY_ENOUGH = 30
+
+
+def _nearby_by_city(rows: list[dict]) -> list[dict]:
+    """Per city: signals, buyable, settled, won, average ask, result per share
+    at the ask (buyable and settled), and what ALL settled signals would have
+    made. `enough` says whether the city has enough settled buyable signals
+    to be judged on its own."""
+    by: dict[str, list[dict]] = {}
+    for r in rows:
+        by.setdefault(r["city"], []).append(r)
+    out = []
+    for city, rs in sorted(by.items()):
+        buy = [r for r in rs if r["tradable"]]
+        settled = [r for r in buy if r["won"] is not None]
+        anyset = [r for r in rs if r["won"] is not None and r["pnl_per_share"] is not None]
+        asks = [r["ask"] for r in buy if r["ask"] is not None]
+        out.append({
+            "city": city, "signals": len(rs), "buyable": len(buy), "settled": len(settled),
+            "wins": sum(1 for r in settled if r["won"]),
+            "win_rate": round(sum(1 for r in settled if r["won"]) / len(settled), 3) if settled else None,
+            "avg_ask": round(sum(asks) / len(asks), 4) if asks else None,
+            "pnl_per_share": round(sum(r["pnl_per_share"] for r in settled) / len(settled), 4) if settled else None,
+            "would_pnl_all": round(sum(r["pnl_per_share"] for r in anyset) / len(anyset), 4) if anyset else None,
+            "enough": len(settled) >= NEARBY_ENOUGH,
+        })
+    return out
+
+
+@router.get("/nearby/stations")
+async def admin_nearby_stations(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=90, ge=1, le=365),
+    city_id: Optional[int] = Query(default=None),
+):
+    """Each city's settlement station and its nearby stations: distance,
+    direction, how much each helped on Jul-Nov history, and — from the live
+    paper signals — in how many signals it was past its own high and how
+    those signals settled."""
+    from app.nearby.models import NearbySignal
+    from app.nearby.stations import NEARBY, NEARBY_HISTORY
+
+    q = select(City.id, City.name, City.primary_icao).where(City.active == True)
+    if city_id is not None:
+        q = q.where(City.id == city_id)
+    cities = [(cid, name, (icao or "").upper()) for cid, name, icao in (await db.execute(q)).all()
+              if (icao or "").upper() in NEARBY]
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    live: dict[tuple[int, str], dict] = {}
+    for city_id_, detail, won in (await db.execute(
+            select(NearbySignal.city_id, NearbySignal.detail, MarketOutcome.won)
+            .join(MarketOutcome, MarketOutcome.id == NearbySignal.outcome_id)
+            .where(NearbySignal.signaled_at >= since))).all():
+        for d in detail or []:
+            if (d.get("below_f") or 0) < 1.0:
+                continue
+            k = live.setdefault((city_id_, d.get("icao")), {"past_high": 0, "settled": 0, "won": 0})
+            k["past_high"] += 1
+            if won is not None:
+                k["settled"] += 1
+                k["won"] += int(bool(won))
+    compass = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    out = []
+    for cid, name, target in sorted(cities, key=lambda c: c[1]):
+        for icao, km, bearing in NEARBY[target]:
+            hist = NEARBY_HISTORY.get((target, icao), (None, None))
+            lv = live.get((cid, icao), {"past_high": 0, "settled": 0, "won": 0})
+            out.append({"city": name, "city_id": cid, "settlement": target, "station": icao, "km": km,
+                        "direction": compass[int((bearing + 22.5) // 45) % 8], "bearing": bearing,
+                        "hist_lift_jul_sep": hist[0], "hist_lift_oct_nov": hist[1], **lv})
+    return {"days": days, "rows": out}
 
 
 @router.get("/metar/csv")
