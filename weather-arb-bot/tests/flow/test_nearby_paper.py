@@ -266,6 +266,41 @@ class TestReportFilters:
         assert r["settled"] == 0, "not buyable: never scored"
 
 
+class TestByCity:
+    @pytest.mark.asyncio
+    async def test_the_city_summary_and_its_stations(self, http, world, fake_telegram):
+        from app.api.admin import admin_nearby_report, admin_nearby_stations
+        from app.nearby.stations import NEARBY, NEARBY_HISTORY
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.70, ask=0.74))
+        await _run(world, http)
+        async with world() as db:
+            (await db.get(MarketOutcome, 11)).won = True
+            await db.commit()
+            rep = await admin_nearby_report("t", db, days=30, from_date=None, to_date=None, city_id=None)
+            st = await admin_nearby_stations("t", db, days=90, city_id=None)
+            other = await admin_nearby_stations("t", db, days=90, city_id=AUSTIN.id + 1)
+        (c,) = rep["by_city"]
+        assert c["city"] == "Austin" and (c["signals"], c["buyable"], c["settled"], c["wins"]) == (1, 1, 1, 1)
+        assert c["pnl_per_share"] == pytest.approx(0.26) and c["enough"] is False
+        rows = {r["station"]: r for r in st["rows"]}
+        assert set(rows) == {s for s, _, _ in NEARBY["KAUS"]}
+        falling = NB[:4]                                     # the fixture's four falling neighbours
+        for icao in falling:
+            assert (rows[icao]["past_high"], rows[icao]["settled"], rows[icao]["won"]) == (1, 1, 1)
+        assert rows[NB[4]]["past_high"] == 0, "the rising one was not past its high"
+        r0 = rows[NB[0]]
+        km, bearing = next((k, b) for s_, k, b in NEARBY["KAUS"] if s_ == NB[0])
+        assert r0["km"] == km and r0["bearing"] == bearing and r0["direction"] in ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+        assert (r0["hist_lift_jul_sep"], r0["hist_lift_oct_nov"]) == NEARBY_HISTORY.get(("KAUS", NB[0]), (None, None))
+        assert other["rows"] == [], "the city filter applies"
+
+    def test_the_history_table_only_names_listed_stations(self):
+        from app.nearby.stations import NEARBY, NEARBY_HISTORY
+        for (target, icao), (a, b) in NEARBY_HISTORY.items():
+            assert icao in {s for s, _, _ in NEARBY[target]}
+            assert a is None or -50 < a < 50
+
+
 class TestSettings:
     @pytest.mark.asyncio
     async def test_the_switches_persist(self, monkeypatch):

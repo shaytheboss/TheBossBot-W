@@ -387,6 +387,12 @@
         <tbody id="nearbyBody"></tbody>
       </table>
       </div>
+      <h3 style="margin-top:20px;">By city</h3>
+      <p class="small">Each city's own record in this range. A city is judged on its own only once it has ~30 settled buyable signals — before that its figures are mostly luck (on July–November history, a city's result in July–September did not predict its result in October–November at all).</p>
+      <div id="nearbyByCity" style="overflow-x:auto"></div>
+      <h3 style="margin-top:20px;">Stations by city</h3>
+      <p class="small">Each settlement station's nearby stations. <strong>History</strong>: on July–November METARs, after the usual peak, when this station was ≥1°F below its own high, how many percentage points more often the settlement station was already at the day's high (July–Sep / Oct–Nov). <strong>Live</strong>: in how many of the paper signals it was past its own high, and how those signals settled.</p>
+      <div id="nearbyStations" style="overflow-x:auto"></div>
     </section>
 
     <section id="tab-lessons" class="hidden">
@@ -2437,6 +2443,41 @@ async function loadNearby() {
     card('Market after 10 / 30 min', `${sc(j.avg_move_10)} / ${sc(j.avg_move_30)}`);
   j.rows.forEach(x => { x._buyable = x.tradable ? 'yes' : 'no'; });
   _registerTable('nearbyBody', j.rows, _renderNearby, { key: 'at', dir: 'desc', type: 'date' });
+  _renderNearbyByCity(j.by_city || []);
+  const sp = new URLSearchParams(); if (c) sp.set('city_id', c);
+  const rs = await api('/nearby/stations?' + sp);
+  if (rs.ok) _renderNearbyStations((await rs.json()).rows || []);
+}
+
+function _renderNearbyByCity(rows) {
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  const pct = v => v == null ? '—' : Math.round(v * 100) + '%';
+  let h = '<table class="small"><thead><tr><th>City</th><th>Signals</th><th>Buyable</th><th>Settled</th><th>Won</th>'
+    + '<th>Win rate</th><th>Avg ask</th><th>Result / share</th><th>All signals would have</th><th>Enough data?</th></tr></thead><tbody>';
+  for (const x of rows) {
+    h += `<tr><td>${escapeHtml(x.city)}</td><td>${x.signals}</td><td>${x.buyable}</td><td>${x.settled}</td><td>${x.wins}</td>`
+      + `<td>${pct(x.win_rate)}</td><td>${cent(x.avg_ask)}</td><td>${sc(x.pnl_per_share)}</td>`
+      + `<td><span style="opacity:.7">${sc(x.would_pnl_all)}</span></td><td>${x.enough ? '✅' : `not yet (${x.settled}/30)`}</td></tr>`;
+  }
+  h += '</tbody></table>';
+  document.getElementById('nearbyByCity').innerHTML = rows.length ? h : '<p class="small">No signal in this range.</p>';
+  makeTablesSortable('nearbyByCity');
+}
+
+function _renderNearbyStations(rows) {
+  const lift = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + 'pp';
+  let h = '<table class="small"><thead><tr><th>City</th><th>Settlement</th><th>Nearby</th><th>km</th><th>Direction</th>'
+    + '<th>History Jul–Sep</th><th>History Oct–Nov</th><th>Live: past its high</th><th>…settled</th><th>…won</th></tr></thead><tbody>';
+  for (const x of rows) {
+    h += `<tr><td>${escapeHtml(x.city)}</td><td>${escapeHtml(x.settlement)}</td><td>${escapeHtml(x.station)}</td>`
+      + `<td>${Math.round(x.km)}</td><td>${escapeHtml(x.direction)} (${x.bearing}°)</td>`
+      + `<td>${lift(x.hist_lift_jul_sep)}</td><td>${lift(x.hist_lift_oct_nov)}</td>`
+      + `<td>${x.past_high}</td><td>${x.settled}</td><td>${x.settled ? `${x.won} (${Math.round(100 * x.won / x.settled)}%)` : '—'}</td></tr>`;
+  }
+  h += '</tbody></table>';
+  document.getElementById('nearbyStations').innerHTML = rows.length ? h : '<p class="small">No city with nearby stations.</p>';
+  makeTablesSortable('nearbyStations');
 }
 
 function resetNbFilter() {
