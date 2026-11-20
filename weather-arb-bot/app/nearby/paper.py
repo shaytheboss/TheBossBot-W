@@ -79,12 +79,20 @@ def _fmt_delta(delta_f: float, unit: str) -> str:
     return f"{delta_f * 5 / 9:.1f}°C" if unit == "C" else f"{delta_f:.1f}°F"
 
 
+def event_url(market: Market) -> Optional[str]:
+    """The Polymarket event page — the same link the bot's other alerts use."""
+    return f"https://polymarket.com/event/{market.external_id}" if market.external_id else None
+
+
 def message(city: str, outcome: MarketOutcome, unit: str, v: sig.Verdict, book: dict,
-            km: dict[str, float]) -> str:
+            km: dict[str, float], link: Optional[str] = None,
+            peak_share: Optional[float] = None) -> str:
     """The bet first, then its price, then why — everything in the market's unit."""
+    fair = sig.fair_value(book["mid"]) if "mid" in book else None
     lines = [f"🟢 <b>Paper buy: YES {escape(outcome.bucket_label)}</b> — {escape(city)}",
              f"Ask <b>{book['ask'] * 100:.1f}¢</b> ({book['ask_size']:.0f} shares) · "
-             f"bid {book['bid'] * 100:.1f}¢ · spread {(book['ask'] - book['bid']) * 100:.1f}¢",
+             f"bid {book['bid'] * 100:.1f}¢ · spread {(book['ask'] - book['bid']) * 100:.1f}¢"
+             + (f" · worth ~{fair * 100:.0f}¢" if fair is not None else ""),
              f"High so far {_fmt(v.target.high_f, unit)} at {escape(v.target.icao)}, "
              f"now {_fmt(v.target.now_f, unit)}",
              f"<b>{len(v.falling)} of {len(v.nearby)}</b> nearby stations are past their own high:"]
@@ -92,6 +100,10 @@ def message(city: str, outcome: MarketOutcome, unit: str, v: sig.Verdict, book: 
         mark = "↓" if s in v.falling else "↑"
         lines.append(f"  {mark} {escape(s.icao)} {km.get(s.icao, 0):.0f} km: "
                      f"{_fmt_delta(s.below_f, unit)} below its high")
+    if peak_share is not None:
+        lines.append(f"Past the usual peak: on {peak_share * 100:.0f}% of this month's days the high had come by now")
+    if link:
+        lines.append(f'<a href="{escape(link, quote=True)}">Open on Polymarket</a>')
     lines.append("<i>Paper only — nothing is bought. The bet: today's high stays in this bucket.</i>")
     return "\n".join(lines)
 
@@ -137,6 +149,18 @@ async def _follow_ups(db, now: datetime, collector: PolymarketCollector) -> int:
     return done
 
 
+async def _peak_share(db, city_id: int, local: datetime) -> Optional[float]:
+    """Share of this month's days whose high had come by this local time, from
+    the peak guard; early in a month (too few days) the previous month's."""
+    from app.peaks.guard import share_passed
+    hour = local.hour + local.minute / 60
+    share, _ = await share_passed(db, city_id, local.month, hour, today=local.date())
+    if share is None:
+        prev = 12 if local.month == 1 else local.month - 1
+        share, _ = await share_passed(db, city_id, prev, hour, today=local.date())
+    return share
+
+
 async def run_paper(db, now: Optional[datetime] = None,
                     collector: Optional[PolymarketCollector] = None) -> dict:
     now = now or datetime.now(timezone.utc)
@@ -169,6 +193,11 @@ async def run_paper(db, now: Optional[datetime] = None,
                              [sig.station_state(s, reads.get(s, []), now) for s, _, _ in nb])
             if v is None or not v.fires:
                 continue
+            local = now.astimezone(ZoneInfo(city.timezone or "UTC"))
+            share = await _peak_share(db, city.id, local)
+            if not sig.past_peak(share):
+                stats["before_peak"] = stats.get("before_peak", 0) + 1
+                continue                                    # the station may still be climbing
             stats["fired"] += 1
             outcomes = (await db.execute(select(MarketOutcome).where(MarketOutcome.market_id == market.id))).scalars().all()
             hold = next((o for o in outcomes if o.token_id and sig.holds(
@@ -179,7 +208,6 @@ async def run_paper(db, now: Optional[datetime] = None,
             if book is None or not sig.mid_in_band(book["mid"]):
                 continue                                    # not recorded: may still fire later in band
             km = {s: d for s, d, _ in nb}
-            local = now.astimezone(ZoneInfo(city.timezone or "UTC"))
             tradable = sig.tradable(book["bid"], book["ask"])
             if existing is not None and not tradable:
                 continue                                    # keep the first sighting; try again next run
@@ -204,7 +232,8 @@ async def run_paper(db, now: Optional[datetime] = None,
                 stats["not_tradable"] = stats.get("not_tradable", 0) + 1
                 continue                                    # recorded for the report, never announced
             if getattr(settings, "nearby_alerts_enabled", True):
-                if await send_text(db, message(city.name, hold, resolve_bucket_unit(hold), v, book, km)):
+                if await send_text(db, message(city.name, hold, resolve_bucket_unit(hold), v, book, km,
+                                               link=event_url(market), peak_share=share)):
                     row.alerted = True
                     await db.commit()
                     stats["alerted"] += 1

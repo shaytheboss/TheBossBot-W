@@ -68,10 +68,27 @@ class TestBucket:
 
 
 class TestTradable:
-    @pytest.mark.parametrize("bid,ask,ok", [(0.58, 0.62, True), (0.80, 0.88, True), (0.81, 0.89, False),
-                                            (0.692, 0.995, False), (0.40, 0.51, False), (None, 0.6, False)])
-    def test_ask_and_spread_limits(self, bid, ask, ok):
+    @pytest.mark.parametrize("bid,ask,ok", [
+        (0.70, 0.74, True),      # mid .72 -> worth .85 -> up to .83
+        (0.67, 0.83, True),      # a 16c spread is fine when the ask is still worth it
+        (0.67, 0.84, False),     # one cent over
+        (0.58, 0.62, True),      # mid .60 -> worth .667 -> up to .647
+        (0.40, 0.55, False),     # mid .475 -> worth .538 -> up to .518
+        (0.74, 0.84, False),     # Buenos Aires live: mid .79 -> worth .85 -> up to .83
+        (0.692, 0.995, False),   # Munich live: mid .84 -> worth .915 -> up to .895
+        (0.80, 0.94, False),     # mid .87 is above the band
+        (None, 0.6, False), (0.7, 0.6, False),
+    ])
+    def test_ask_against_fair_value(self, bid, ask, ok):
         assert sig.tradable(bid, ask) is ok
+
+    def test_fair_value_bands(self):
+        assert sig.fair_value(0.30) == 0.538 and sig.fair_value(0.85) == 0.915
+        assert sig.fair_value(0.29) is None and sig.fair_value(0.86) is None and sig.fair_value(None) is None
+
+    @pytest.mark.parametrize("share,ok", [(None, False), (0.49, False), (0.5, True), (1.0, True)])
+    def test_past_peak(self, share, ok):
+        assert sig.past_peak(share) is ok
 
 
 class TestMessage:
