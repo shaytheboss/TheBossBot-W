@@ -912,6 +912,15 @@ async def job_run_analyzer():
         except Exception as e:
             logger.error(f"Beta analyzer job failed (non-critical): {e}", exc_info=True)
 
+    # Real track (app/realtrack) in its own session: it only records what the
+    # detectors noted above, so a failure here cannot touch alpha or beta.
+    async with AsyncSessionLocal() as db:
+        try:
+            from app.realtrack.track import process as realtrack_process
+            await realtrack_process(db)
+        except Exception as e:
+            logger.error(f"Real track failed (non-critical): {e}", exc_info=True)
+
     # Exit monitor runs in its own session so it CANNOT affect alpha or beta.
     async with AsyncSessionLocal() as db:
         try:

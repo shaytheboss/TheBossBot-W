@@ -107,6 +107,7 @@
       <button data-tab="intraday">⚡ Intraday Stats</button>
       <button data-tab="intradaypos">⚡ Intraday Positions</button>
       <button data-tab="nearby">🛰 Nearby (paper)</button>
+      <button data-tab="realtrack">💰 Real track</button>
       <button data-tab="lessons">Lessons</button>
       <button data-tab="cities">Cities</button>
       <button data-tab="exits">🚨 Exit Signals</button>
@@ -393,6 +394,58 @@
       <h3 style="margin-top:20px;">Stations by city</h3>
       <p class="small">Each settlement station's nearby stations. <strong>History</strong>: on July–November METARs, after the usual peak, when this station was ≥1°F below its own high, how many percentage points more often the settlement station was already at the day's high (July–Sep / Oct–Nov). <strong>Live</strong>: in how many of the paper signals it was past its own high, and how those signals settled.</p>
       <div id="nearbyStations" style="overflow-x:auto"></div>
+    </section>
+
+    <section id="tab-realtrack" class="hidden">
+      <p class="small">The bot's own signals that meet the rule which held up on May–November history: <strong>the event is today in the city's own calendar</strong> and the bot's <strong>confidence is at least 91%</strong>. Each is recorded once per bucket and side as a <strong>virtual buy of 5 shares at the live price</strong> (YES ask, or 1 − YES bid for NO) and sent on Telegram under its own 💰 REAL TRACK header. It runs next to the research positions and changes none of them; when a research position on the same bucket is already open, the same-day entry is still recorded here (column "Research open"). The bot's stated % runs high — on history, 91–95% won about 74–78%. Switches are on the Settings tab.</p>
+      <div class="toolbar">
+        <label class="row small">Event date from <input type="date" id="rtFrom" /></label>
+        <label class="row small">To <input type="date" id="rtTo" /></label>
+        <label class="row small">City
+          <select id="rtCity"><option value="">All cities</option></select>
+        </label>
+        <select id="rtResult" onchange="applyRtClientFilter()" title="How the bet settled">
+          <option value="">All results</option>
+          <option value="won">Won</option>
+          <option value="lost">Lost</option>
+          <option value="open">Open (not settled)</option>
+        </select>
+        <select id="rtModel" onchange="applyRtClientFilter()" title="Which estimator gave the signal">
+          <option value="">α and β</option>
+          <option value="alpha">α only</option>
+          <option value="beta">β only</option>
+        </select>
+        <button class="btn primary" onclick="loadRealTrack()">Apply Filter</button>
+        <button class="btn" onclick="resetRtFilter()">Reset</button>
+        <button class="btn" onclick="exportCsv('rtBody', 'real-track')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
+      </div>
+      <div class="cards" id="rtCards"></div>
+      <div style="overflow-x:auto">
+      <table id="rtTable">
+        <thead><tr>
+          <th data-sort-key="at" data-sort-type="date">Bought (UTC)</th>
+          <th data-sort-key="local_time" data-sort-type="str">Local</th>
+          <th data-sort-key="date" data-sort-type="date">Event date</th>
+          <th data-sort-key="city" data-sort-type="str">City</th>
+          <th data-sort-key="_bet" data-sort-type="str">Bet</th>
+          <th data-sort-key="confidence" data-sort-type="num">Conf.</th>
+          <th data-sort-key="model" data-sort-type="str">Model</th>
+          <th data-sort-key="price" data-sort-type="num">Price</th>
+          <th data-sort-key="bid" data-sort-type="num">YES bid</th>
+          <th data-sort-key="ask" data-sort-type="num">YES ask</th>
+          <th data-sort-key="spread" data-sort-type="num">Spread</th>
+          <th data-sort-key="_research" data-sort-type="str">Research open</th>
+          <th data-sort-key="result" data-sort-type="str">Result</th>
+          <th data-sort-key="pnl_per_share" data-sort-type="num">P&amp;L / share</th>
+          <th data-sort-key="pnl" data-sort-type="num">P&amp;L (5 sh.)</th>
+          <th>Link</th>
+        </tr></thead>
+        <tbody id="rtBody"></tbody>
+      </table>
+      </div>
+      <h3 style="margin-top:20px;">By city</h3>
+      <p class="small">Each city's own record in this range. A city is judged on its own only once it has ~30 settled buys — on May–November history, a city's same-day result in one half did not predict the other half at all.</p>
+      <div id="rtByCity" style="overflow-x:auto"></div>
     </section>
 
     <section id="tab-lessons" class="hidden">
@@ -815,6 +868,7 @@ function bindTabs() {
       if (tab === 'intraday') loadIntraday();
       if (tab === 'intradaypos') loadIntradayPos();
       if (tab === 'nearby') loadNearby();
+      if (tab === 'realtrack') loadRealTrack();
       if (tab === 'lessons') loadLessons();
       if (tab === 'cities') loadCities();
       if (tab === 'settings') loadSettings();
@@ -845,7 +899,7 @@ async function ensureCitiesLoaded() {
   if (!r.ok) return [];
   const rows = await r.json();
   window._citiesCache = rows;
-  ['statsCity','posCity','lesCity','oppCity','idCity','idpCity','nbCity'].forEach(id => {
+  ['statsCity','posCity','lesCity','oppCity','idCity','idpCity','nbCity','rtCity'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel || sel.dataset.populated === '1') return;
     rows.forEach(c => {
@@ -2198,6 +2252,23 @@ async function loadSettings() {
           <option value="1" ${s.open_meteo_hrrr_half_hourly ? 'selected' : ''}>On (:20 and :50)</option>
           <option value="0" ${s.open_meteo_hrrr_half_hourly ? '' : 'selected'}>Off (:20 only)</option>
         </select></td></tr>
+      <tr><td colspan="2" style="padding-top:14px;font-weight:600;">💰 Real track (same day, high confidence — virtual buys, own table)</td></tr>
+      <tr><td>Real track — record virtual buys</td><td>
+        <select id="set-rt-on">
+          <option value="1" ${s.realtrack_enabled ? 'selected' : ''}>On</option>
+          <option value="0" ${s.realtrack_enabled ? '' : 'selected'}>Off</option>
+        </select></td></tr>
+      <tr><td>Real track — Telegram message per buy</td><td>
+        <select id="set-rt-alerts">
+          <option value="1" ${s.realtrack_alerts_enabled ? 'selected' : ''}>On</option>
+          <option value="0" ${s.realtrack_alerts_enabled ? '' : 'selected'}>Off</option>
+        </select></td></tr>
+      <tr><td>Real track — minimum confidence (0.91 = 91%)</td>
+          <td><input id="set-rt-conf" type="number" step="0.01" min="0.5" max="1" value="${s.realtrack_min_confidence}" /></td></tr>
+      <tr><td>Real track — days ahead (0 = the event is today in the city)</td><td>
+        <select id="set-rt-days">
+          ${[0, 1, 2, 3].map(d => `<option value="${d}" ${s.realtrack_max_days_ahead === d ? 'selected' : ''}>${d}</option>`).join('')}
+        </select></td></tr>
       <tr><td colspan="2" style="padding-top:14px;font-weight:600;">🛰 Research collectors (cost: small; switch off to save Railway)</td></tr>
       <tr><td>Nearby stations — collect METARs</td><td>
         <select id="set-nearby-obs">
@@ -2308,6 +2379,10 @@ async function saveSettings() {
     nearby_paper_enabled: document.getElementById('set-nearby-paper').value === '1',
     nearby_alerts_enabled: document.getElementById('set-nearby-alerts').value === '1',
     nws_obs_enabled: document.getElementById('set-nws-obs').value === '1',
+    realtrack_enabled: document.getElementById('set-rt-on').value === '1',
+    realtrack_alerts_enabled: document.getElementById('set-rt-alerts').value === '1',
+    realtrack_min_confidence: parseFloat(document.getElementById('set-rt-conf').value),
+    realtrack_max_days_ahead: parseInt(document.getElementById('set-rt-days').value),
   };
   const r = await api('/settings', { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (r.ok) { alert('Saved'); loadSettings(); }
@@ -2527,6 +2602,102 @@ function _renderNearby(rows) {
       <td>${x.link ? `<a href="${escapeHtml(x.link)}" target="_blank" rel="noopener">Polymarket ↗</a>` : '—'}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="17" class="small">No signal in this range. The job runs every 5 minutes for cities with an open market between 10:00 and 20:00 local.</td></tr>';
+}
+
+// --- 💰 Real track tab --------------------------------------------------------
+async function loadRealTrack() {
+  await ensureCitiesLoaded();
+  _initFilterDefaults('rtFrom', 'rtTo');
+  const p = new URLSearchParams();
+  const f = document.getElementById('rtFrom').value;
+  const t = document.getElementById('rtTo').value;
+  const c = document.getElementById('rtCity').value;
+  if (f) p.set('from_date', f);
+  if (t) p.set('to_date', t);
+  if (c) p.set('city_id', c);
+  const r = await api('/realtrack/report?' + p); if (!r.ok) return;
+  const j = await r.json();
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  const usd = v => v == null ? '—' : (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
+  const res = j.pnl_per_share;
+  const rule = j.rule || {};
+  document.getElementById('rtCards').innerHTML =
+    card('Rule', `${rule.enabled ? '' : 'OFF · '}${rule.max_days_ahead ? 'up to ' + rule.max_days_ahead + ' days' : 'same day'}, ≥${Math.round((rule.min_confidence || 0) * 100)}%`) +
+    card('Buys', j.buys) +
+    card('Settled', j.settled) +
+    card('Won', j.settled ? `${j.wins} (${Math.round(100 * j.wins / j.settled)}%)` : '—') +
+    card('Avg price', cent(j.avg_price)) +
+    card('Avg confidence', j.avg_confidence == null ? '—' : Math.round(j.avg_confidence) + '%') +
+    `<div class="card"><div class="label">Result / share</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
+      + `<div class="small">${j.settled < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
+    card('P&L (5 shares each)', usd(j.total_pnl)) +
+    card('Research position already open', j.research_open);
+  j.rows.forEach(x => { x._bet = `${x.side} ${x.bucket}`; x._research = x.research_open ? 'yes' : 'no'; });
+  _registerTable('rtBody', j.rows, _renderRealTrack, { key: 'at', dir: 'desc', type: 'date' });
+  _renderRtByCity(j.by_city || []);
+}
+
+function _renderRtByCity(rows) {
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  const usd = v => v == null ? '—' : (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
+  const pct = v => v == null ? '—' : Math.round(v * 100) + '%';
+  let h = '<table class="small"><thead><tr><th>City</th><th>Buys</th><th>Settled</th><th>Won</th>'
+    + '<th>Win rate</th><th>Avg price</th><th>Result / share</th><th>P&amp;L (5 sh.)</th><th>Enough data?</th></tr></thead><tbody>';
+  for (const x of rows) {
+    h += `<tr><td>${escapeHtml(x.city)}</td><td>${x.buys}</td><td>${x.settled}</td><td>${x.wins}</td>`
+      + `<td>${pct(x.win_rate)}</td><td>${cent(x.avg_price)}</td><td>${sc(x.pnl_per_share)}</td>`
+      + `<td>${usd(x.total_pnl)}</td><td>${x.enough ? '✅' : `not yet (${x.settled}/30)`}</td></tr>`;
+  }
+  h += '</tbody></table>';
+  document.getElementById('rtByCity').innerHTML = rows.length ? h : '<p class="small">No buy in this range.</p>';
+  makeTablesSortable('rtByCity');
+}
+
+function resetRtFilter() {
+  ['rtFrom', 'rtTo', 'rtCity', 'rtResult', 'rtModel'].forEach(id => { document.getElementById(id).value = ''; });
+  _clientFilters['rtBody'] = null;
+  loadRealTrack();
+}
+
+function applyRtClientFilter() {
+  const res = document.getElementById('rtResult').value;
+  const m = document.getElementById('rtModel').value;
+  _clientFilters['rtBody'] = (res || m) ? (x => {
+    if (res && x.result !== res) return false;
+    if (m && x.model !== m) return false;
+    return true;
+  }) : null;
+  _rerenderTable('rtBody');
+}
+
+function _renderRealTrack(rows) {
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  const usd = v => v == null ? '—' : (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
+  document.getElementById('rtBody').innerHTML = rows.map(x => {
+    const result = x.result === 'won' ? '✅ Won' : x.result === 'lost' ? '❌ Lost' : '⏳ Open';
+    const cls = x.result === 'won' ? 'win' : x.result === 'lost' ? 'loss' : '';
+    return `<tr class="${cls}">
+      <td class="small">${escapeHtml(x.at.slice(5, 16).replace('T', ' '))}</td>
+      <td class="small">${escapeHtml(x.local_time || '')}</td>
+      <td>${escapeHtml(x.date)}</td>
+      <td>${escapeHtml(x.city)}</td>
+      <td><strong>${escapeHtml(x.side)}</strong> ${escapeHtml(x.bucket)}</td>
+      <td>${x.confidence}%</td>
+      <td>${x.model === 'beta' ? 'β' : 'α'}</td>
+      <td>${cent(x.price)}</td>
+      <td>${cent(x.bid)}</td>
+      <td>${cent(x.ask)}</td>
+      <td>${cent(x.spread)}</td>
+      <td>${x.research_open ? '📌 yes' : '—'}</td>
+      <td>${result}</td>
+      <td>${sc(x.pnl_per_share)}</td>
+      <td>${usd(x.pnl)}</td>
+      <td>${x.link ? `<a href="${escapeHtml(x.link)}" target="_blank" rel="noopener">Polymarket ↗</a>` : '—'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="16" class="small">No buy in this range yet. The analyzer checks every few minutes; a buy appears when a signal for a market that settles today (city time) reaches the confidence floor.</td></tr>';
 }
 
 async function showShadowStatus(btn) {

@@ -122,6 +122,8 @@ def reset_module_caches():
     import app.nearby.job as nearby_job
     import app.peaks.guard as peaks_guard
     import app.shadow.v2 as shadow_v2
+    import app.realtrack.hook as realtrack_hook
+    import app.realtrack.track as realtrack_track
     from app.utils import jobstats
 
     def _clear():
@@ -145,6 +147,8 @@ def reset_module_caches():
         nearby_job.LAST_RUN.clear()
         peaks_guard.reset_cache()
         shadow_v2.reset_cache()
+        realtrack_hook.reset()
+        realtrack_track.LAST_RUN.clear()
 
     _clear()
     yield

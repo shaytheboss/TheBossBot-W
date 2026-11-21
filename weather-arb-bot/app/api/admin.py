@@ -128,6 +128,10 @@ class SettingsIn(BaseModel):
     nearby_obs_enabled: Optional[bool] = None
     nearby_paper_enabled: Optional[bool] = None
     nearby_alerts_enabled: Optional[bool] = None
+    realtrack_enabled: Optional[bool] = None
+    realtrack_alerts_enabled: Optional[bool] = None
+    realtrack_min_confidence: Optional[float] = None
+    realtrack_max_days_ahead: Optional[int] = None
     intraday_peak_guard_min_passed: Optional[float] = None
     model_fetch_mode: Optional[str] = None
     open_meteo_extra_models: Optional[str] = None
@@ -2392,6 +2396,99 @@ async def admin_nearby_stations(
     return {"days": days, "rows": out}
 
 
+@router.get("/realtrack/report")
+async def admin_realtrack_report(
+    _: str = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=30, ge=1, le=365),
+    from_date: Optional[date_cls] = Query(default=None, description="Event date from (overrides `days`)"),
+    to_date: Optional[date_cls] = Query(default=None, description="Event date to, inclusive"),
+    city_id: Optional[int] = Query(default=None),
+):
+    """The real track: every same-day, high-confidence virtual buy at the live
+    price, and — once its market settles — the result. Small table; one query.
+    Summary figures follow the filters."""
+    from zoneinfo import ZoneInfo
+    from app.realtrack import track as realtrack
+    from app.realtrack.models import RealTrackBuy
+
+    q = (select(RealTrackBuy, City.name, City.timezone, MarketOutcome.bucket_label, MarketOutcome.won,
+                Market.external_id)
+         .join(City, City.id == RealTrackBuy.city_id)
+         .join(MarketOutcome, MarketOutcome.id == RealTrackBuy.outcome_id)
+         .join(Market, Market.id == RealTrackBuy.market_id))
+    if from_date is not None:
+        q = q.where(RealTrackBuy.event_date >= from_date)
+    else:
+        q = q.where(RealTrackBuy.bought_at >= datetime.now(timezone.utc) - timedelta(days=days))
+    if to_date is not None:
+        q = q.where(RealTrackBuy.event_date <= to_date)
+    if city_id is not None:
+        q = q.where(RealTrackBuy.city_id == city_id)
+    rows = (await db.execute(q.order_by(desc(RealTrackBuy.bought_at)))).all()
+
+    out = []
+    for b, city, tz, bucket, outcome_won, slug in rows:
+        at = b.bought_at if b.bought_at.tzinfo else b.bought_at.replace(tzinfo=timezone.utc)
+        won = realtrack.result_of(b.side, outcome_won)
+        pnl = None if won is None else round(int(won) - b.price, 4)
+        out.append({
+            "at": at.isoformat(), "local_time": at.astimezone(ZoneInfo(tz or "UTC")).strftime("%H:%M"),
+            "city": city, "city_id": b.city_id, "date": b.event_date.isoformat(),
+            "bucket": bucket, "side": b.side, "model": b.estimator, "confidence": b.confidence,
+            "price": b.price, "bid": b.bid, "ask": b.ask, "spread": round(b.ask - b.bid, 4),
+            "shares": b.shares, "research_open": bool(b.research_open), "alerted": bool(b.alerted),
+            "link": realtrack.event_url(slug),
+            "result": "open" if won is None else ("won" if won else "lost"),
+            "won": won, "pnl_per_share": pnl,
+            "pnl": None if pnl is None else round(pnl * b.shares, 2),
+        })
+
+    settled = [r for r in out if r["won"] is not None]
+
+    def mean(xs):
+        xs = [x for x in xs if x is not None]
+        return round(sum(xs) / len(xs), 4) if xs else None
+    return {
+        "days": days,
+        "buys": len(out),
+        "settled": len(settled),
+        "wins": sum(1 for r in settled if r["won"]),
+        "avg_price": mean([r["price"] for r in out]),
+        "avg_confidence": mean([r["confidence"] for r in out]),
+        "pnl_per_share": mean([r["pnl_per_share"] for r in settled]),
+        "total_pnl": round(sum(r["pnl"] for r in settled), 2),
+        "research_open": sum(1 for r in out if r["research_open"]),
+        "rule": {"min_confidence": getattr(settings, "realtrack_min_confidence", 0.91),
+                 "max_days_ahead": getattr(settings, "realtrack_max_days_ahead", 0),
+                 "enabled": getattr(settings, "realtrack_enabled", True)},
+        "last_run": dict(realtrack.LAST_RUN),
+        "by_city": _realtrack_by_city(out),
+        "rows": out,
+    }
+
+
+def _realtrack_by_city(rows: list[dict]) -> list[dict]:
+    """Per city: buys, settled, won, win rate, average price and result.
+    `enough` marks ~30 settled buys, before which a city's figures are mostly luck."""
+    by: dict[str, list[dict]] = {}
+    for r in rows:
+        by.setdefault(r["city"], []).append(r)
+    out = []
+    for city, rs in sorted(by.items()):
+        settled = [r for r in rs if r["won"] is not None]
+        wins = sum(1 for r in settled if r["won"])
+        out.append({
+            "city": city, "buys": len(rs), "settled": len(settled), "wins": wins,
+            "win_rate": round(wins / len(settled), 3) if settled else None,
+            "avg_price": round(sum(r["price"] for r in rs) / len(rs), 4),
+            "pnl_per_share": round(sum(r["pnl_per_share"] for r in settled) / len(settled), 4) if settled else None,
+            "total_pnl": round(sum(r["pnl"] for r in settled), 2),
+            "enough": len(settled) >= NEARBY_ENOUGH,
+        })
+    return out
+
+
 @router.get("/metar/csv")
 async def admin_metar_csv(
     _: str = Depends(require_admin),
@@ -2869,6 +2966,10 @@ async def admin_get_settings(_: str = Depends(require_admin)):
         "nearby_obs_enabled": getattr(settings, "nearby_obs_enabled", True),
         "nearby_paper_enabled": getattr(settings, "nearby_paper_enabled", True),
         "nearby_alerts_enabled": getattr(settings, "nearby_alerts_enabled", True),
+        "realtrack_enabled": getattr(settings, "realtrack_enabled", True),
+        "realtrack_alerts_enabled": getattr(settings, "realtrack_alerts_enabled", True),
+        "realtrack_min_confidence": getattr(settings, "realtrack_min_confidence", 0.91),
+        "realtrack_max_days_ahead": getattr(settings, "realtrack_max_days_ahead", 0),
         "intraday_peak_guard_min_passed": getattr(settings, "intraday_peak_guard_min_passed", 0.5),
         "model_fetch_mode": getattr(settings, "model_fetch_mode", "batched"),
         "open_meteo_extra_models": getattr(settings, "open_meteo_extra_models", ""),
@@ -2970,10 +3071,19 @@ async def admin_set_settings(
             raise HTTPException(400, "open_meteo_extra_models: up to 10 Open-Meteo model ids, comma-separated")
         changed["open_meteo_extra_models"] = ",".join(names)
     for flag in ("open_meteo_hrrr_half_hourly", "open_meteo_probe_enabled", "nws_obs_enabled",
-                 "nearby_obs_enabled", "nearby_paper_enabled", "nearby_alerts_enabled"):
+                 "nearby_obs_enabled", "nearby_paper_enabled", "nearby_alerts_enabled",
+                 "realtrack_enabled", "realtrack_alerts_enabled"):
         val = getattr(payload, flag)
         if val is not None:
             changed[flag] = bool(val)
+    if payload.realtrack_min_confidence is not None:
+        if not (0.5 <= payload.realtrack_min_confidence <= 1.0):
+            raise HTTPException(400, "realtrack_min_confidence must be 0.5-1.0")
+        changed["realtrack_min_confidence"] = payload.realtrack_min_confidence
+    if payload.realtrack_max_days_ahead is not None:
+        if not (0 <= payload.realtrack_max_days_ahead <= 3):
+            raise HTTPException(400, "realtrack_max_days_ahead must be 0-3")
+        changed["realtrack_max_days_ahead"] = payload.realtrack_max_days_ahead
 
     # Apply in-memory (immediate effect) AND persist (survives restart).
     for key, val in changed.items():
