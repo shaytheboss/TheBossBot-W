@@ -16,6 +16,7 @@ from app.config import settings
 from app.models.city import City
 from app.models.market import Market, MarketOutcome
 from app.models.opportunity import Opportunity
+from app.realtrack import hook as realtrack_hook
 from app.utils.units import resolve_bucket_unit
 
 logger = logging.getLogger(__name__)
@@ -541,6 +542,15 @@ async def _evaluate_opportunity(
     # Virtual buy is suppressed during suspension or blacklist.
     # Calibration is display-only for now — raw certainty drives the gate.
     create_virtual_buy = (certainty >= buy_thresh) and not is_blacklisted and not is_suspended
+
+    # Real track (app/realtrack): noted BEFORE the research dedup below, so an
+    # older research position on this bucket cannot hide a same-day signal.
+    # An in-memory append that never raises — nothing below depends on it.
+    realtrack_hook.note(
+        estimator="alpha", city=city, market=market, outcome=outcome, side=side,
+        certainty=certainty, book=book, entry_cost=entry_cost,
+        excluded=is_blacklisted or is_suspended,
+    )
 
     # Dedup: skip new records when an OPEN position already exists for this
     # (outcome, side) — regardless of when it was opened. This prevents double

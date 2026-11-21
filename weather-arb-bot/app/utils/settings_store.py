@@ -59,6 +59,11 @@ PERSISTABLE_KEYS: frozenset = frozenset({
     "nearby_obs_enabled",
     "nearby_paper_enabled",
     "nearby_alerts_enabled",
+    # The real track (app/realtrack/).
+    "realtrack_enabled",
+    "realtrack_alerts_enabled",
+    "realtrack_min_confidence",
+    "realtrack_max_days_ahead",
 })
 
 

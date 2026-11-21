@@ -142,6 +142,19 @@ class Settings(BaseSettings):
     nearby_paper_enabled: bool = True
     nearby_alerts_enabled: bool = True
 
+    # ── Real track (app/realtrack/) ─────────────────────────────────────────
+    # The bot's own signals that meet the rule which held up on May–Nov
+    # history: the event is today in the city's calendar and the confidence is
+    # at least realtrack_min_confidence. Recorded once per bucket and side as a
+    # virtual buy at the live price, in their own table, and announced with
+    # their own Telegram header. Runs next to the research track; changes none
+    # of it.
+    realtrack_enabled: bool = True
+    realtrack_alerts_enabled: bool = True
+    realtrack_min_confidence: float = 0.91
+    # 0 = the event is today in the city's own calendar.
+    realtrack_max_days_ahead: int = 0
+
     # ── Shadow study (app/shadow/) ──────────────────────────────────────────
     # Hourly record of the model's estimate vs the market price for EVERY
     # bucket of every open market, on each city's own clock. Research only:

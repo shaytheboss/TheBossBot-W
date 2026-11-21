@@ -29,6 +29,7 @@ from app.models.city import City
 from app.models.market import Market, MarketOutcome
 from app.models.model_skill import ModelSkill
 from app.models.opportunity import Opportunity
+from app.realtrack import hook as realtrack_hook
 from app.utils.units import resolve_bucket_unit
 
 logger = logging.getLogger(__name__)
@@ -320,6 +321,14 @@ async def _beta_evaluate_opportunity(
         alert_thresh,
     )
     create_virtual_buy = (certainty >= beta_buy_thresh) and not is_blacklisted and not is_suspended
+
+    # Real track (app/realtrack): noted before the dedup below; an in-memory
+    # append that never raises — nothing below depends on it.
+    realtrack_hook.note(
+        estimator="beta", city=city, market=market, outcome=outcome, side=side,
+        certainty=certainty, book=book, entry_cost=entry_cost,
+        excluded=is_blacklisted or is_suspended,
+    )
 
     # Beta-scoped dedup: only looks at beta rows
     if (
