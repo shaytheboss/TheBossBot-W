@@ -24,8 +24,10 @@ class RealTrackBuy(Base):
     ask = Column(REAL, nullable=False)
     price = Column(REAL, nullable=False)
     shares = Column(SmallInteger, nullable=False)
-    # A research position on this bucket and side was already open, so the
-    # research track recorded nothing new here — this row is the same-day entry.
+    # The regular (research) bot already held an open position on this bucket
+    # and side, opened BEFORE this signal, so it recorded nothing new — this row
+    # is the same-day entry. (Rows recorded before 2026-11-22 also counted a
+    # position the regular bot opened in the same run.)
     research_open = Column(Boolean, nullable=False, default=False)
     alerted = Column(Boolean, nullable=False, default=False)
 

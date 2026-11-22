@@ -12,9 +12,10 @@ a day. Reads the research positions; never writes them.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -62,23 +63,37 @@ async def track_record(db) -> dict:
     return {"settled": n, "wins": wins, "pnl_per_share": (pnl / n) if n else None}
 
 
-def message(n: dict, research_open: bool, record: dict) -> str:
-    """The bet first, then its price, then why — distinct from every research alert."""
+def side_book(side: str, yes_bid: float, yes_ask: float) -> tuple[float, float]:
+    """Bid and ask of the side being bought. A NO share's ask is 1 - the YES
+    bid and its bid is 1 - the YES ask; the spread is the same either way."""
+    if side == "YES":
+        return yes_bid, yes_ask
+    return round(1 - yes_ask, 4), round(1 - yes_bid, 4)
+
+
+def message(n: dict, held: Optional[dict], record: dict) -> str:
+    """The bet first, then its price, then why — distinct from every research alert.
+    Prices are in the side being bought. `held` is the regular bot's own open
+    position on this bucket and side, opened before this signal, if any."""
     c = lambda v: f"{v * 100:.1f}¢"    # noqa: E731
     when = "today" if n["lead"] == 0 else f"in {n['lead']} day{'s' if n['lead'] > 1 else ''}"
     hh = int(n["local_hour"])
     mm = int(round((n["local_hour"] - hh) * 60))
+    bid, ask = side_book(n["side"], n["bid"], n["ask"])
     lines = [
         f"💰💰 <b>REAL TRACK — BUY {n['side']} {escape(n['bucket'])}</b>",
         f"{escape(n['city'])} · event {when} · {hh:02d}:{mm:02d} local",
-        f"{n['side']} price <b>{c(n['price'])}</b> per share "
-        f"(YES bid {c(n['bid'])} / ask {c(n['ask'])} · spread {c(n['ask'] - n['bid'])})",
+        f"{n['side']} price <b>{c(n['price'])}</b> per share · "
+        f"{n['side']} bid {c(bid)} · spread {c(ask - bid)}",
         f"Bot confidence <b>{n['confidence']}%</b> [{'α' if n['estimator'] == 'alpha' else 'β'}] · "
         f"rule: same day, ≥{hook.min_confidence()}%",
         "<i>Backtest May–Nov: this rule won 76% at ~73¢ — the bot's % runs high.</i>",
     ]
-    if research_open:
-        lines.append("📌 A research position on this bucket is already open — this is the same-day entry.")
+    if held:
+        since = held["since"].astimezone(ZoneInfo(n.get("tz") or "UTC")).strftime("%d.%m")
+        at = f" at {c(held['price'])}" if held.get("price") is not None else ""
+        lines.append(f"📌 The regular bot already holds {n['side']} on this bucket since {since}{at} — "
+                     "it records nothing new today; this is today's entry.")
     if record.get("settled"):
         lines.append(f"Real track so far: {record['wins']}/{record['settled']} won · "
                      f"{record['pnl_per_share'] * 100:+.1f}¢ per share")
@@ -108,15 +123,23 @@ async def send_text(db, text: str) -> int:
     return sent
 
 
-async def _research_open(db, outcome_id: int, side: str) -> bool:
-    q = await db.execute(
-        select(Opportunity.id).where(
+async def _held_before(db, outcome_id: int, side: str, before: datetime) -> Optional[dict]:
+    """The regular bot's earliest still-open position on this bucket and side
+    opened BEFORE the signal, or None. A position it opens in the same run —
+    seconds after the note, because its own gate (90%) is below ours — does
+    not count: that is the same signal, not one held from before."""
+    row = (await db.execute(
+        select(Opportunity.detected_at, Opportunity.virtual_entry_price).where(
             Opportunity.outcome_id == outcome_id,
             Opportunity.side == side,
             Opportunity.virtual_status == "open",
-        ).limit(1)
-    )
-    return q.scalar_one_or_none() is not None
+            Opportunity.detected_at < before,
+        ).order_by(Opportunity.detected_at).limit(1)
+    )).first()
+    if row is None:
+        return None
+    since = row.detected_at if row.detected_at.tzinfo else row.detected_at.replace(tzinfo=timezone.utc)
+    return {"since": since, "price": None if row.virtual_entry_price is None else float(row.virtual_entry_price)}
 
 
 async def process(db, now: Optional[datetime] = None) -> dict:
@@ -143,16 +166,16 @@ async def process(db, now: Optional[datetime] = None) -> dict:
     for key, n in fresh.items():
         if key in held:
             continue
-        research_open = await _research_open(db, n["outcome_id"], n["side"])
+        held_before = await _held_before(db, n["outcome_id"], n["side"], n["noted_at"])
         row = RealTrackBuy(
             estimator=n["estimator"], city_id=n["city_id"], market_id=n["market_id"],
             outcome_id=n["outcome_id"], side=n["side"], event_date=n["event_date"],
             bought_at=n["noted_at"], local_hour=n["local_hour"], confidence=n["confidence"],
             bid=n["bid"], ask=n["ask"], price=n["price"], shares=SHARES,
-            research_open=research_open, alerted=False,
+            research_open=held_before is not None, alerted=False,
         )
         db.add(row)
-        new.append((row, n, research_open))
+        new.append((row, n, held_before))
     if not new:
         LAST_RUN.clear()
         LAST_RUN.update(stats)
@@ -170,8 +193,8 @@ async def process(db, now: Optional[datetime] = None) -> dict:
 
     if getattr(settings, "realtrack_alerts_enabled", True) and settings.telegram_bot_token:
         record = await track_record(db)
-        for row, n, research_open in new:
-            if await send_text(db, message(n, research_open, record)):
+        for row, n, held_before in new:
+            if await send_text(db, message(n, held_before, record)):
                 row.alerted = True
                 stats["alerted"] += 1
         await db.commit()

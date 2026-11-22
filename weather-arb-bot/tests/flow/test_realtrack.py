@@ -94,11 +94,13 @@ class TestTheRule:
         first = m.text.splitlines()[0]
         assert "REAL TRACK — BUY NO 93-94°F" in first and first.startswith("💰💰")
         assert "Austin · event today · 13:00 local" in m.text
-        assert "NO price <b>39.0¢</b>" in m.text and "YES bid 61.0¢ / ask 63.0¢" in m.text
+        # Book 0.61 / 0.63 for YES is 0.37 / 0.39 for NO: prices in the side bought.
+        assert "NO price <b>39.0¢</b> per share · NO bid 37.0¢ · spread 2.0¢" in m.text
+        assert "YES bid" not in m.text and "63.0¢" not in m.text
         assert "Bot confidence <b>83%</b> [α]" in m.text and "≥83%" in m.text
         assert f'<a href="{SLUG_LINK}">Open on Polymarket</a>' in m.text
         assert "Virtual buy of 5 shares" in m.text
-        assert "already open" not in m.text and "so far" not in m.text
+        assert "already holds" not in m.text and "so far" not in m.text
         # The research alert still goes out, unchanged, in its own dialect.
         (r,) = _research(pipeline)
         assert r.parse_mode == "Markdown" and "REAL TRACK" not in r.text
@@ -252,7 +254,40 @@ class TestAlongsideResearch:
         (b,) = await pipeline.rows(RealTrackBuy)
         assert b.outcome_id == 2 and b.research_open is True
         (m,) = _real(pipeline)
-        assert "research position on this bucket is already open" in m.text
+        assert "📌 The regular bot already holds NO on this bucket since" in m.text
+        assert "at 70.0¢ — it records nothing new today; this is today's entry." in m.text
+
+    @pytest.mark.asyncio
+    async def test_only_a_position_held_from_before_counts_as_already_held(self, pipeline, monkeypatch):
+        """At 91%+ the regular bot usually buys the same bucket in the same run
+        (its own gate is 90%), seconds AFTER the real track noted it. That is
+        not "already held" — only a position opened before the signal is."""
+        t = datetime(2026, 11, 21, 6, 0, tzinfo=timezone.utc)
+
+        def note(outcome_id):
+            return {"estimator": "alpha", "city_id": pipeline.city.id, "city": "Austin",
+                    "tz": pipeline.city.tz, "market_id": 1, "slug": "s", "event_date": pipeline.event_date,
+                    "lead": 0, "outcome_id": outcome_id, "bucket": "x", "side": "NO", "confidence": 93,
+                    "certainty": 0.93, "bid": 0.2, "ask": 0.22, "price": 0.8, "noted_at": t, "local_hour": 12.0}
+
+        def research(outcome_id, at, price):
+            return Opportunity(outcome_id=outcome_id, side="NO", detected_at=at, market_price=0.2,
+                               estimated_true_prob=0.07, edge=0.15, confidence_score=93, signals={},
+                               alert_sent=True, virtual_shares=5, virtual_entry_price=price,
+                               virtual_cost=5 * price, virtual_status="open")
+        async with pipeline.session() as db:
+            db.add(research(1, t + timedelta(seconds=3), 0.8))      # bought in this same run
+            db.add(research(2, t - timedelta(days=2), 0.71))         # bought two days earlier
+            await db.commit()
+        hook.PENDING.extend([note(1), note(2)])
+        async with pipeline.session() as db:
+            await track.process(db, now=t + timedelta(minutes=1))
+
+        held = {b.outcome_id: b.research_open for b in await pipeline.rows(RealTrackBuy)}
+        assert held == {1: False, 2: True}
+        texts = sorted(m.text for m in _real(pipeline))
+        assert sum("already holds" in x for x in texts) == 1
+        assert any("already holds NO on this bucket since 19.11 at 71.0¢" in x for x in texts)
 
     @pytest.mark.asyncio
     async def test_the_research_track_is_identical_with_the_real_track_on_or_off(self, pipeline, monkeypatch):
@@ -349,6 +384,9 @@ class TestReport:
         (r,) = rep["rows"]
         assert r["result"] == "open" and r["link"] == SLUG_LINK and r["local_time"] == "13:00"
         assert (r["side"], r["bucket"], r["model"], r["confidence"]) == ("NO", "93-94°F", "alpha", 83)
+        # Shown in the side bought: the YES book 0.61 / 0.63 is 0.37 / 0.39 for NO.
+        assert (r["price"], r["bid"], r["ask"]) == (pytest.approx(0.39), pytest.approx(0.37), pytest.approx(0.39))
+        assert r["spread"] == pytest.approx(0.02)
 
         # 95-96°F wins: the NO on 93-94°F pays 1.
         async with pipeline.session() as db:
@@ -381,9 +419,21 @@ class TestReport:
         text = track.message(
             {"side": "NO", "bucket": "15°C", "city": "Tokyo", "lead": 0, "local_hour": 9.5,
              "price": 0.8, "bid": 0.19, "ask": 0.21, "confidence": 93, "estimator": "beta",
-             "slug": None}, False, record)
+             "slug": None}, None, record)
         assert "Real track so far: 1/1 won · +61.0¢ per share" in text
         assert "09:30 local" in text and "[β]" in text and "Open on Polymarket" not in text
+        assert "NO price <b>80.0¢</b> per share · NO bid 79.0¢ · spread 2.0¢" in text
+        yes = track.message(
+            {"side": "YES", "bucket": "15°C", "city": "Tokyo", "lead": 0, "local_hour": 9.5,
+             "price": 0.74, "bid": 0.71, "ask": 0.74, "confidence": 92, "estimator": "alpha",
+             "slug": None}, None, {})
+        assert "YES price <b>74.0¢</b> per share · YES bid 71.0¢ · spread 3.0¢" in yes
+
+
+def test_the_book_of_the_side_bought():
+    assert track.side_book("YES", 0.61, 0.63) == (0.61, 0.63)
+    assert track.side_book("NO", 0.61, 0.63) == (pytest.approx(0.37), pytest.approx(0.39))
+    assert track.side_book("NO", 0.22, 0.24) == (pytest.approx(0.76), pytest.approx(0.78))   # Jeddah 35°C
 
 
 def test_result_of_each_side():
