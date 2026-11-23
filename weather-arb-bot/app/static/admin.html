@@ -397,7 +397,7 @@
     </section>
 
     <section id="tab-realtrack" class="hidden">
-      <p class="small">The bot's own signals that meet the rule which held up on May–November history: <strong>the event is today in the city's own calendar</strong> and the bot's <strong>confidence is at least 91%</strong>. Each is recorded once per bucket and side as a <strong>virtual buy of 5 shares at the live price</strong> (YES ask, or 1 − YES bid for NO) and sent on Telegram under its own 💰 REAL TRACK header. It runs next to the research positions and changes none of them; when a research position on the same bucket is already open, the same-day entry is still recorded here (column "Research open"). The bot's stated % runs high — on history, 91–95% won about 74–78%. Switches are on the Settings tab.</p>
+      <p class="small">The bot's own signals that meet the rule which held up on May–November history: <strong>the event is today in the city's own calendar</strong> and the bot's <strong>confidence is at least 91%</strong>. Each is recorded once per bucket and side as a <strong>virtual buy of 5 shares at the live price</strong> (the ask of the side bought — for NO that is 1 − the YES bid) and sent on Telegram under its own 💰 REAL TRACK header. Price, bid and spread are all in the side bought. It runs next to the regular bot's positions and changes none of them; when the regular bot already held the same bucket from before (usually bought a day or two earlier), it records nothing new that day, and this tab still records the same-day entry (column "Regular bot already held"). The bot's stated % runs high — on history, 91–95% won about 74–78%. Switches are on the Settings tab.</p>
       <div class="toolbar">
         <label class="row small">Event date from <input type="date" id="rtFrom" /></label>
         <label class="row small">To <input type="date" id="rtTo" /></label>
@@ -430,11 +430,10 @@
           <th data-sort-key="_bet" data-sort-type="str">Bet</th>
           <th data-sort-key="confidence" data-sort-type="num">Conf.</th>
           <th data-sort-key="model" data-sort-type="str">Model</th>
-          <th data-sort-key="price" data-sort-type="num">Price</th>
-          <th data-sort-key="bid" data-sort-type="num">YES bid</th>
-          <th data-sort-key="ask" data-sort-type="num">YES ask</th>
+          <th data-sort-key="price" data-sort-type="num" title="What one share of the side bought cost: its ask">Price</th>
+          <th data-sort-key="bid" data-sort-type="num" title="Bid of the side bought">Bid</th>
           <th data-sort-key="spread" data-sort-type="num">Spread</th>
-          <th data-sort-key="_research" data-sort-type="str">Research open</th>
+          <th data-sort-key="_research" data-sort-type="str" title="The regular bot already had an open position on this bucket and side from before this signal, so it recorded nothing new today; this row is today's entry">Regular bot already held</th>
           <th data-sort-key="result" data-sort-type="str">Result</th>
           <th data-sort-key="pnl_per_share" data-sort-type="num">P&amp;L / share</th>
           <th data-sort-key="pnl" data-sort-type="num">P&amp;L (5 sh.)</th>
@@ -2632,7 +2631,7 @@ async function loadRealTrack() {
     `<div class="card"><div class="label">Result / share</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
       + `<div class="small">${j.settled < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
     card('P&L (5 shares each)', usd(j.total_pnl)) +
-    card('Research position already open', j.research_open);
+    card('Regular bot already held', j.research_open);
   j.rows.forEach(x => { x._bet = `${x.side} ${x.bucket}`; x._research = x.research_open ? 'yes' : 'no'; });
   _registerTable('rtBody', j.rows, _renderRealTrack, { key: 'at', dir: 'desc', type: 'date' });
   _renderRtByCity(j.by_city || []);
@@ -2689,7 +2688,6 @@ function _renderRealTrack(rows) {
       <td>${x.model === 'beta' ? 'β' : 'α'}</td>
       <td>${cent(x.price)}</td>
       <td>${cent(x.bid)}</td>
-      <td>${cent(x.ask)}</td>
       <td>${cent(x.spread)}</td>
       <td>${x.research_open ? '📌 yes' : '—'}</td>
       <td>${result}</td>
@@ -2697,7 +2695,7 @@ function _renderRealTrack(rows) {
       <td>${usd(x.pnl)}</td>
       <td>${x.link ? `<a href="${escapeHtml(x.link)}" target="_blank" rel="noopener">Polymarket ↗</a>` : '—'}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="16" class="small">No buy in this range yet. The analyzer checks every few minutes; a buy appears when a signal for a market that settles today (city time) reaches the confidence floor.</td></tr>';
+  }).join('') || '<tr><td colspan="15" class="small">No buy in this range yet. The analyzer checks every few minutes; a buy appears when a signal for a market that settles today (city time) reaches the confidence floor.</td></tr>';
 }
 
 async function showShadowStatus(btn) {

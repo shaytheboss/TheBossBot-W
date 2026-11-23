@@ -124,6 +124,7 @@ def reset_module_caches():
     import app.shadow.v2 as shadow_v2
     import app.realtrack.hook as realtrack_hook
     import app.realtrack.track as realtrack_track
+    import app.workers.jobs as jobs
     from app.utils import jobstats
 
     def _clear():
@@ -149,6 +150,7 @@ def reset_module_caches():
         shadow_v2.reset_cache()
         realtrack_hook.reset()
         realtrack_track.LAST_RUN.clear()
+        jobs._last_skill_refresh = None
 
     _clear()
     yield

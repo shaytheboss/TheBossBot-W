@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     polymarket_fetch_interval: int = 300  # 5 min
     wunderground_fetch_interval: int = 1800
     analyzer_run_interval: int = 300      # 5 min
+    # Settlement check (job_check_resolutions): a market is checked once its
+    # day has ended in its city; hourly means a result shows up within about an
+    # hour of Polymarket settling it. Was 24 h.
+    resolution_check_interval: int = 3600
     external_forecast_fetch_interval: int = 14400  # 4h — rate-limited external APIs
     # Tomorrow.io budget-aware job (free tier: 25 req/h, 500/day).
     # 20 req/run x hourly = 480/day, inside both caps.

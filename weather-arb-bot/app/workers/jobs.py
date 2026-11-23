@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import httpx
@@ -1434,29 +1435,90 @@ async def _send_intraday_resolution_alert(
             logger.error(f"Failed to send intraday resolution alert to {user.chat_id}: {e}")
 
 
-async def job_check_resolutions():
-    today = date.today()
+#: The model-skill refresh that follows a settlement reads 90 days of forecasts
+#: for every city — the heaviest query in this job. Settlement runs hourly, so
+#: the refresh is held to about once a day, which is how often it ran when
+#: settlement itself was daily.
+SKILL_REFRESH_EVERY = timedelta(hours=20)
+_last_skill_refresh: Optional[datetime] = None
+#: Polymarket settles a market within about a day of its end. One still open
+#: after this many days is a straggler (e.g. a slug Gamma no longer finds) and
+#: is retried once a day — on the run in the 00 UTC hour — not every hour, so
+#: a pile of them cannot multiply the job's requests by 24.
+STRAGGLER_DAYS = 3
+
+
+def _local_day_over(event_date: date, tz_name: Optional[str], now: datetime) -> bool:
+    """Has the market's day ended in the city's own calendar? Polymarket cannot
+    settle before then, so earlier checks are wasted requests."""
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else timezone.utc
+    except Exception:
+        tz = timezone.utc
+    return event_date < now.astimezone(tz).date()
+
+
+async def job_check_resolutions(now: Optional[datetime] = None, include_stragglers: bool = False):
+    """Settle every market whose day has ended in its city and that Polymarket
+    has settled. Runs hourly (settings.resolution_check_interval), so a result
+    appears within about an hour of Polymarket's — previously a market waited
+    for UTC midnight and then for the next daily run. Markets older than
+    STRAGGLER_DAYS are checked once a day, or on demand (include_stragglers)."""
+    global _last_skill_refresh
+    # `run_at`, not `now`: the settlement loop below sets its own `now`.
+    run_at = now or datetime.now(timezone.utc)
     async with AsyncSessionLocal() as db:
+        # A city's day can end before UTC midnight (Asia, Europe), so markets
+        # dated today in UTC are candidates too; _local_day_over decides.
         result = await db.execute(
             select(Market)
-            .where(Market.resolved == False, Market.event_date < today)
+            .where(Market.resolved == False, Market.event_date <= run_at.date())
             .order_by(Market.event_date)
         )
         markets = result.scalars().all()
         if not markets:
             return
+        cities = {c.id: c for c in (await db.execute(
+            select(City).where(City.id.in_({m.city_id for m in markets}))
+        )).scalars().all()}
+        stragglers_due = include_stragglers or run_at.hour == 0
+        markets = [m for m in markets if m.city_id in cities
+                   and _local_day_over(m.event_date, cities[m.city_id].timezone, run_at)
+                   and (stragglers_due or (run_at.date() - m.event_date).days <= STRAGGLER_DAYS)]
+        if not markets:
+            return
         logger.info(f"job_check_resolutions: checking {len(markets)} unresolved past markets")
         any_resolved = False   # האם נסגר משהו בריצה הזו → עדכון מאגר הכישרון
         for market in markets:
-            city_result = await db.execute(select(City).where(City.id == market.city_id))
-            city = city_result.scalar_one_or_none()
-            if not city:
+            city = cities[market.city_id]
+
+            outcomes_result = await db.execute(
+                select(MarketOutcome).where(MarketOutcome.market_id == market.id)
+            )
+            outcomes = outcomes_result.scalars().all()
+
+            # --- Resolution source: Polymarket ONLY ---
+            # WIN/LOSS must reflect how Polymarket actually settled the market.
+            # METAR (or any temperature computation) can disagree with
+            # Polymarket's official result — different station, rounding, or
+            # observation window — so it must NEVER decide WIN/LOSS. If
+            # Polymarket hasn't settled yet we leave the market unresolved and
+            # retry on the next run.
+            poly_winning, poly_resolved, poly_note = (
+                await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
+            )
+
+            if not poly_resolved:
+                logger.info(
+                    f"job_check_resolutions: {market.external_id} not yet settled on "
+                    f"Polymarket — leaving unresolved (METAR not used for resolution)"
+                )
                 continue
 
-            # Always try to fetch METAR high (needed for alert display even when
-            # resolution source is Polymarket). The day window is the CITY'S
-            # LOCAL day — a UTC window includes the previous local evening and
-            # can show a contaminated "high" in the alert.
+            # The METAR high is a reference figure for the resolution alert only;
+            # read it once the market has settled, not on every hourly retry. The
+            # day window is the CITY'S LOCAL day — a UTC window includes the
+            # previous local evening and can show a contaminated "high".
             import pytz as _pytz
             try:
                 _tz = _pytz.timezone(city.timezone) if city.timezone else _pytz.utc
@@ -1477,30 +1539,6 @@ async def job_check_resolutions():
             # METAR high is kept only as a reference figure for the alert; it is
             # NOT used to decide WIN/LOSS (Polymarket is authoritative).
             actual_high_f: Optional[float] = float(actual_high_raw) if actual_high_raw is not None else None
-
-            outcomes_result = await db.execute(
-                select(MarketOutcome).where(MarketOutcome.market_id == market.id)
-            )
-            outcomes = outcomes_result.scalars().all()
-
-            # --- Resolution source: Polymarket ONLY ---
-            # WIN/LOSS must reflect how Polymarket actually settled the market.
-            # METAR (or any temperature computation) can disagree with
-            # Polymarket's official result — different station, rounding, or
-            # observation window — so it must NEVER decide WIN/LOSS. If
-            # Polymarket hasn't settled yet we leave the market unresolved and
-            # retry on the next run. The METAR high is still fetched above, but
-            # only for display as a reference figure in the alert.
-            poly_winning, poly_resolved, poly_note = (
-                await _fetch_polymarket_winning_outcomes(market.external_id, outcomes)
-            )
-
-            if not poly_resolved:
-                logger.info(
-                    f"job_check_resolutions: {market.external_id} not yet settled on "
-                    f"Polymarket — leaving unresolved (METAR not used for resolution)"
-                )
-                continue
 
             winning_outcome_ids: set[int] = set(poly_winning)
             resolution_source = "Polymarket"
@@ -1585,10 +1623,13 @@ async def job_check_resolutions():
         # נסגרו שווקים בריצה הזו → מעדכנים מיד את מאגר דיוק-המודלים, כדי
         # שהמשקולות יראו את התוצאה הטרייה כבר בסריקת החיזוי הבאה.
         # try/except נפרד: כשל בעדכון הכישרון לעולם לא מפיל settlement.
-        if any_resolved:
+        # (Held to about once a day — see SKILL_REFRESH_EVERY.)
+        if any_resolved and (_last_skill_refresh is None
+                             or run_at - _last_skill_refresh >= SKILL_REFRESH_EVERY):
             try:
                 from app.analyzers.model_skill import update_model_skill
                 await update_model_skill(db)
+                _last_skill_refresh = run_at
             except Exception as e:
                 logger.error(f"model_skill update after resolutions failed: {e}", exc_info=True)
 

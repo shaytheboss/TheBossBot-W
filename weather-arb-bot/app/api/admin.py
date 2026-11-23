@@ -293,9 +293,9 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
     today = date_cls.today()
     now = datetime.now(timezone.utc)
 
-    # Phase 1: normal resolution job
+    # Phase 1: normal resolution job — every unsettled market, old ones included
     try:
-        await job_check_resolutions()
+        await job_check_resolutions(include_stragglers=True)
     except Exception as e:
         logger.error(f"Admin resolve-pending (job phase) failed: {e}", exc_info=True)
         raise HTTPException(500, f"Resolve failed: {e}")
@@ -2432,11 +2432,13 @@ async def admin_realtrack_report(
         at = b.bought_at if b.bought_at.tzinfo else b.bought_at.replace(tzinfo=timezone.utc)
         won = realtrack.result_of(b.side, outcome_won)
         pnl = None if won is None else round(int(won) - b.price, 4)
+        # Stored as the YES book; shown in the side that was bought.
+        bid, ask = realtrack.side_book(b.side, b.bid, b.ask)
         out.append({
             "at": at.isoformat(), "local_time": at.astimezone(ZoneInfo(tz or "UTC")).strftime("%H:%M"),
             "city": city, "city_id": b.city_id, "date": b.event_date.isoformat(),
             "bucket": bucket, "side": b.side, "model": b.estimator, "confidence": b.confidence,
-            "price": b.price, "bid": b.bid, "ask": b.ask, "spread": round(b.ask - b.bid, 4),
+            "price": b.price, "bid": bid, "ask": ask, "spread": round(ask - bid, 4),
             "shares": b.shares, "research_open": bool(b.research_open), "alerted": bool(b.alerted),
             "link": realtrack.event_url(slug),
             "result": "open" if won is None else ("won" if won else "lost"),
