@@ -293,9 +293,9 @@ async def admin_resolve_pending(_: str = Depends(require_admin)):
     today = date_cls.today()
     now = datetime.now(timezone.utc)
 
-    # Phase 1: normal resolution job
+    # Phase 1: normal resolution job — every unsettled market, old ones included
     try:
-        await job_check_resolutions()
+        await job_check_resolutions(include_stragglers=True)
     except Exception as e:
         logger.error(f"Admin resolve-pending (job phase) failed: {e}", exc_info=True)
         raise HTTPException(500, f"Resolve failed: {e}")

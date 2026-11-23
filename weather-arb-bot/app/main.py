@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
                            id="polymarket", next_run_time=now, max_instances=1, misfire_grace_time=60)
         _add_tracked_job(job_run_analyzer, IntervalTrigger(seconds=settings.analyzer_run_interval),
                            id="analyzer", next_run_time=now, max_instances=1, misfire_grace_time=60)
-        _add_tracked_job(job_check_resolutions, IntervalTrigger(seconds=86400),
+        _add_tracked_job(job_check_resolutions, IntervalTrigger(seconds=settings.resolution_check_interval),
                            id="resolutions", next_run_time=now, max_instances=1, misfire_grace_time=3600)
         # Data retention / de-dup — the RAM-cost control job. First run cleans the
         # accumulated backlog; delay it 10 min so it doesn't fight startup.
