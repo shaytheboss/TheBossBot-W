@@ -402,6 +402,19 @@ class TestTodayStatus:
         (r,) = paper.today_summary(T + timedelta(days=1))["rows"]
         assert (r["day"], r["checks"], r["fired"]) == ((DAY + timedelta(days=1)).isoformat(), 1, 0)
 
+    def test_the_tab_filters_and_its_cards_follow_them(self):
+        from pathlib import Path
+        html = (Path(__file__).resolve().parents[2] / "app" / "static" / "admin.html").read_text(encoding="utf-8")
+        ids = ("nbMaxAsk", "nbMaxSpread", "nbMinShare", "nbHourFrom", "nbHourTo")
+        apply_fn = html[html.index("function applyNbClientFilter()"):]
+        apply_fn = apply_fn[:apply_fn.index("\n}\n")]
+        reset_fn = html[html.index("function resetNbFilter()"):]
+        reset_fn = reset_fn[:reset_fn.index("\n}\n")]
+        for i in ids:
+            assert f'id="{i}"' in html and f"'{i}'" in apply_fn and f"'{i}'" in reset_fn, i
+        assert "_renderNbCards(rows, all.length)" in apply_fn and "_renderNearbyByCity(_nbByCity(rows))" in apply_fn
+        assert "📋 Today by city — tap to open" in html
+
     def test_the_tab_shows_it(self):
         from pathlib import Path
         html = (Path(__file__).resolve().parents[2] / "app" / "static" / "admin.html").read_text(encoding="utf-8")
