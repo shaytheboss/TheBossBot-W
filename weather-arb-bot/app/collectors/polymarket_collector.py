@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
@@ -14,8 +15,19 @@ CLOB_API_BASE = "https://clob.polymarket.com"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
 
+class NoOrderbook(Exception):
+    """CLOB answered 404 ("No orderbook exists for the requested token id"):
+    the token has no book — a closed or removed market. Expected, not an
+    error; the price job reports these itself, by city, date and bucket."""
+
+
 class PolymarketCollector(BaseCollector):
     name = "polymarket"
+
+    def __init__(self):
+        super().__init__()
+        #: Tokens whose last /midpoint answer was "no order book".
+        self._no_book: set[str] = set()
 
     async def collect(self, token_id: str, *args, **kwargs) -> Optional[dict]:
         return await self.get_midpoint(token_id)
@@ -34,18 +46,33 @@ class PolymarketCollector(BaseCollector):
         Correct Polymarket CLOB API: GET /midpoint?token_id=X returns {"mid": "0.42"}.
         The /prices endpoint does NOT exist on CLOB — it always returns 400.
         """
+        self._no_book.discard(token_id)          # reflects this answer only
         try:
-            resp = await self._get(
-                f"{CLOB_API_BASE}/midpoint",
-                params={"token_id": token_id},
-            )
-            data = resp.json()
-            if isinstance(data, dict) and "mid" in data:
-                return float(data["mid"])
+            return await self._midpoint(token_id)
+        except NoOrderbook:
+            self._no_book.add(token_id)
+            logger.debug(f"No order book for {token_id}")
             return None
         except Exception as e:
             logger.error(f"Failed to fetch /midpoint for {token_id}: {e}")
             return None
+
+    async def _midpoint(self, token_id: str) -> Optional[float]:
+        """The midpoint, raising NoOrderbook for a token without a book."""
+        try:
+            resp = await self._get(
+                f"{CLOB_API_BASE}/midpoint",
+                params={"token_id": token_id},
+                quiet_statuses=(404,),
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise NoOrderbook(token_id) from e
+            raise
+        data = resp.json()
+        if isinstance(data, dict) and "mid" in data:
+            return float(data["mid"])
+        return None
 
     async def get_price(self, token_id: str, side: str = "buy") -> Optional[float]:
         """Get best bid (side=buy) or best ask (side=sell) for a token."""
@@ -130,10 +157,13 @@ class PolymarketCollector(BaseCollector):
 
         `commit=False` lets the caller batch many outcomes into one commit
         instead of one transaction per outcome.
+
+        Returns {"no_book": True} when the token has no CLOB order book, so the
+        caller can stop asking for a while; None on any other failure.
         """
         yes_price = await self.get_midpoint(token_id)
         if yes_price is None:
-            return None
+            return {"no_book": True} if token_id in self._no_book else None
 
         now = datetime.now(timezone.utc)
 

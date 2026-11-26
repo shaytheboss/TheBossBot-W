@@ -36,6 +36,61 @@ logger = logging.getLogger(__name__)
 FOLLOW_UPS = (("mid_10", 10), ("mid_30", 30))
 FOLLOW_UP_WINDOW = timedelta(hours=3)
 
+#: What the paper test saw for each city, for the Nearby tab's status line — so
+#: a day without rows can be told apart from a stuck job. One entry per city,
+#: replaced when the city's local day changes. In memory only: no table, no
+#: cost; a restart starts it again (STARTED says when).
+TODAY: dict[str, dict] = {}
+STARTED = datetime.now(timezone.utc)
+TODAY_WINDOW = timedelta(hours=24)
+_COUNTED = ("fired", "before_peak", "above_band", "below_band")
+
+
+def _tally(city: City, day, now: datetime, stage: str, mid: Optional[float] = None) -> None:
+    """Record one step of one check. `checked` counts the check; the counted
+    stages add one each; any other stage is just the latest result."""
+    rec = TODAY.get(city.name)
+    if rec is None or rec["day"] != day:
+        rec = TODAY[city.name] = {"day": day, "tz": city.timezone or "UTC", "checks": 0,
+                                  **{k: 0 for k in _COUNTED}, "recorded": False, "bought": False,
+                                  "last": None, "last_at": now, "last_mid": None}
+    rec["last_at"] = now
+    if stage == "checked":
+        rec["checks"] += 1
+        return
+    if stage in _COUNTED:
+        rec[stage] += 1
+    if stage in ("recorded", "bought"):
+        rec[stage] = True
+    if stage != "fired":
+        rec["last"] = stage
+    if mid is not None:
+        rec["last_mid"] = round(mid, 4)
+
+
+def today_summary(now: Optional[datetime] = None) -> dict:
+    """The last 24 hours, per city and in total, for the Nearby tab."""
+    now = now or datetime.now(timezone.utc)
+    rows = []
+    for name, r in sorted(TODAY.items()):
+        if now - r["last_at"] > TODAY_WINDOW:
+            continue
+        rows.append({"city": name, "day": r["day"].isoformat(), "checks": r["checks"],
+                     **{k: r[k] for k in _COUNTED}, "recorded": r["recorded"], "bought": r["bought"],
+                     "last": r["last"], "last_mid": r["last_mid"],
+                     "last_local": r["last_at"].astimezone(ZoneInfo(r["tz"])).strftime("%H:%M")})
+    return {
+        "since": STARTED.isoformat(timespec="minutes"),
+        "cities_checked": len(rows),
+        "cities_fired": sum(1 for r in rows if r["fired"]),
+        "cities_before_peak": sum(1 for r in rows if r["before_peak"]),
+        "cities_above_band": sum(1 for r in rows if r["above_band"]),
+        "cities_below_band": sum(1 for r in rows if r["below_band"]),
+        "cities_recorded": sum(1 for r in rows if r["recorded"]),
+        "cities_bought": sum(1 for r in rows if r["bought"]),
+        "rows": rows,
+    }
+
 
 def book_summary(book: Optional[dict]) -> Optional[dict]:
     """Best bid, best ask and the size offered at the ask. None unless two-sided."""
@@ -181,35 +236,48 @@ async def run_paper(db, now: Optional[datetime] = None,
             existing = (await db.execute(
                 select(NearbySignal).where(NearbySignal.market_id == market.id))).scalars().first()
             if existing is not None and existing.tradable:
+                _tally(city, day, now, "done")
                 continue                                    # one tradable signal per market
             # A signal met at an untradable book does NOT close the market: it is
             # re-checked every run until the book allows a buy (live since #136,
             # the first wide book had silenced the market for the whole day).
             stats["checked"] += 1
+            _tally(city, day, now, "checked")
             midnight = datetime.combine(day, time(0), tzinfo=ZoneInfo(city.timezone or "UTC")).astimezone(timezone.utc)
             target_icao = city.primary_icao.upper()
             reads = await _readings(db, [target_icao] + [s for s, _, _ in nb], midnight, now)
             v = sig.evaluate(sig.station_state(target_icao, reads[target_icao], now),
                              [sig.station_state(s, reads.get(s, []), now) for s, _, _ in nb])
             if v is None or not v.fires:
+                _tally(city, day, now, "no_reading" if v is None else "not_falling")
                 continue
             local = now.astimezone(ZoneInfo(city.timezone or "UTC"))
             share = await _peak_share(db, city.id, local)
             if not sig.past_peak(share):
                 stats["before_peak"] = stats.get("before_peak", 0) + 1
+                _tally(city, day, now, "before_peak")
                 continue                                    # the station may still be climbing
             stats["fired"] += 1
+            _tally(city, day, now, "fired")
             outcomes = (await db.execute(select(MarketOutcome).where(MarketOutcome.market_id == market.id))).scalars().all()
             hold = next((o for o in outcomes if o.token_id and sig.holds(
                 o.bucket_min, o.bucket_max, resolve_bucket_unit(o), v.target.high_f)), None)
             if hold is None:
+                _tally(city, day, now, "no_bucket")
                 continue
             book = book_summary(await collector.get_orderbook(hold.token_id))
             if book is None or not sig.mid_in_band(book["mid"]):
-                continue                                    # not recorded: may still fire later in band
+                # Not recorded: may still fire later in band. Above the band the
+                # market already knew; that is counted, so a quiet day reads as one.
+                stage = "no_book" if book is None else ("above_band" if book["mid"] > sig.MID_HI else "below_band")
+                if stage != "no_book":
+                    stats[stage] = stats.get(stage, 0) + 1
+                _tally(city, day, now, stage, None if book is None else book["mid"])
+                continue
             km = {s: d for s, d, _ in nb}
             tradable = sig.tradable(book["bid"], book["ask"])
             if existing is not None and not tradable:
+                _tally(city, day, now, "waiting_buyable", book["mid"])
                 continue                                    # keep the first sighting; try again next run
             fields = dict(
                 outcome_id=hold.id, signaled_at=now, local_hour=round(local.hour + local.minute / 60, 2),
@@ -228,6 +296,9 @@ async def run_paper(db, now: Optional[datetime] = None,
                     setattr(row, k, val)
             await db.commit()
             stats["recorded"] += 1
+            _tally(city, day, now, "bought" if row.tradable else "recorded", book["mid"])
+            if row.tradable:
+                TODAY[city.name]["recorded"] = True
             if not row.tradable:
                 stats["not_tradable"] = stats.get("not_tradable", 0) + 1
                 continue                                    # recorded for the report, never announced

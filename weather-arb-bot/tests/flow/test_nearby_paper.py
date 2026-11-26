@@ -329,6 +329,86 @@ class TestSettings:
             await engine.dispose()
 
 
+class TestTodayStatus:
+    """The tab's status line: a quiet day must read as one, not as a stuck job.
+    On 26.11 the signal fired in Tokyo, Seoul, Singapore and Kuala Lumpur, but
+    each bucket was already at 95-99.9c, so nothing was recorded and the tab
+    showed nothing at all."""
+
+    @pytest.mark.asyncio
+    async def test_a_signal_the_market_already_priced_is_counted_not_recorded(self, http, world, monkeypatch):
+        from app.api.admin import admin_nearby_report
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.97, ask=0.99))
+        stats = await _run(world, http)
+        assert (stats["fired"], stats["recorded"], stats["above_band"]) == (1, 0, 1)
+        assert await _signals(world) == [], "still not recorded: nothing to buy at 98c"
+
+        t = paper.today_summary(T)
+        assert (t["cities_checked"], t["cities_fired"], t["cities_above_band"], t["cities_recorded"]) == (1, 1, 1, 0)
+        (r,) = t["rows"]
+        assert (r["city"], r["checks"], r["fired"], r["above_band"]) == ("Austin", 1, 1, 1)
+        assert (r["last"], r["last_mid"], r["last_local"], r["day"]) == ("above_band", 0.98, "14:00", DAY.isoformat())
+
+        monkeypatch.setattr(paper, "TODAY_WINDOW", timedelta(days=36500))   # the report reads the real clock
+        async with world() as db:
+            rep = await admin_nearby_report("t", db, days=30, from_date=None, to_date=None, city_id=None)
+        assert rep["signals"] == 0 and rep["today"]["cities_above_band"] == 1
+
+    @pytest.mark.asyncio
+    async def test_below_the_band_is_counted_too(self, http, world):
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.10, ask=0.14))
+        stats = await _run(world, http)
+        assert stats["below_band"] == 1
+        assert paper.today_summary(T)["rows"][0]["last"] == "below_band"
+
+    @pytest.mark.asyncio
+    async def test_neighbours_not_falling(self, http, monkeypatch):
+        engine, maker = await _world(monkeypatch, falling=2)
+        try:
+            await _run(maker, http)
+            (r,) = paper.today_summary(T)["rows"]
+            assert (r["checks"], r["fired"], r["last"]) == (1, 0, "not_falling")
+        finally:
+            await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_before_the_usual_peak(self, http, monkeypatch):
+        engine, maker = await _world(monkeypatch, peak_hour=18.0)      # 14:00 is before 18:00
+        try:
+            await _run(maker, http)
+            t = paper.today_summary(T)
+            assert (t["cities_before_peak"], t["cities_fired"]) == (1, 0)
+            assert t["rows"][0]["last"] == "before_peak"
+        finally:
+            await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_a_paper_buy_and_the_runs_after_it(self, http, world, fake_telegram):
+        http.add(pm.CLOB_BOOK, json=pm.book(bid=0.70, ask=0.74))
+        await _run(world, http)
+        await _run(world, http, T + timedelta(minutes=5))
+        t = paper.today_summary(T + timedelta(minutes=5))
+        assert (t["cities_recorded"], t["cities_bought"]) == (1, 1)
+        (r,) = t["rows"]
+        assert (r["checks"], r["last"]) == (1, "done"), "after the buy the market is not checked again"
+
+    def test_older_than_a_day_drops_out_and_a_new_local_day_starts_fresh(self):
+        class City:
+            name, timezone = "Austin", AUSTIN.tz
+        paper._tally(City, DAY, T, "checked")
+        paper._tally(City, DAY, T, "fired")
+        assert paper.today_summary(T + timedelta(hours=25))["rows"] == []
+        paper._tally(City, DAY + timedelta(days=1), T + timedelta(days=1), "checked")
+        (r,) = paper.today_summary(T + timedelta(days=1))["rows"]
+        assert (r["day"], r["checks"], r["fired"]) == ((DAY + timedelta(days=1)).isoformat(), 1, 0)
+
+    def test_the_tab_shows_it(self):
+        from pathlib import Path
+        html = (Path(__file__).resolve().parents[2] / "app" / "static" / "admin.html").read_text(encoding="utf-8")
+        assert 'id="nearbyStatus"' in html and "_renderNearbyStatus(j.last_run || {}, j.today)" in html
+        assert "price above 85¢ — the market already knew" in html
+
+
 class TestBoundary:
     def test_trading_code_does_not_depend_on_it(self):
         """The nearby test trades on paper. Only the scheduler and the admin

@@ -2255,6 +2255,7 @@ async def admin_nearby_report(
     result. Small table; one query. Summary figures follow the filters."""
     from zoneinfo import ZoneInfo
     from app.nearby import job as nearby_job
+    from app.nearby import paper as nearby_paper
     from app.nearby.models import NearbySignal
 
     q = (select(NearbySignal, City.name, City.timezone, MarketOutcome.bucket_label, MarketOutcome.won,
@@ -2316,6 +2317,7 @@ async def admin_nearby_report(
         "avg_move_10": mean([r["move_10"] for r in buyable]),
         "avg_move_30": mean([r["move_30"] for r in buyable]),
         "last_run": dict(nearby_job.LAST_RUN),
+        "today": nearby_paper.today_summary(),
         "by_city": _nearby_by_city(out),
         "rows": out,
     }

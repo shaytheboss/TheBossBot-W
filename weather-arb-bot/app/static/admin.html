@@ -363,6 +363,7 @@
         <button class="btn" onclick="resetNbFilter()">Reset</button>
         <button class="btn" onclick="exportCsv('nearbyBody', 'nearby-paper')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
       </div>
+      <div id="nearbyStatus" class="small" style="margin:8px 0 12px;line-height:1.6"></div>
       <div class="cards" id="nearbyCards"></div>
       <div style="overflow-x:auto">
       <table id="nearbyTable">
@@ -2515,12 +2516,49 @@ async function loadNearby() {
     `<div class="card"><div class="label">Result / share at ask</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
       + `<div class="small">${j.settled < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
     card('Market after 10 / 30 min', `${sc(j.avg_move_10)} / ${sc(j.avg_move_30)}`);
+  _renderNearbyStatus(j.last_run || {}, j.today);
   j.rows.forEach(x => { x._buyable = x.tradable ? 'yes' : 'no'; });
   _registerTable('nearbyBody', j.rows, _renderNearby, { key: 'at', dir: 'desc', type: 'date' });
   _renderNearbyByCity(j.by_city || []);
   const sp = new URLSearchParams(); if (c) sp.set('city_id', c);
   const rs = await api('/nearby/stations?' + sp);
   if (rs.ok) _renderNearbyStations((await rs.json()).rows || []);
+}
+
+// What the job is doing right now and what it saw over the last 24 hours, so a
+// day with no rows can be told apart from a stuck job.
+const NB_STAGE = {
+  not_falling: 'nearby stations still near their highs', no_reading: 'no fresh reading at the settlement station',
+  before_peak: 'before the city\'s usual peak hour', no_bucket: 'no bucket holds the high so far',
+  no_book: 'no order book for the bucket', above_band: 'price above 85¢ — the market already knew',
+  below_band: 'price below 30¢', waiting_buyable: 'recorded; waiting for a buyable price',
+  recorded: 'recorded, not buyable', bought: 'bought on paper', done: 'already bought on paper today',
+};
+function _renderNearbyStatus(run, today) {
+  const el = document.getElementById('nearbyStatus');
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  let h = run.at
+    ? `<b>Collector:</b> last run ${escapeHtml(String(run.at).slice(11, 16))} UTC · ${run.cities} cities inside their 10:00–20:00 window`
+      + (run.error ? ` · <span style="color:var(--loss)">error: ${escapeHtml(run.error)}</span>` : ' · no errors')
+    : '<b>Collector:</b> no run since the last restart yet (it runs every 5 minutes)';
+  if (today) {
+    h += `<br><b>Last 24 h:</b> checked ${today.cities_checked} cities · condition met in ${today.cities_fired}`
+      + ` · of those, ${today.cities_above_band} already above 85¢ (the market knew first) and ${today.cities_below_band} below 30¢`
+      + ` · ${today.cities_before_peak} fired before their usual peak (not counted)`
+      + ` · ${today.cities_recorded} recorded · ${today.cities_bought} bought on paper`
+      + ` <span style="opacity:.7">(since ${escapeHtml(String(today.since).slice(5, 16).replace('T', ' '))} UTC)</span>`;
+    if ((today.rows || []).length) {
+      h += '<details style="margin-top:6px"><summary>By city, last 24 h</summary><div style="overflow-x:auto">'
+        + '<table class="small" id="nearbyTodayTable"><thead><tr><th>City</th><th>Day</th><th>Checks</th><th>Condition met</th>'
+        + '<th>Before peak</th><th>Above 85¢</th><th>Below 30¢</th><th>Latest</th><th>Price</th><th>At (local)</th></tr></thead><tbody>'
+        + today.rows.map(r => `<tr><td>${escapeHtml(r.city)}</td><td>${escapeHtml(r.day)}</td><td>${r.checks}</td>`
+          + `<td>${r.fired}</td><td>${r.before_peak}</td><td>${r.above_band}</td><td>${r.below_band}</td>`
+          + `<td>${escapeHtml(NB_STAGE[r.last] || r.last || '—')}</td><td>${cent(r.last_mid)}</td><td>${escapeHtml(r.last_local)}</td></tr>`).join('')
+        + '</tbody></table></div></details>';
+    }
+  }
+  el.innerHTML = h;
+  if (document.getElementById('nearbyTodayTable')) makeTablesSortable('nearbyStatus');
 }
 
 function _renderNearbyByCity(rows) {

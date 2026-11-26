@@ -180,7 +180,7 @@ class Pipeline:
                     )
                 except Exception:
                     got = None
-                if got is None:
+                if got is None or got.get("no_book"):
                     continue
                 if got.get("skipped"):
                     skipped += 1
