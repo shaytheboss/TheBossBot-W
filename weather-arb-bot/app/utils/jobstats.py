@@ -87,6 +87,9 @@ def track(name: str, fn: Callable) -> Callable:
             record(name, time.monotonic() - t0, _cpu_seconds() - c0, failed)
 
     wrapped.__name__ = getattr(fn, "__name__", name)
+    # APScheduler names a job by __qualname__; without this every skipped-run
+    # warning read "track.<locals>.wrapped" and never said which job it was.
+    wrapped.__qualname__ = getattr(fn, "__qualname__", wrapped.__name__)
     wrapped.__doc__ = getattr(fn, "__doc__", None)
     return wrapped
 

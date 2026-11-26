@@ -43,7 +43,7 @@ class BaseCollector(ABC):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    async def _get(self, url: str, **kwargs) -> httpx.Response:
+    async def _get(self, url: str, quiet_statuses: tuple = (), **kwargs) -> httpx.Response:
         """GET with exponential-backoff retry on transient failures.
 
         Retries up to _MAX_RETRIES times on:
@@ -51,6 +51,8 @@ class BaseCollector(ABC):
           - HTTP 429, 5xx       (rate-limit or server overload)
 
         Deterministic errors (401, 403, 404, other 4xx) raise immediately.
+        `quiet_statuses` are still raised, but logged at DEBUG: for a caller
+        that expects them and reports them itself.
         """
         client = await self._get_client()
         for attempt in range(_MAX_RETRIES + 1):
@@ -82,9 +84,8 @@ class BaseCollector(ABC):
                 response.raise_for_status()
             except httpx.HTTPStatusError as e:
                 body_hint = e.response.text[:200].replace("\n", " ")
-                logger.error(
-                    f"[{self.name}] HTTP {e.response.status_code} for {url} — {body_hint}"
-                )
+                log = logger.debug if e.response.status_code in quiet_statuses else logger.error
+                log(f"[{self.name}] HTTP {e.response.status_code} for {url} — {body_hint}")
                 raise
             return response
 

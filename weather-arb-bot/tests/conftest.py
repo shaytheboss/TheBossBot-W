@@ -120,6 +120,7 @@ def reset_module_caches():
     import app.peaks.job as peaks_job
     import app.nwsobs.job as nwsobs_job
     import app.nearby.job as nearby_job
+    import app.nearby.paper as nearby_paper
     import app.peaks.guard as peaks_guard
     import app.shadow.v2 as shadow_v2
     import app.realtrack.hook as realtrack_hook
@@ -146,11 +147,13 @@ def reset_module_caches():
         peaks_job.LAST_RUN.clear()
         nwsobs_job.LAST_RUN.clear()
         nearby_job.LAST_RUN.clear()
+        nearby_paper.TODAY.clear()
         peaks_guard.reset_cache()
         shadow_v2.reset_cache()
         realtrack_hook.reset()
         realtrack_track.LAST_RUN.clear()
         jobs._last_skill_refresh = None
+        jobs._no_book_until.clear()
 
     _clear()
     yield

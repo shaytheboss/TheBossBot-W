@@ -742,16 +742,25 @@ def should_poll_now(
     return (now - last_ts).total_seconds() >= far_interval_seconds
 
 
-async def job_fetch_polymarket():
+#: A bucket whose token has no CLOB order book (404) — a closed or removed
+#: market — is asked again only after this, not every 5 minutes. Each one used
+#: to cost a request and two ERROR log lines per run.
+NO_BOOK_RETRY = timedelta(hours=1)
+_no_book_until: dict[int, datetime] = {}
+
+
+async def job_fetch_polymarket(now: Optional[datetime] = None):
+    now = now or datetime.now(timezone.utc)
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(MarketOutcome, Market.event_date)
+            select(MarketOutcome, Market.event_date, Market.city_id)
             .join(Market, Market.id == MarketOutcome.market_id)
             .where(Market.resolved == False, MarketOutcome.token_id != None)
         )
         rows_oc = result.all()
-        outcomes = [oc for oc, _ev in rows_oc]
-        event_by_outcome = {oc.id: ev for oc, ev in rows_oc}
+        outcomes = [oc for oc, _ev, _cid in rows_oc]
+        event_by_outcome = {oc.id: ev for oc, ev, _cid in rows_oc}
+        city_by_outcome = {oc.id: cid for oc, _ev, cid in rows_oc}
         if not outcomes:
             logger.debug("job_fetch_polymarket: no outcomes with token_id")
             return
@@ -780,22 +789,26 @@ async def job_fetch_polymarket():
 
         # Skip distant markets on most runs — no HTTP call at all for them.
         today = date.today()
-        now = datetime.now(timezone.utc)
         horizon = int(getattr(settings, "max_days_ahead_for_alert", 3))
+        for oid in [o for o, until in _no_book_until.items() if until <= now]:
+            del _no_book_until[oid]                      # due for another try
+        resting = sum(1 for oc in outcomes if oc.id in _no_book_until)
         due = [
             oc for oc in outcomes
-            if should_poll_now(
+            if oc.id not in _no_book_until and should_poll_now(
                 event_by_outcome.get(oc.id), today, horizon,
                 (last_map.get(oc.id) or (None, None))[1], now,
             )
         ]
-        deferred = len(outcomes) - len(due)
+        deferred = len(outcomes) - len(due) - resting
 
         logger.info(
             f"job_fetch_polymarket: polling {len(due)} of {len(outcomes)} outcomes "
-            f"({deferred} beyond the {horizon}-day horizon deferred)"
+            f"({deferred} beyond the {horizon}-day horizon deferred, "
+            f"{resting} without an order book resting)"
         )
         written = skipped = 0
+        no_book: list = []
         for outcome in due:
             try:
                 res = await poly_col.collect_and_store(
@@ -805,7 +818,10 @@ async def job_fetch_polymarket():
                 )
                 if res is None:
                     continue
-                if res.get("skipped"):
+                if res.get("no_book"):
+                    _no_book_until[outcome.id] = now + NO_BOOK_RETRY
+                    no_book.append(outcome)
+                elif res.get("skipped"):
                     skipped += 1
                 else:
                     written += 1
@@ -820,6 +836,20 @@ async def job_fetch_polymarket():
             f"job_fetch_polymarket: {written} price rows written, "
             f"{skipped} unchanged (skipped)"
         )
+        if no_book:
+            # One line naming them — city, date, bucket — instead of two ERROR
+            # lines per bucket per run with only a 77-digit token to go on.
+            names = dict((await db.execute(
+                select(City.id, City.name).where(City.id.in_({city_by_outcome[o.id] for o in no_book}))
+            )).all())
+            labels = sorted(f"{names.get(city_by_outcome[o.id], '?')} {event_by_outcome[o.id]} {o.bucket_label}"
+                            for o in no_book)
+            more = f" (+{len(labels) - 10} more)" if len(labels) > 10 else ""
+            logger.warning(
+                f"job_fetch_polymarket: {len(no_book)} outcomes have no order book on Polymarket "
+                f"— asked again in {int(NO_BOOK_RETRY.total_seconds() // 60)} min: "
+                f"{'; '.join(labels[:10])}{more}"
+            )
 
 
 async def job_run_intraday():

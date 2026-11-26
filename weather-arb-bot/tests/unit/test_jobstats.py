@@ -73,6 +73,19 @@ class TestTransparency:
         assert jobstats.track("polymarket", job_fetch_polymarket).__name__ == \
             "job_fetch_polymarket"
 
+    @pytest.mark.asyncio
+    async def test_apscheduler_logs_the_jobs_own_name(self):
+        """APScheduler names a job by __qualname__, not __name__: a skipped-run
+        warning read 'track.<locals>.wrapped' and never said which job it was.
+        (Fails before the fix.)"""
+        from apscheduler.util import get_callable_name
+
+        async def job_fetch_polymarket():
+            return None
+        assert get_callable_name(jobstats.track("polymarket", job_fetch_polymarket)) == \
+            get_callable_name(job_fetch_polymarket)
+        assert "wrapped" not in get_callable_name(jobstats.track("polymarket", job_fetch_polymarket))
+
 
 # ── The numbers mean something ────────────────────────────────────────────
 
