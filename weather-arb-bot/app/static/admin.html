@@ -359,6 +359,11 @@
           <option value="lost">Lost</option>
           <option value="open">Open (not settled)</option>
         </select>
+        <label class="row small" title="Only signals whose ask was this or cheaper, in cents">Max ask ¢ <input type="number" id="nbMaxAsk" min="0" max="100" step="1" style="width:46px;" oninput="applyNbClientFilter()" /></label>
+        <label class="row small" title="Only signals whose spread was this or narrower, in cents">Max spread ¢ <input type="number" id="nbMaxSpread" min="0" max="100" step="1" style="width:46px;" oninput="applyNbClientFilter()" /></label>
+        <label class="row small" title="Only signals where at least this % of the nearby stations were past their own high (e.g. 75 = 3 of 4)">Min nearby % <input type="number" id="nbMinShare" min="0" max="100" step="5" style="width:46px;" oninput="applyNbClientFilter()" /></label>
+        <label class="row small" title="Local hour of the signal, from (inclusive)">Local hour from <input type="number" id="nbHourFrom" min="0" max="23" step="1" style="width:40px;" oninput="applyNbClientFilter()" /></label>
+        <label class="row small" title="Local hour of the signal, to (inclusive: 17 includes 17:59)">to <input type="number" id="nbHourTo" min="0" max="23" step="1" style="width:40px;" oninput="applyNbClientFilter()" /></label>
         <button class="btn primary" onclick="loadNearby()">Apply Filter</button>
         <button class="btn" onclick="resetNbFilter()">Reset</button>
         <button class="btn" onclick="exportCsv('nearbyBody', 'nearby-paper')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
@@ -416,6 +421,20 @@
           <option value="alpha">α only</option>
           <option value="beta">β only</option>
         </select>
+        <select id="rtSide" onchange="applyRtClientFilter()" title="Which side was bought">
+          <option value="">All sides</option>
+          <option value="YES">YES</option>
+          <option value="NO">NO</option>
+        </select>
+        <select id="rtHeld" onchange="applyRtClientFilter()" title="Did the regular bot already hold this bucket from before?">
+          <option value="">Held by regular bot: any</option>
+          <option value="1">Already held</option>
+          <option value="0">Not held</option>
+        </select>
+        <label class="row small" title="Only buys at this confidence or higher (0-100)">Min conf <input type="number" id="rtMinConf" min="0" max="100" step="1" style="width:46px;" oninput="applyRtClientFilter()" /></label>
+        <label class="row small" title="Only buys at this price or cheaper, in cents">Max price ¢ <input type="number" id="rtMaxPrice" min="0" max="100" step="1" style="width:46px;" oninput="applyRtClientFilter()" /></label>
+        <label class="row small" title="Local hour of the buy, from (inclusive)">Local hour from <input type="number" id="rtHourFrom" min="0" max="23" step="1" style="width:40px;" oninput="applyRtClientFilter()" /></label>
+        <label class="row small" title="Local hour of the buy, to (inclusive: 15 includes 15:59)">to <input type="number" id="rtHourTo" min="0" max="23" step="1" style="width:40px;" oninput="applyRtClientFilter()" /></label>
         <button class="btn primary" onclick="loadRealTrack()">Apply Filter</button>
         <button class="btn" onclick="resetRtFilter()">Reset</button>
         <button class="btn" onclick="exportCsv('rtBody', 'real-track')" title="Download the rows currently shown to a CSV (opens in Excel)">⬇ CSV</button>
@@ -2505,21 +2524,10 @@ async function loadNearby() {
   const j = await r.json();
   const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
   const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
-  const res = j.pnl_per_share_at_ask;
-  document.getElementById('nearbyCards').innerHTML =
-    card('Signals', j.signals) +
-    card('Buyable', j.tradable) +
-    card('Buyable & settled', j.settled) +
-    card('Won', j.settled ? `${j.wins} (${Math.round(100 * j.wins / j.settled)}%)` : '—') +
-    card('Avg ask (buyable)', cent(j.avg_ask)) +
-    card('Avg spread (all)', cent(j.avg_spread)) +
-    `<div class="card"><div class="label">Result / share at ask</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
-      + `<div class="small">${j.settled < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
-    card('Market after 10 / 30 min', `${sc(j.avg_move_10)} / ${sc(j.avg_move_30)}`);
   _renderNearbyStatus(j.last_run || {}, j.today);
   j.rows.forEach(x => { x._buyable = x.tradable ? 'yes' : 'no'; });
   _registerTable('nearbyBody', j.rows, _renderNearby, { key: 'at', dir: 'desc', type: 'date' });
-  _renderNearbyByCity(j.by_city || []);
+  applyNbClientFilter();          // cards and the by-city table follow the filters
   const sp = new URLSearchParams(); if (c) sp.set('city_id', c);
   const rs = await api('/nearby/stations?' + sp);
   if (rs.ok) _renderNearbyStations((await rs.json()).rows || []);
@@ -2548,7 +2556,7 @@ function _renderNearbyStatus(run, today) {
       + ` · ${today.cities_recorded} recorded · ${today.cities_bought} bought on paper`
       + ` <span style="opacity:.7">(since ${escapeHtml(String(today.since).slice(5, 16).replace('T', ' '))} UTC)</span>`;
     if ((today.rows || []).length) {
-      h += '<details style="margin-top:6px"><summary>By city, last 24 h</summary><div style="overflow-x:auto">'
+      h += `<details style="margin-top:8px"><summary style="display:inline-block;cursor:pointer;padding:6px 12px;border:1px solid var(--accent);border-radius:8px;background:var(--panel);color:var(--accent);font-weight:600">📋 Today by city — tap to open (${today.rows.length} cities)</summary><div style="overflow-x:auto">`
         + '<table class="small" id="nearbyTodayTable"><thead><tr><th>City</th><th>Day</th><th>Checks</th><th>Condition met</th>'
         + '<th>Before peak</th><th>Above 85¢</th><th>Below 30¢</th><th>Latest</th><th>Price</th><th>At (local)</th></tr></thead><tbody>'
         + today.rows.map(r => `<tr><td>${escapeHtml(r.city)}</td><td>${escapeHtml(r.day)}</td><td>${r.checks}</td>`
@@ -2593,21 +2601,74 @@ function _renderNearbyStations(rows) {
 }
 
 function resetNbFilter() {
-  ['nbFrom', 'nbTo', 'nbCity', 'nbBuyable', 'nbResult'].forEach(id => { document.getElementById(id).value = ''; });
+  ['nbFrom', 'nbTo', 'nbCity', 'nbBuyable', 'nbResult', 'nbMaxAsk', 'nbMaxSpread', 'nbMinShare', 'nbHourFrom', 'nbHourTo']
+    .forEach(id => { document.getElementById(id).value = ''; });
   _clientFilters['nearbyBody'] = null;
   loadNearby();
 }
 
+// "3/4" -> 75
+const _nbShare = x => { const [f, n] = String(x.nearby || '').split('/').map(Number); return n ? 100 * f / n : null; };
+
 function applyNbClientFilter() {
   const b = document.getElementById('nbBuyable').value;
   const res = document.getElementById('nbResult').value;
-  _clientFilters['nearbyBody'] = (b || res) ? (x => {
+  const maxAsk = _num('nbMaxAsk'), maxSpread = _num('nbMaxSpread'), minShare = _num('nbMinShare');
+  const hFrom = _num('nbHourFrom'), hTo = _num('nbHourTo');
+  const on = b || res || [maxAsk, maxSpread, minShare, hFrom, hTo].some(x => x != null);
+  const fn = on ? (x => {
     if (b === '1' && !x.tradable) return false;
     if (b === '0' && x.tradable) return false;
     if (res && x.result !== res) return false;
+    if (maxAsk != null && (x.ask == null || x.ask * 100 > maxAsk + 1e-9)) return false;
+    if (maxSpread != null && (x.spread == null || x.spread * 100 > maxSpread + 1e-9)) return false;
+    if (minShare != null && !(_nbShare(x) >= minShare - 1e-9)) return false;
+    const h = _localHour(x);
+    if (hFrom != null && !(h >= hFrom)) return false;
+    if (hTo != null && !(h <= hTo)) return false;
     return true;
   }) : null;
+  _clientFilters['nearbyBody'] = fn;
   _rerenderTable('nearbyBody');
+  const all = _tableCache['nearbyBody'] || [];
+  const rows = fn ? all.filter(fn) : all;
+  _renderNbCards(rows, all.length);
+  _renderNearbyByCity(_nbByCity(rows));
+}
+
+// The server's summary, recomputed from the rows the filters let through.
+function _renderNbCards(rows, total) {
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  const buy = rows.filter(r => r.tradable), settled = buy.filter(r => r.won != null);
+  const wins = settled.filter(r => r.won).length;
+  const res = _mean(settled.map(r => r.pnl_per_share));
+  document.getElementById('nearbyCards').innerHTML =
+    card('Signals', rows.length === total ? rows.length : `${rows.length} <span class="small">of ${total} (filtered)</span>`) +
+    card('Buyable', buy.length) +
+    card('Buyable & settled', settled.length) +
+    card('Won', settled.length ? `${wins} (${Math.round(100 * wins / settled.length)}%)` : '—') +
+    card('Avg ask (buyable)', cent(_mean(buy.map(r => r.ask)))) +
+    card('Avg spread (all)', cent(_mean(rows.map(r => r.spread)))) +
+    `<div class="card"><div class="label">Result / share at ask</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
+      + `<div class="small">${settled.length < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
+    card('Market after 10 / 30 min', `${sc(_mean(buy.map(r => r.move_10)))} / ${sc(_mean(buy.map(r => r.move_30)))}`);
+}
+
+function _nbByCity(rows) {
+  const by = {};
+  rows.forEach(r => { (by[r.city] = by[r.city] || []).push(r); });
+  return Object.keys(by).sort().map(city => {
+    const rs = by[city], buy = rs.filter(r => r.tradable), settled = buy.filter(r => r.won != null);
+    const anyset = rs.filter(r => r.won != null && r.pnl_per_share != null);
+    const wins = settled.filter(r => r.won).length;
+    return { city, signals: rs.length, buyable: buy.length, settled: settled.length, wins,
+             win_rate: settled.length ? wins / settled.length : null,
+             avg_ask: _mean(buy.map(r => r.ask)),
+             pnl_per_share: _mean(settled.map(r => r.pnl_per_share)),
+             would_pnl_all: _mean(anyset.map(r => r.pnl_per_share)),
+             enough: settled.length >= 30 };
+  });
 }
 
 function _renderNearby(rows) {
@@ -2657,22 +2718,51 @@ async function loadRealTrack() {
   const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
   const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
   const usd = v => v == null ? '—' : (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
-  const res = j.pnl_per_share;
-  const rule = j.rule || {};
-  document.getElementById('rtCards').innerHTML =
-    card('Rule', `${rule.enabled ? '' : 'OFF · '}${rule.max_days_ahead ? 'up to ' + rule.max_days_ahead + ' days' : 'same day'}, ≥${Math.round((rule.min_confidence || 0) * 100)}%`) +
-    card('Buys', j.buys) +
-    card('Settled', j.settled) +
-    card('Won', j.settled ? `${j.wins} (${Math.round(100 * j.wins / j.settled)}%)` : '—') +
-    card('Avg price', cent(j.avg_price)) +
-    card('Avg confidence', j.avg_confidence == null ? '—' : Math.round(j.avg_confidence) + '%') +
-    `<div class="card"><div class="label">Result / share</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
-      + `<div class="small">${j.settled < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
-    card('P&L (5 shares each)', usd(j.total_pnl)) +
-    card('Regular bot already held', j.research_open);
+  window._rtRule = j.rule || {};
   j.rows.forEach(x => { x._bet = `${x.side} ${x.bucket}`; x._research = x.research_open ? 'yes' : 'no'; });
   _registerTable('rtBody', j.rows, _renderRealTrack, { key: 'at', dir: 'desc', type: 'date' });
-  _renderRtByCity(j.by_city || []);
+  applyRtClientFilter();          // cards and the by-city table follow the filters
+}
+
+const _mean = xs => { xs = xs.filter(v => v != null); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
+const _localHour = x => parseInt(String(x.local_time || '').slice(0, 2), 10);
+const _num = id => { const v = parseFloat(document.getElementById(id).value); return isNaN(v) ? null : v; };
+
+function _renderRtCards(rows, total) {
+  const cent = v => v == null ? '—' : (v * 100).toFixed(1) + '¢';
+  const sc = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '¢';
+  const usd = v => v == null ? '—' : (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
+  const rule = window._rtRule || {};
+  const settled = rows.filter(r => r.won != null);
+  const wins = settled.filter(r => r.won).length;
+  const res = _mean(settled.map(r => r.pnl_per_share));
+  const conf = _mean(rows.map(r => r.confidence));
+  document.getElementById('rtCards').innerHTML =
+    card('Rule', `${rule.enabled ? '' : 'OFF · '}${rule.max_days_ahead ? 'up to ' + rule.max_days_ahead + ' days' : 'same day'}, ≥${Math.round((rule.min_confidence || 0) * 100)}%`) +
+    card('Buys', rows.length === total ? rows.length : `${rows.length} <span class="small">of ${total} (filtered)</span>`) +
+    card('Settled', settled.length) +
+    card('Won', settled.length ? `${wins} (${Math.round(100 * wins / settled.length)}%)` : '—') +
+    card('Avg price', cent(_mean(rows.map(r => r.price)))) +
+    card('Avg confidence', conf == null ? '—' : Math.round(conf) + '%') +
+    `<div class="card"><div class="label">Result / share</div><div class="value" style="color:${res == null ? 'inherit' : (res >= 0 ? 'var(--win)' : 'var(--loss)')}">${sc(res)}</div>`
+      + `<div class="small">${settled.length < 30 ? 'too early to judge (needs ~30+)' : (res > 0 ? 'positive so far' : 'negative so far')}</div></div>` +
+    card('P&L (5 shares each)', usd(settled.reduce((a, r) => a + (r.pnl || 0), 0))) +
+    card('Regular bot already held', rows.filter(r => r.research_open).length);
+}
+
+// Same figures as the server's by_city, from the rows the filters let through.
+function _rtByCity(rows) {
+  const by = {};
+  rows.forEach(r => { (by[r.city] = by[r.city] || []).push(r); });
+  return Object.keys(by).sort().map(city => {
+    const rs = by[city], settled = rs.filter(r => r.won != null), wins = settled.filter(r => r.won).length;
+    return { city, buys: rs.length, settled: settled.length, wins,
+             win_rate: settled.length ? wins / settled.length : null,
+             avg_price: _mean(rs.map(r => r.price)),
+             pnl_per_share: _mean(settled.map(r => r.pnl_per_share)),
+             total_pnl: settled.reduce((a, r) => a + (r.pnl || 0), 0),
+             enough: settled.length >= 30 };
+  });
 }
 
 function _renderRtByCity(rows) {
@@ -2693,20 +2783,36 @@ function _renderRtByCity(rows) {
 }
 
 function resetRtFilter() {
-  ['rtFrom', 'rtTo', 'rtCity', 'rtResult', 'rtModel'].forEach(id => { document.getElementById(id).value = ''; });
+  ['rtFrom', 'rtTo', 'rtCity', 'rtResult', 'rtModel', 'rtSide', 'rtHeld', 'rtMinConf', 'rtMaxPrice', 'rtHourFrom', 'rtHourTo']
+    .forEach(id => { document.getElementById(id).value = ''; });
   _clientFilters['rtBody'] = null;
   loadRealTrack();
 }
 
 function applyRtClientFilter() {
-  const res = document.getElementById('rtResult').value;
-  const m = document.getElementById('rtModel').value;
-  _clientFilters['rtBody'] = (res || m) ? (x => {
+  const v = id => document.getElementById(id).value;
+  const res = v('rtResult'), m = v('rtModel'), side = v('rtSide'), held = v('rtHeld');
+  const minConf = _num('rtMinConf'), maxPrice = _num('rtMaxPrice'), hFrom = _num('rtHourFrom'), hTo = _num('rtHourTo');
+  const on = res || m || side || held || [minConf, maxPrice, hFrom, hTo].some(x => x != null);
+  const fn = on ? (x => {
     if (res && x.result !== res) return false;
     if (m && x.model !== m) return false;
+    if (side && x.side !== side) return false;
+    if (held === '1' && !x.research_open) return false;
+    if (held === '0' && x.research_open) return false;
+    if (minConf != null && (x.confidence ?? 0) < minConf) return false;
+    if (maxPrice != null && x.price * 100 > maxPrice + 1e-9) return false;
+    const h = _localHour(x);
+    if (hFrom != null && !(h >= hFrom)) return false;
+    if (hTo != null && !(h <= hTo)) return false;
     return true;
   }) : null;
+  _clientFilters['rtBody'] = fn;
   _rerenderTable('rtBody');
+  const all = _tableCache['rtBody'] || [];
+  const rows = fn ? all.filter(fn) : all;
+  _renderRtCards(rows, all.length);
+  _renderRtByCity(_rtByCity(rows));
 }
 
 function _renderRealTrack(rows) {

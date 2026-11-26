@@ -436,6 +436,24 @@ def test_the_book_of_the_side_bought():
     assert track.side_book("NO", 0.22, 0.24) == (pytest.approx(0.76), pytest.approx(0.78))   # Jeddah 35°C
 
 
+def test_the_tab_filters_and_its_cards_follow_them():
+    """Like the Positions tab: side, minimum confidence, max price, local hour
+    and "regular bot already held" — and the cards and the by-city table are
+    recomputed from the rows the filters let through. (Behaviour checked in a
+    headless browser; this keeps the wiring from silently coming undone.)"""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parents[2] / "app" / "static" / "admin.html").read_text(encoding="utf-8")
+    ids = ("rtSide", "rtHeld", "rtMinConf", "rtMaxPrice", "rtHourFrom", "rtHourTo")
+    apply_fn = html[html.index("function applyRtClientFilter()"):]
+    apply_fn = apply_fn[:apply_fn.index("\n}\n")]
+    reset_fn = html[html.index("function resetRtFilter()"):]
+    reset_fn = reset_fn[:reset_fn.index("\n}\n")]
+    for i in ids:
+        assert f'id="{i}"' in html and f"'{i}'" in apply_fn and f"'{i}'" in reset_fn, i
+    assert "_renderRtCards(rows, all.length)" in apply_fn and "_renderRtByCity(_rtByCity(rows))" in apply_fn
+    assert "applyRtClientFilter();" in html[html.index("async function loadRealTrack()"):html.index("function _renderRtCards")]
+
+
 def test_result_of_each_side():
     assert track.result_of("YES", True) is True and track.result_of("YES", False) is False
     assert track.result_of("NO", True) is False and track.result_of("NO", False) is True
