@@ -405,7 +405,7 @@ class TestTodayStatus:
     def test_the_tab_filters_and_its_cards_follow_them(self):
         from pathlib import Path
         html = (Path(__file__).resolve().parents[2] / "app" / "static" / "admin.html").read_text(encoding="utf-8")
-        ids = ("nbMaxAsk", "nbMaxSpread", "nbMinShare", "nbHourFrom", "nbHourTo")
+        ids = ("nbMinAsk", "nbMaxAsk", "nbMaxSpread", "nbMinShare", "nbHourFrom", "nbHourTo")
         apply_fn = html[html.index("function applyNbClientFilter()"):]
         apply_fn = apply_fn[:apply_fn.index("\n}\n")]
         reset_fn = html[html.index("function resetNbFilter()"):]
