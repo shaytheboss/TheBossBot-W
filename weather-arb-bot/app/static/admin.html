@@ -359,6 +359,7 @@
           <option value="lost">Lost</option>
           <option value="open">Open (not settled)</option>
         </select>
+        <label class="row small" title="Only signals whose ask was this or higher, in cents">Min ask ¢ <input type="number" id="nbMinAsk" min="0" max="100" step="1" style="width:46px;" oninput="applyNbClientFilter()" /></label>
         <label class="row small" title="Only signals whose ask was this or cheaper, in cents">Max ask ¢ <input type="number" id="nbMaxAsk" min="0" max="100" step="1" style="width:46px;" oninput="applyNbClientFilter()" /></label>
         <label class="row small" title="Only signals whose spread was this or narrower, in cents">Max spread ¢ <input type="number" id="nbMaxSpread" min="0" max="100" step="1" style="width:46px;" oninput="applyNbClientFilter()" /></label>
         <label class="row small" title="Only signals where at least this % of the nearby stations were past their own high (e.g. 75 = 3 of 4)">Min nearby % <input type="number" id="nbMinShare" min="0" max="100" step="5" style="width:46px;" oninput="applyNbClientFilter()" /></label>
@@ -432,6 +433,7 @@
           <option value="0">Not held</option>
         </select>
         <label class="row small" title="Only buys at this confidence or higher (0-100)">Min conf <input type="number" id="rtMinConf" min="0" max="100" step="1" style="width:46px;" oninput="applyRtClientFilter()" /></label>
+        <label class="row small" title="Only buys at this price or higher, in cents (e.g. 70: the market agrees the bet is likely)">Min price ¢ <input type="number" id="rtMinPrice" min="0" max="100" step="1" style="width:46px;" oninput="applyRtClientFilter()" /></label>
         <label class="row small" title="Only buys at this price or cheaper, in cents">Max price ¢ <input type="number" id="rtMaxPrice" min="0" max="100" step="1" style="width:46px;" oninput="applyRtClientFilter()" /></label>
         <label class="row small" title="Local hour of the buy, from (inclusive)">Local hour from <input type="number" id="rtHourFrom" min="0" max="23" step="1" style="width:40px;" oninput="applyRtClientFilter()" /></label>
         <label class="row small" title="Local hour of the buy, to (inclusive: 15 includes 15:59)">to <input type="number" id="rtHourTo" min="0" max="23" step="1" style="width:40px;" oninput="applyRtClientFilter()" /></label>
@@ -2601,7 +2603,7 @@ function _renderNearbyStations(rows) {
 }
 
 function resetNbFilter() {
-  ['nbFrom', 'nbTo', 'nbCity', 'nbBuyable', 'nbResult', 'nbMaxAsk', 'nbMaxSpread', 'nbMinShare', 'nbHourFrom', 'nbHourTo']
+  ['nbFrom', 'nbTo', 'nbCity', 'nbBuyable', 'nbResult', 'nbMinAsk', 'nbMaxAsk', 'nbMaxSpread', 'nbMinShare', 'nbHourFrom', 'nbHourTo']
     .forEach(id => { document.getElementById(id).value = ''; });
   _clientFilters['nearbyBody'] = null;
   loadNearby();
@@ -2613,13 +2615,14 @@ const _nbShare = x => { const [f, n] = String(x.nearby || '').split('/').map(Num
 function applyNbClientFilter() {
   const b = document.getElementById('nbBuyable').value;
   const res = document.getElementById('nbResult').value;
-  const maxAsk = _num('nbMaxAsk'), maxSpread = _num('nbMaxSpread'), minShare = _num('nbMinShare');
+  const minAsk = _num('nbMinAsk'), maxAsk = _num('nbMaxAsk'), maxSpread = _num('nbMaxSpread'), minShare = _num('nbMinShare');
   const hFrom = _num('nbHourFrom'), hTo = _num('nbHourTo');
-  const on = b || res || [maxAsk, maxSpread, minShare, hFrom, hTo].some(x => x != null);
+  const on = b || res || [minAsk, maxAsk, maxSpread, minShare, hFrom, hTo].some(x => x != null);
   const fn = on ? (x => {
     if (b === '1' && !x.tradable) return false;
     if (b === '0' && x.tradable) return false;
     if (res && x.result !== res) return false;
+    if (minAsk != null && (x.ask == null || x.ask * 100 < minAsk - 1e-9)) return false;
     if (maxAsk != null && (x.ask == null || x.ask * 100 > maxAsk + 1e-9)) return false;
     if (maxSpread != null && (x.spread == null || x.spread * 100 > maxSpread + 1e-9)) return false;
     if (minShare != null && !(_nbShare(x) >= minShare - 1e-9)) return false;
@@ -2783,7 +2786,7 @@ function _renderRtByCity(rows) {
 }
 
 function resetRtFilter() {
-  ['rtFrom', 'rtTo', 'rtCity', 'rtResult', 'rtModel', 'rtSide', 'rtHeld', 'rtMinConf', 'rtMaxPrice', 'rtHourFrom', 'rtHourTo']
+  ['rtFrom', 'rtTo', 'rtCity', 'rtResult', 'rtModel', 'rtSide', 'rtHeld', 'rtMinConf', 'rtMinPrice', 'rtMaxPrice', 'rtHourFrom', 'rtHourTo']
     .forEach(id => { document.getElementById(id).value = ''; });
   _clientFilters['rtBody'] = null;
   loadRealTrack();
@@ -2792,8 +2795,9 @@ function resetRtFilter() {
 function applyRtClientFilter() {
   const v = id => document.getElementById(id).value;
   const res = v('rtResult'), m = v('rtModel'), side = v('rtSide'), held = v('rtHeld');
-  const minConf = _num('rtMinConf'), maxPrice = _num('rtMaxPrice'), hFrom = _num('rtHourFrom'), hTo = _num('rtHourTo');
-  const on = res || m || side || held || [minConf, maxPrice, hFrom, hTo].some(x => x != null);
+  const minConf = _num('rtMinConf'), minPrice = _num('rtMinPrice'), maxPrice = _num('rtMaxPrice');
+  const hFrom = _num('rtHourFrom'), hTo = _num('rtHourTo');
+  const on = res || m || side || held || [minConf, minPrice, maxPrice, hFrom, hTo].some(x => x != null);
   const fn = on ? (x => {
     if (res && x.result !== res) return false;
     if (m && x.model !== m) return false;
@@ -2801,6 +2805,7 @@ function applyRtClientFilter() {
     if (held === '1' && !x.research_open) return false;
     if (held === '0' && x.research_open) return false;
     if (minConf != null && (x.confidence ?? 0) < minConf) return false;
+    if (minPrice != null && x.price * 100 < minPrice - 1e-9) return false;
     if (maxPrice != null && x.price * 100 > maxPrice + 1e-9) return false;
     const h = _localHour(x);
     if (hFrom != null && !(h >= hFrom)) return false;

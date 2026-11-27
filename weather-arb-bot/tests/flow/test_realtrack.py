@@ -443,7 +443,7 @@ def test_the_tab_filters_and_its_cards_follow_them():
     headless browser; this keeps the wiring from silently coming undone.)"""
     from pathlib import Path
     html = (Path(__file__).resolve().parents[2] / "app" / "static" / "admin.html").read_text(encoding="utf-8")
-    ids = ("rtSide", "rtHeld", "rtMinConf", "rtMaxPrice", "rtHourFrom", "rtHourTo")
+    ids = ("rtSide", "rtHeld", "rtMinConf", "rtMinPrice", "rtMaxPrice", "rtHourFrom", "rtHourTo")
     apply_fn = html[html.index("function applyRtClientFilter()"):]
     apply_fn = apply_fn[:apply_fn.index("\n}\n")]
     reset_fn = html[html.index("function resetRtFilter()"):]
