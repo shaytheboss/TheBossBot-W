@@ -8,6 +8,23 @@ All commands below run from `weather-arb-bot/`.
 
 ---
 
+## Research memory — read it first
+
+`weather-arb-bot/docs/RESEARCH.md` is the record of every strategy and analysis
+tried on this bot: what was measured, the numbers, and what was decided —
+including everything that did **not** work. It exists because six months of
+findings lived only in chat and in temp folders that were wiped.
+
+- **Before** proposing or researching any strategy, threshold, model change or
+  data source: read §1 ("What we know") and search the file for the idea.
+  Do not re-test a rejected idea without saying what is different this time.
+- **After** any research, add an entry (date, question, data, method, numbers as
+  measured, decision, status) in the same PR. Null results get an entry too.
+- Analysis scripts that produced a result go in
+  `weather-arb-bot/docs/research/scripts/`, with a docstring saying how to run them.
+
+---
+
 ## The three rules
 
 ### 1. Run the tests and the linter after every code change
