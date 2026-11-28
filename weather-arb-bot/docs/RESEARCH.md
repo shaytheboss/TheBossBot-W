@@ -32,9 +32,13 @@ The short version. Each line points to the entries behind it.
 2. **Taking liquidity costs ~2–3.5¢ per share** (median half-spread 2¢ at
    15–70¢, 3.5¢ at 70–85¢; much wider at fast moments). Most edges we found were
    smaller than that. (R-2026-11-27f; §4)
-3. **The bot's own forecast does not beat the market.** Buying wherever the model
-   says "more likely than the price" loses at every lead time and threshold, for
-   the current model and for model v2 (t −2 to −9). (R-2026-11-27c)
+3. **The bot's own forecast does not beat the market.** On 2,260 settled trades the
+   model added no information beyond the price (logistic regression: market
+   z = +6.28, model z = +0.32, #111). Buying wherever the model says "more likely
+   than the price" loses at every lead time and threshold, for the current model
+   and for model v2 (t −2 to −9). (R-2026-11-27c) Very large disagreements are
+   the worst: edge ≥ 28pp won 48% (#75); beta, which disagreed more, lost more
+   (−13.4% ROI vs −5.0%, #80).
 4. **The bot's stated confidence is inflated:** "91–92%" won 74%, "95–96%" 78%,
    "97%" 83% (same day); live Real track "~93%" won 66%. A NO at "97%" is just
    the 3% probability floor. (R-2026-11-21a, R-2026-11-27a, R-2026-11-27h)
@@ -58,6 +62,21 @@ The short version. Each line points to the entries behind it.
 10. **Information the market does not have yet is the only edge with evidence:**
     nearby stations lead the market by ~10–30 minutes (paper test live since
     #135). On 26.11 the market was faster than the neighbours in Asia. (R-2026-11-26a)
+11. **Intraday loses money:** 5,418 settled bets, −1.88pp, t = −3.35 (#113). The one
+    rule that survived an out-of-sample test there is **don't buy below a 70¢ ask**
+    (−6.35pp and −5.27pp in the two halves); it avoids losses, it creates no edge.
+    "Impossible" locks confirmed on Wunderground won only 77.5% (89 bets) at ~80¢
+    — the market was right — mostly declared when the max had only touched the
+    edge, hence the one-unit lock margin. Entries before the city's usual peak
+    won 65% vs 78% (z = 3.0, n = 500, #127); that guard is recorded but **off**.
+12. **Polymarket moved resolution from Wunderground to the weather.gov time series**
+    (#129, Oct 2026). Several guards were built on "resolves on Wunderground"
+    (WU-anchored bias, WU-confirmed locks, the intraday running max scraped from
+    WU) and have not been re-checked since. **Open.**
+
+The full May–November record — 143 findings, 56 incidents, 33 things tried and
+reverted, and 23 places where sources conflict — is in
+[`research/history-may-nov-2026.md`](research/history-may-nov-2026.md).
 
 ---
 
@@ -291,4 +310,30 @@ section below has the details and sources.
   buyable signals.
 - **Look-ahead mistake (twice)** — see §2.
 
-<!-- PR-HISTORY -->
+### The full history
+
+[`research/history-may-nov-2026.md`](research/history-may-nov-2026.md) holds every
+finding and rule-with-a-reason from PRs #1–#145 and from measured comments in
+`app/`, by topic, with sources; the incidents table; what was tried and reverted;
+a month-by-month timeline. It was extracted automatically on 2026-11-28; 26 key
+numbers were checked against the PR text and all matched.
+
+### Conflicts in the record, and what we know about them
+
+From the list at the end of the history file, the ones that matter for trading:
+
+1. **Settlement source.** Guards from June–September assume Wunderground; since
+   October Polymarket resolves on weather.gov (#129, #133). Which guards still
+   rest on the old premise has not been checked. **Open — worth doing first.**
+2. **Settlement stations.** The history shows New York moving KLGA → KNYC (#15)
+   and Dallas to the city centre (#28), while `app/nearby/stations.py` keys New
+   York as KLGA and Dallas as KDAL. The November analysis resolved this: the 21%
+   US METAR mismatch (#133) came from four stations that did not match the
+   weather.gov rules; with the rules' stations (KLGA, KHOU, KBKF, KDAL) METAR
+   matched the settled bucket on 98.7% of days (#135). `app/utils/seed.py` still
+   says KNYC — the seed is stale; the live city rows are what count.
+3. **Wunderground vs METAR, which runs warmer:** #72 says WU is 1–2°F warmer; #74
+   and #81 say METAR runs 2–4°F above WU. Probably daily highs vs intraday spikes;
+   never reconciled. Moot for settlement after #129, still used by the bias.
+4. **Removed without a record:** the same-day METAR running-max override and the
+   0.289°F discretisation σ (#41) are no longer in `app/`, and no PR says why.
